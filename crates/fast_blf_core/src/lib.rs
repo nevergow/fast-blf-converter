@@ -979,6 +979,7 @@ pub fn series_for_plot<'py>(
         item.set_item("vmax", s.vmax)?;
         item.set_item("first", s.first)?;
         item.set_item("last", s.last)?;
+        item.set_item("mean_all", s.mean_all)?;
         series_list.append(item)?;
     }
     result.set_item("series", series_list)?;

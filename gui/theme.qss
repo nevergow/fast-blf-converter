@@ -775,3 +775,35 @@ QAbstractScrollArea {
     background-color: #25252E;
     border: none;
 }
+
+/* ------------------------------------------- 画图预览窗（Step 16） -------- */
+/* #plotInfo：顶部信息条（时间范围 / 信号数 / 抽稀说明，抽稀文字在控件里用琥珀色）。 */
+QLabel#plotInfo {
+    background-color: #25252E;
+    border: 1px solid #3A3A46;
+    border-radius: 6px;
+    padding: 8px 12px;
+    color: #E8E8F0;
+}
+
+/* #plotLegend：右侧图例（信号名 + 单位 + 原始采样点数，可点击显隐）。 */
+QListWidget#plotLegend {
+    background-color: #25252E;
+    alternate-background-color: #2A2A33;
+    border: 1px solid #3A3A46;
+    border-radius: 6px;
+    color: #E8E8F0;
+    outline: none;
+}
+
+QListWidget#plotLegend::item {
+    padding: 4px 6px;
+}
+
+QListWidget#plotLegend::item:hover {
+    background-color: #35353F;
+}
+
+QListWidget#plotLegend::item:selected {
+    background-color: #33475B;
+}

@@ -77,6 +77,9 @@ pub struct SignalSeries {
     /// 全量原始数据的首/末采样值（按时间先后）。
     pub first: f64,
     pub last: f64,
+    /// **全量原始数据的算术平均**（= sum/count，不是桶均值的平均）。
+    /// 报告统计表用它给出精确均值；桶均值数组 `mean` 只适合画曲线。
+    pub mean_all: f64,
 }
 
 /// `absolute` 口径下的一个时间刻度。
@@ -181,6 +184,8 @@ pub(crate) struct SignalAccumulator {
     /// 全量最小/最大。
     pub vmin: f64,
     pub vmax: f64,
+    /// 全量求和（与 `count` 一起给出**精确**均值）。
+    pub sum: f64,
     /// 首/末采样值（按时间先后）。
     pub first: f64,
     pub last: f64,
@@ -198,6 +203,7 @@ impl SignalAccumulator {
             count: 0,
             vmin: f64::INFINITY,
             vmax: f64::NEG_INFINITY,
+            sum: 0.0,
             first: 0.0,
             last: 0.0,
             first_t: f64::INFINITY,
@@ -212,6 +218,7 @@ impl SignalAccumulator {
     #[inline]
     pub(crate) fn push(&mut self, t: f64, value: f64) {
         self.count += 1;
+        self.sum += value;
         if value < self.vmin {
             self.vmin = value;
         }
@@ -540,6 +547,8 @@ fn decode_and_bucket(
             vmax: acc.vmax,
             first: acc.first,
             last: acc.last,
+            // 上面已跳过 count == 0 的信号，除零不可能发生。
+            mean_all: acc.sum / acc.count as f64,
         });
     }
     series
@@ -813,6 +822,26 @@ mod tests {
         assert_eq!(out.min[0], -3.0);
         assert_eq!(out.max[0], -3.0);
         assert_eq!(out.max[2], 100.0);
+    }
+
+    /// T4b：`mean_all` 必须是**全量算术平均**，而不是"桶均值的平均"——
+    /// 桶内点数不等时两者不同（这正是报告统计表需要专用字段的原因）。
+    #[test]
+    fn mean_all_is_true_mean_not_bucket_mean_average() {
+        // 桶0 收到 3 个点（10/20/30），桶5 收到 1 个点（100）。
+        let samples = [(0.0, 10.0), (0.2, 20.0), (0.4, 30.0), (5.0, 100.0)];
+        let acc = accumulate(0.0, 10.0, 10, &samples);
+        assert_eq!(acc.count, 4);
+        assert_eq!(acc.sum, 160.0);
+        let mean_all = acc.sum / acc.count as f64;
+        assert_eq!(mean_all, 40.0, "全量均值必须是 (10+20+30+100)/4 = 40");
+
+        let out = acc.finish();
+        assert_eq!(out.mean, vec![20.0, 100.0], "桶均值：桶0=20、桶5=100");
+        let bucket_mean_avg = out.mean.iter().sum::<f64>() / out.mean.len() as f64;
+        assert_eq!(bucket_mean_avg, 60.0, "桶均值的平均是 60");
+        assert_ne!(mean_all, bucket_mean_avg,
+                   "若两者相等，这个用例就证明不了 mean_all 的必要性");
     }
 
     /// T5：`buckets` 参数边界；越界报 `BAD_CONFIG`。

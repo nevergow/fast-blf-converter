@@ -123,6 +123,9 @@ config 字段（在 `convert` 的 config 之上）：
       "min":  [float, ...], "max": [float, ...], "mean": [float, ...],
       "vmin": float, "vmax": float,      # 全量原始数据的最小/最大（不是抽稀后的）
       "first": float, "last": float,     # 首/末原始采样值
+      "mean_all": float,                 # **全量原始数据的算术平均**（sum/count）。
+                                         # 报告/统计必须用它；桶均值数组 `mean` 只适合画曲线，
+                                         # 二者不可互换（桶内点数不等时，桶均值的平均 ≠ 真均值）。
     }, ...
   ],
   "dbc_errors": {"1": str}, "warnings": [str],

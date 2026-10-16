@@ -8,7 +8,12 @@
 2. 按周期拆表后产生海量 `null` 空值 → **按报文独立成表**（或按统一时间轴重采样对齐）；
 3. 缺乏列式/多表导出能力 → Polars 列式流水线 + 单文件多 Sheet 的 Excel 报告。
 
-## v0.2.1 更新（第二轮 Windows 真机试用反馈）
+## v0.3.0 更新（第三轮反馈：进度/通道/填充 + 画图与报告）
+
+> **为什么一版发全**：原计划 v0.2.1（修 ①②③）与 v0.3.0（画图）分两次发。
+> 中间那轮 CI 因为**推送前就触发了构建**（构建的是旧提交，不含修复），被发版脚本的
+> "使用说明版本断言"当场拦下、未产生错误发布。既然那一轮已白跑，就合并为一次发布，
+> 省一轮 50 分钟的 CI 与一份额度。
 
 1. **解析进度条改成真实进度**（原来"到 100% 又退回去"）：解析信号原本走的是"不确定态乒乓动画"
    （`0↔100` 来回扫），而 `scan` 的进度回调**本来就带真实文件级进度**，只是界面没接。
@@ -28,6 +33,19 @@
      重采样网格的**线性插值行为与旧版本逐字节一致**（对拍 sha256 相同，回归红线）。
 4. **进度粒度细化**：此前 50ms 节流只放行"最后一个文件"，中间文件完成会被吃掉（8 个切片只看到 4 级台阶）；
    现在每个文件完成都放行（每任务最多 N 次事件）。实测 8 切片 → **`12/25/37/50/62/75/87/100` 八级台阶**。
+
+5. **画图预览（`📈 预览`）**：勾选信号即弹曲线窗口 —— **min/max 包络**（梳状，不丢峰）+ 半透明均值线，
+   **多量纲分 Y 轴**（同单位共轴，>4 条自动归一化），滚轮缩放 / 拖动平移 / 双击复位 / 十字光标读数 / 图例显隐。
+   **自绘**（QPainter）：零新依赖、零打包风险，且包络渲染与分轴需要完全掌控。
+6. **离线 HTML 报告（`📤 导出 HTML 报告`）**：**单文件、完全自包含**（ECharts 5.5.1 内嵌 + 数据内嵌，
+   **禁止 CDN**），同事断网双击即开；含文件清单、时间范围、DBC 绑定情况（含失败通道）、
+   **全量统计表**（原始点数 / min / max / mean / first / last）、可缩放曲线、抽稀说明。
+   体积控制在 8MB 内，超限时按相邻桶合并（min 取更小、max 取更大，**仍不丢峰**）并在页面写明；
+   写盘走临时文件 + 原子替换，**不产出半截文件**。
+7. **`series_for_plot`（Rust 侧抽稀+统计，图表的唯一数据来源）**：百万级采样点**绝不**搬进 Python ——
+   在 Rust 里解码并按全局时间等宽分桶，每桶给 min/max/mean 与桶中心时间，每信号最多回传 `buckets` 个点。
+   实测 187MB / 408 万帧：release **0.96s**、返回 32.6 万点 = **原始的 1.02%**；debug 构建 9.9s。
+   新增 `mean_all`（全量真均值）——报告统计表用它，而不是"桶均值的平均"（两者在桶内点数不等时不同）。
 
 ## v0.2.0 更新（基于 Windows 真机试用反馈）
 
@@ -92,12 +110,15 @@ gui/main.py (PySide6, 暗色 Fluent)  ──QThread──►  fast_blf_core (Rus
 
 | 验证项 | 结果 |
 |---|---|
-| 单元 + 集成测试 | **102 项全绿**（45 单元 + 57 集成 `tests/e2e_synthetic.rs`） |
+| 单元 + 集成测试 | **112 项全绿**（53 单元 + 59 集成 `tests/e2e_synthetic.rs`，另 1 项 ignored 为性能基准） |
+| 画图数据接口 | 187MB/408 万帧 → **0.96s**（release）、返回点数 **压缩到 1.02%**；逐桶 min/max/mean 与**独立复算**零不符；包络极值覆盖全量极值（不丢峰）；`absolute` 口径命中 `2025-10-16 14:10:00.123456` 定值 |
+| HTML 报告自包含性 | 真实浏览器打开验证：canvas 绘制像素 126KB、7 信号统计表齐全、**零外部 script/link 引用、零 fetch/XHR/Image 调用**、1.24MB < 8MB |
+| 预览控件（离屏实测） | 1100×560 渲染、224 种颜色、调色板曲线像素 3664 个（不是空白图）；AST 级检查确认**渲染路径不 import/不调用内核**、无新增依赖 |
 | 填充策略专项 | `hold` 输出值**全落在原始采样集合内**（不造值）；`linear` 网格路径与旧版**逐字节一致**（对拍 sha256）；`ffill_max_gap_ms=50ms` 时按信号报出置空行数；非法值报 `BAD_CONFIG` 并回显 |
 | 进度行为 | 解析进度**单调不减、终值 100%**；8 切片实测阶梯 `12/25/37/50/62/75/87/100`；单文件 187MB 时"已扫帧数"连续跳动 29 次 |
 | 端到端验收 `tests/acceptance.py` | **55/55 通过**（A4 三格式/无空值、A5 百万行防呆、**A6 坏 DBC 容错**、**A6' 空 BLF 扫描**、**A7 时间口径 4 选 1 精确比对**、**A9 宽表同名信号**） |
 | DBC 解析矩阵 | **24/25 种真实写法可解析**（空 `NS_` 段 / `SG_MUL_VAL_` / `SIG_VALTYPE_` / `EV_` / 扩展帧 / CRLF / ENUM 越界…）；唯一失败用例是文件本身引号不规范，按预期给出精确行号 |
-| GUI 无人值守自检 | **7 条全过**：`--selftest` / `--selftest-parse`（`PARSE_OK` 进度单调→100 + Ch1~Ch8 不消失）/ `--selftest-deep`（`DEEP_OK channels=8`）/ `--selftest-config`（`CONFIG_OK`）/ `--selftest-progress`（`PROGRESS_OK`）/ **`--selftest-fill`**（`FILL_OK hold_distinct=52 linear_distinct=60 gapped_nulls=45 none_nulls=496`）/ `--dump-check-states`（`DUMP_OK`） |
+| GUI 无人值守自检 | **8 条全过**：`--selftest` / `--selftest-parse`（`PARSE_OK` 进度单调→100 + Ch1~Ch8 不消失）/ `--selftest-deep`（`DEEP_OK channels=8`）/ `--selftest-config`（`CONFIG_OK`）/ `--selftest-progress`（`PROGRESS_OK`）/ `--selftest-fill`（`FILL_OK hold_distinct=52 linear_distinct=60 gapped_nulls=45 none_nulls=496`）/ **`--selftest-plot`**（`PLOT_OK` 预览离屏渲染 + 报告自包含性门禁）/ `--dump-check-states`（`DUMP_OK`） |
 | GUI 交互路径独立探针 | **11/11**：通道级绑 DBC → 解析 → 报文名从 `ID_0x123` 变真名 → 取消勾选 → **重解析后勾选被恢复** → 全部清除 |
 | 冻结态（PyInstaller onedir，本机实跑） | `--selftest` 内核就绪 0.2.0 / `--selftest-config` **`CONFIG_OK`（预设保存·加载·DBC 缺失处理在打包后可用）** / `--selftest-deep` `DEEP_SKIP no_fixture` / `--dump-check-states` `DUMP_OK` 23079B；`theme.qss` 落在 `_internal/gui/theme.qss` |
 | 位序正确性 | Intel/Motorola 与 `cantools` **1440 组随机对拍 0 不一致**（见 `docs/DEPS.md` §7） |

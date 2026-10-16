@@ -47,9 +47,13 @@ from PySide6.QtWidgets import (
 try:  # 以脚本方式运行（python gui/main.py）时 gui/ 已在 sys.path 首位
     from check_delegate import CheckStateDelegate
     import presets as preset_store
+    from plot_view import PreviewWindow
+    import report_html as report_builder
 except ImportError:  # 作为包导入（gui.main）时
     from gui.check_delegate import CheckStateDelegate
     from gui import presets as preset_store
+    from gui.plot_view import PreviewWindow
+    from gui import report_html as report_builder
 
 # --------------------------------------------------------------- 内核延迟导入 --
 try:  # pragma: no cover - 取决于是否已 maturin develop
@@ -359,9 +363,13 @@ class Worker(QThread):
             self.failed.emit(KERNEL_MISSING_TEXT)
             return
         try:
-            report = (core.scan(self.blf_paths, self.dbc_map, self._progress_bridge)
-                      if self.mode == "scan"
-                      else core.convert(self.config, self._progress_bridge))
+            if self.mode == "scan":
+                report = core.scan(self.blf_paths, self.dbc_map, self._progress_bridge)
+            elif self.mode == "series":
+                # Step 16：画图数据只走 series_for_plot（内核侧抽稀），GUI 不解码 BLF。
+                report = core.series_for_plot(self.config)
+            else:
+                report = core.convert(self.config, self._progress_bridge)
         except Exception as exc:  # noqa: BLE001 - 任何内核异常都要变成提示
             self.failed.emit(f"{type(exc).__name__}: {exc}")
             return
@@ -386,6 +394,13 @@ class MainWindow(QMainWindow):
         self.dbc_by_channel: dict[int, str] = {}
         self.channel_summary: dict[str, dict] = {}
         self.scan_worker = self.convert_worker = None
+        #: Step 16：画图 / HTML 报告的取数线程 + 预览窗口 + 最近一次上下文。
+        self.plot_worker = None
+        self.preview_window: PreviewWindow | None = None
+        self._plot_selection: dict | None = None
+        self._plot_action: str | None = None
+        self._plot_out_path: str | None = None
+        self._plot_time_format: str | None = None
         self._checks_guard = False
         #: 解析前的勾选快照（Step 6a §4：按名字恢复勾选）。
         self._check_snapshot: dict[str, set] | None = None
@@ -465,6 +480,14 @@ class MainWindow(QMainWindow):
         self.act_clear_dbc = QAction("🗑 全部清除 DBC", self)
         tune(self.act_clear_dbc, statusTip="清空所有通道的 DBC 绑定与树里的 DBC 节点（需二次确认）")
         bar.addAction(self.act_clear_dbc)
+        # Step 16：画图入口（工具栏 + 信号树右键；数据统一走 Rust 侧 series_for_plot）。
+        self.act_preview = QAction("📈 预览", self)
+        tune(self.act_preview, statusTip="用抽稀后的 min/max 包络在独立窗口预览已勾选信号（不丢峰）")
+        bar.addAction(self.act_preview)
+        self.act_export_html = QAction("📤 导出 HTML 报告", self)
+        tune(self.act_export_html,
+             statusTip="把已勾选信号导出为离线自包含 HTML 报告（图表库内嵌，断网也能打开）")
+        bar.addAction(self.act_export_html)
         # Step 13 B4：手动添加通道（工具入口之一；另一处在信号树空白处右键）。
         self.act_add_channel = QAction(ADD_CHANNEL_TEXT, self)
         tune(self.act_add_channel, statusTip=ADD_CHANNEL_STATUS_TIP)
@@ -657,6 +680,9 @@ class MainWindow(QMainWindow):
         self.act_add_blf.triggered.connect(self.add_blf_dialog)
         self.btn_parse.clicked.connect(self.start_parse_signals)
         self.act_clear_dbc.triggered.connect(self.clear_dbc_bindings)
+        # Step 16：预览 / 导出 HTML 报告（均复用 Worker 线程取数）。
+        self.act_preview.triggered.connect(self.start_plot_preview)
+        self.act_export_html.triggered.connect(self.start_export_html)
         self.act_add_channel.triggered.connect(self.add_channel_dialog)
         self.act_save_config.triggered.connect(self.save_config_dialog)
         self.act_load_config.triggered.connect(self.load_config_dialog)
@@ -825,7 +851,21 @@ class MainWindow(QMainWindow):
                 self.add_channel_dialog()
             return
         item = self.signal_model.itemFromIndex(self.signal_proxy.mapToSource(index))
-        if item is None or item.data(NODE_ROLE) != NODE_CHANNEL:
+        if item is None:
+            return
+        kind = item.data(NODE_ROLE)
+        # Step 16：在信号 / 报文节点上右键 → 预览 / 导出 HTML 报告（对当前勾选生效）。
+        if kind in (NODE_SIGNAL, NODE_MESSAGE):
+            menu = QMenu(self.signal_view)
+            preview_action = menu.addAction(self.act_preview.text())
+            export_action = menu.addAction(self.act_export_html.text())
+            chosen = menu.exec(self.signal_view.viewport().mapToGlobal(pos))
+            if chosen is preview_action:
+                self.start_plot_preview()
+            elif chosen is export_action:
+                self.start_export_html()
+            return
+        if kind != NODE_CHANNEL:
             return
         channel = int(item.data(CH_ROLE) or 0)
         menu = QMenu(self.signal_view)
@@ -1467,6 +1507,8 @@ class MainWindow(QMainWindow):
                 parent = parent.parent()
         finally:
             self._checks_guard = False
+        # Step 16：勾选数变化会直接影响「📈 预览」/「📤 导出 HTML」是否可用。
+        self._refresh_action_state()
 
     def _apply_state_down(self, item: QStandardItem, state: Qt.CheckState) -> None:
         """向下广播勾选；DBC 等不可勾选容器只递归、不写状态。"""
@@ -1579,6 +1621,7 @@ class MainWindow(QMainWindow):
             self._checks_guard = False
         self._cascade_checks()
         self.statusBar().showMessage(f"已勾选 {count} 个节点（含未展开层级）")
+        self._refresh_action_state()
 
     def _check_subtree(self, item: QStandardItem | None) -> int:
         if item is None:
@@ -1597,6 +1640,7 @@ class MainWindow(QMainWindow):
         finally:
             self._checks_guard = False
         self.statusBar().showMessage("已清空全部勾选（此时启动转换将不会导出任何信号）")
+        self._refresh_action_state()
 
     def _cascade_checks(self) -> None:
         """兜底：重算所有父节点勾选态（“全选当前过滤项”之后调用）。"""
@@ -1635,7 +1679,8 @@ class MainWindow(QMainWindow):
 
     def _refresh_action_state(self) -> None:
         busy = bool(self.convert_worker and self.convert_worker.isRunning()) or bool(
-            self.scan_worker and self.scan_worker.isRunning())
+            self.scan_worker and self.scan_worker.isRunning()) or bool(
+            self.plot_worker and self.plot_worker.isRunning())
         has_input = bool(self.entries) or bool(self.dbc_by_channel)
         self.btn_convert.setEnabled(KERNEL_READY and bool(self.entries) and not busy)
         hint = (KERNEL_MISSING_TEXT if not KERNEL_READY else
@@ -1648,6 +1693,17 @@ class MainWindow(QMainWindow):
             "请先添加 BLF 或在通道上右键添加 DBC" if not has_input else
             "任务进行中…" if busy else "按当前 BLF 列表与各通道 DBC 扫描并重建信号树")
         self.act_clear_dbc.setEnabled(not busy and bool(self.dbc_by_channel))
+        # Step 16：预览 / 导出报告需要「内核就绪 + 有 BLF + 至少勾选 1 个信号 + 空闲」。
+        has_selection = bool(self.build_selection()) if KERNEL_READY else False
+        plot_ready = KERNEL_READY and bool(self.entries) and has_selection and not busy
+        plot_hint = (KERNEL_MISSING_TEXT if not KERNEL_READY else
+                     "请先添加至少一个 .blf 文件" if not self.entries else
+                     "任务进行中…" if busy else
+                     "请先勾选至少一个信号（可点「🔍 解析信号」后勾选）" if not has_selection else
+                     "用抽稀后的 min/max 包络预览已勾选信号（不丢峰）")
+        for action in (self.act_preview, self.act_export_html):
+            action.setEnabled(plot_ready)
+            action.setToolTip(plot_hint)
         for action in (self.act_save_config, self.act_load_config, self.act_delete_config):
             action.setEnabled(not busy)
         for widget in (self.btn_remove_selected, self.btn_clear_files):
@@ -2098,6 +2154,231 @@ class MainWindow(QMainWindow):
             self._progress_idle()
         self._refresh_action_state()
 
+    # ------------------------------------------- 画图预览 / HTML 报告（Step 16） ----
+    def _current_time_format(self) -> str:
+        """界面「时间列格式」下拉的当前口径（预览 / 报告与导出口径一致）。"""
+        index = max(0, self.combo_time_format.currentIndex())
+        return TIME_FORMAT_CHOICES[index][1]
+
+    def _merged_dbc_map(self) -> dict[int, str]:
+        """``self.dbc_by_channel`` 与树里实际绑定的并集（互为兜底）。"""
+        merged = {int(k): str(v) for k, v in self.dbc_by_channel.items()}
+        merged.update(self._collect_dbc_by_channel())
+        return merged
+
+    def _series_config(self, selection: dict, time_format: str,
+                       buckets: int = 2000) -> dict:
+        """构造 ``series_for_plot`` 的 config（§1.3：在 convert config 之上多 ``buckets``）。"""
+        return {
+            "blf_paths": [entry.path for entry in self.entries],
+            "dbc_by_channel": self._merged_dbc_map(),
+            "selected": selection,
+            "time_format": time_format,
+            "buckets": int(buckets),
+        }
+
+    def _plot_guard(self) -> tuple[bool, dict]:
+        """预览 / 导出的前置检查：不满足时只提示状态栏（不弹窗），返回 ``(是否继续, selection)``。"""
+        if not KERNEL_READY:
+            self.statusBar().showMessage(KERNEL_MISSING_TEXT)
+            return False, {}
+        if not self.entries:
+            self.statusBar().showMessage("请先添加至少一个 .blf 文件（预览 / 报告都需要原始数据）")
+            return False, {}
+        selection = self.build_selection()
+        if not selection:
+            self.statusBar().showMessage("请先勾选至少一个信号（可点「🔍 解析信号」后勾选）")
+            return False, {}
+        return True, selection
+
+    def start_plot_preview(self, selection: dict | None = None) -> None:
+        """工具栏 / 右键「📈 预览」：取数放 Worker 线程，成功后开独立预览窗。"""
+        if self.plot_worker is not None and self.plot_worker.isRunning():
+            self.statusBar().showMessage("取数进行中，请稍候…")
+            return
+        allowed, current = self._plot_guard()
+        if not allowed:
+            return
+        self._plot_selection = selection or current
+        self._plot_action = "preview"
+        self._plot_out_path = None
+        self._plot_time_format = self._current_time_format()
+        self._launch_series_worker()
+
+    def start_export_html(self, selection: dict | None = None) -> None:
+        """工具栏 / 右键「📤 导出 HTML 报告」：先让用户选文件名，再在 Worker 里取数并落盘。"""
+        if self.plot_worker is not None and self.plot_worker.isRunning():
+            self.statusBar().showMessage("取数进行中，请稍候…")
+            return
+        allowed, current = self._plot_guard()
+        if not allowed:
+            return
+        selection = selection or current
+        default_dir = str(Path(self.entries[0].path).parent) if self.entries else str(Path.cwd())
+        default_name = report_builder.default_report_name()
+        if self.quiet_dialogs:
+            target = str(Path(tempfile.mkdtemp(prefix="fblf_report_")) / default_name)
+        else:
+            target, _filter = QFileDialog.getSaveFileName(
+                self, "导出离线 HTML 报告", str(Path(default_dir) / default_name),
+                "HTML 报告 (*.html);;所有文件 (*)")
+        if not target:
+            self.statusBar().showMessage("已取消导出 HTML 报告")
+            return
+        if not target.lower().endswith(".html"):
+            target += ".html"
+        self._plot_selection = selection
+        self._plot_action = "export"
+        self._plot_out_path = target
+        self._plot_time_format = self._current_time_format()
+        self._launch_series_worker()
+
+    def _launch_series_worker(self) -> None:
+        """把 ``series_for_plot`` 丢进 Worker 线程（主线程取数会卡死界面）。"""
+        buckets = 2000  # §A1：默认 2000；预览窗已存在时取画布宽度像素级。
+        if self.preview_window is not None:
+            try:
+                buckets = max(100, min(20000, int(self.preview_window.canvas.width())))
+            except RuntimeError:  # 窗口 C++ 对象已销毁
+                buckets = 2000
+        config = self._series_config(self._plot_selection or {}, self._plot_time_format
+                                     or self._current_time_format(), buckets)
+        self._begin_busy("正在解码并抽稀（min/max 包络）…")
+        self.lbl_status.setText("正在准备画图数据…")
+        self.statusBar().showMessage(
+            "正在调用 series_for_plot 取数（数据降维在内核完成，界面不解码 BLF）")
+        self.plot_worker = Worker("series", config=config, parent=self)
+        self._spawn(self.plot_worker, self._on_plot_progress,
+                    self._on_plot_ok, self._on_plot_failed, self._on_plot_thread_done)
+        self._refresh_action_state()
+
+    def _on_plot_progress(self, payload: dict) -> None:
+        """``series_for_plot`` 无 ``progress_cb``：只在不确定态里刷新文案。"""
+        label = str(payload.get("message") or "正在抽稀…")
+        self.lbl_progress_status.setText(f"正在准备画图数据… {label}")
+
+    def _finish_plot_ok(self, text: str) -> None:
+        """画图 / 报告成功：进度区绿色完成行。"""
+        self._progress_timer.stop()
+        pv = self._pv
+        pv["active"] = True
+        pv["finished"] = True
+        pv["busy"] = False
+        pv["value"] = 100
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
+        self.lbl_progress_status.setText(text)
+        self.lbl_progress_status.setToolTip(text)
+        self.lbl_progress_meta.setText("100%")
+        self._set_progress_state("success")
+
+    def _finish_plot_failed(self, message: str) -> None:
+        """画图 / 报告失败：进度区红字（不弹窗）。"""
+        self._progress_timer.stop()
+        pv = self._pv
+        pv["active"] = True
+        pv["finished"] = True
+        pv["busy"] = False
+        pv["value"] = None
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        text = f"✗ {message}"
+        self.lbl_progress_status.setText(text)
+        self.lbl_progress_status.setToolTip(text)
+        self.lbl_progress_meta.setText("失败")
+        self._set_progress_state("error")
+        self.lbl_status.setText(f"画图 / 报告失败：{message}")
+        print(f"[fast_blf_core] 画图 / 报告失败：{message}", file=sys.stderr)
+
+    def _collect_plot_meta(self, time_format: str) -> dict:
+        """HTML 报告需要的界面上下文（文件清单 / DBC 绑定 / 版本 / 生成时间）。"""
+        files = [{"path": entry.path, "size": entry.size,
+                  "ok": entry.status != STATUS_FAILED, "error": entry.error}
+                 for entry in self.entries]
+        return {
+            "title": "Fast BLF Converter · 数据预览报告",
+            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "version": core.version() if KERNEL_READY else "—",
+            "files": files,
+            "dbc_by_channel": self._merged_dbc_map(),
+            "channel_summary": dict(self.channel_summary or {}),
+            "time_format": time_format,
+        }
+
+    def _on_plot_ok(self, report: dict) -> None:
+        if not isinstance(report, dict) or not report.get("ok"):
+            self._finish_plot_failed("取数失败：series_for_plot 返回 ok=False")
+            return
+        time_format = self._plot_time_format or self._current_time_format()
+        if self._plot_action == "export":
+            meta = self._collect_plot_meta(time_format)
+            out_path = self._plot_out_path or report_builder.default_report_name()
+            result = report_builder.generate_report(report, meta, out_path)
+            if not result.get("ok"):
+                self._finish_plot_failed(str(result.get("error") or "报告生成失败"))
+                return
+            size_text = human_size(int(result.get("bytes") or 0))
+            self._finish_plot_ok(
+                f"✓ 报告已导出：{os.path.basename(str(result.get('path')))}（{size_text}）")
+            self.lbl_status.setText(f"HTML 报告：{result.get('path')}（{size_text}）")
+            self.statusBar().showMessage(f"离线自包含报告已生成：{result.get('path')}")
+        elif self._plot_action == "preview":
+            self._open_preview_window(report)
+        else:
+            # 预览窗在取数期间被用户关掉：丢弃结果，不无端重开窗口。
+            self._progress_idle()
+
+    def _on_plot_failed(self, message: str) -> None:
+        self._finish_plot_failed(message)
+
+    def _on_plot_thread_done(self) -> None:
+        self.plot_worker = None
+        if not self._pv.get("finished"):  # 线程结束却没收到 ok/failed 时的兜底
+            self._progress_idle()
+        self._plot_action = None
+        self._refresh_action_state()
+
+    def _open_preview_window(self, report: dict) -> None:
+        """首次创建 / 复用预览窗口，并把最新取数结果灌进去。"""
+        time_format = self._plot_time_format or self._current_time_format()
+        window = self.preview_window
+        if window is None:
+            window = PreviewWindow(report, time_format=time_format,
+                                   time_format_choices=TIME_FORMAT_CHOICES,
+                                   on_refetch=self._refetch_preview, parent=None)
+            window.closed.connect(self._on_preview_closed)
+            self.preview_window = window
+        else:
+            window.set_plot_data(report, time_format=time_format)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        series = report.get("series") or []
+        total = sum(int(item.get("count", 0) or 0) for item in series)
+        buckets = int(report.get("buckets") or 0)
+        self._finish_plot_ok(f"✓ 预览就绪：{len(series)} 个信号 · {total:,} 个原始点 · "
+                             f"已抽稀为 {buckets} 桶（min/max 包络，不丢峰）")
+        self.statusBar().showMessage(f"预览窗口已打开（{len(series)} 个信号，已抽稀）")
+
+    def _refetch_preview(self, time_format: str) -> None:
+        """预览窗里改时间口径 → 重新走 Worker 取数（不是前端换算）。"""
+        if self.plot_worker is not None and self.plot_worker.isRunning():
+            self.statusBar().showMessage("取数进行中，请稍候再切换时间格式")
+            return
+        if not self._plot_selection:
+            self.statusBar().showMessage("预览上下文已丢失，请重新点「📈 预览」")
+            return
+        self._plot_action = "preview"
+        self._plot_time_format = time_format
+        self._launch_series_worker()
+
+    def _on_preview_closed(self) -> None:
+        self.preview_window = None
+        # 若关闭时刚好在重新取数，丢弃这次结果（避免窗口被关掉后又自己弹回来）。
+        if self._plot_action == "preview":
+            self._plot_action = None
+            self._plot_selection = None
+
     # ------------------------------------------------------ 拖拽/关闭 ------
     def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         event.acceptProposedAction() if event.mimeData().hasUrls() else event.ignore()
@@ -2112,8 +2393,8 @@ class MainWindow(QMainWindow):
             event.ignore()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
-        # 关闭窗口时把两类工作线程都收掉：只处理转换线程时，扫描中关窗可能让进程退不出去。
-        for worker in (self.convert_worker, self.scan_worker):
+        # 关闭窗口时把三类工作线程都收掉：只处理转换线程时，扫描/取数中关窗可能让进程退不出去。
+        for worker in (self.convert_worker, self.scan_worker, self.plot_worker):
             if worker is None or not worker.isRunning():
                 continue
             cancel = getattr(worker, "cancel", None)
@@ -2123,6 +2404,13 @@ class MainWindow(QMainWindow):
                 except Exception:  # noqa: BLE001 - 关闭阶段不允许再抛
                     pass
             worker.wait(3000)
+        # Step 16：预览窗是独立顶层窗口，主窗关闭时一并关掉，不留僵尸窗口。
+        if self.preview_window is not None:
+            try:
+                self.preview_window.close()
+            except RuntimeError:  # 底层 C++ 对象已销毁
+                pass
+            self.preview_window = None
         event.accept()
 
 
@@ -2847,6 +3135,103 @@ def run_selftest_progress() -> int:
     return 0
 
 
+def run_selftest_plot() -> int:
+    """``--selftest-plot``：Step 16 画图 / 离线 HTML 报告的无人值守端到端验证。
+
+    * 用 ``fixtures/multi_channel.blf`` + ``fixtures/demo.dbc`` 构造主窗（offscreen）；
+    * 调 ``series_for_plot`` → 断言 ``series`` 非空、每信号 ``len(t) <= buckets``；
+    * 构造预览控件、``resize(1200, 600)``、``grab()`` 一次（离屏渲染不崩）；
+    * 生成 HTML 报告到临时目录 → 断言文件存在、体积 < 8MB、无外部 src/href/fetch、
+      含 ``echarts`` 标识与 ≥3 个信号名；
+    * 成功打印 ``PLOT_OK series=.. buckets=.. html_bytes=.. png_bytes=..`` 返回 0；
+      失败打印 ``PLOT_FAIL ...`` 返回 2；内核 / 夹具缺失打印 ``PLOT_SKIP ...`` 返回 0。
+    """
+    if core is None:
+        print("PLOT_SKIP no_kernel")
+        return 0
+    root = Path(__file__).resolve().parent.parent
+    blf_path = (root / "fixtures" / "multi_channel.blf").resolve()
+    dbc_path = (root / "fixtures" / "demo.dbc").resolve()
+    absent = [str(p) for p in (blf_path, dbc_path) if not p.is_file()]
+    if absent:
+        print(f"PLOT_SKIP no_fixture {' '.join(absent)}")
+        return 0
+    app = QApplication.instance()
+    if app is None:
+        print("PLOT_FAIL no_qapplication")
+        return 2
+    window: MainWindow | None = None
+    preview: PreviewWindow | None = None
+    try:
+        buckets = 2000
+        window = MainWindow()
+        window.quiet_dialogs = True
+        _setup_scan_tree(window, str(blf_path), {1: str(dbc_path), 2: str(dbc_path)})
+        selection = window.build_selection()
+        if not selection:
+            raise AssertionError("主窗未勾选到任何信号")
+        config = window._series_config(selection, "relative_s", buckets)
+        plot_data = core.series_for_plot(config)
+        series = plot_data.get("series") or []
+        if not series:
+            raise AssertionError("series 为空")
+        for item in series:
+            if len(item.get("t") or []) > buckets:
+                raise AssertionError(
+                    f"信号 {item.get('signal')} 桶数 {len(item.get('t') or [])} > {buckets}")
+
+        # 预览控件离屏渲染（QWidget.paintEvent，必须不崩）。
+        preview = PreviewWindow(plot_data, time_format="relative_s",
+                                time_format_choices=TIME_FORMAT_CHOICES)
+        preview.resize(1200, 600)
+        preview.show()
+        app.processEvents()
+        pixmap = preview.grab()
+        if pixmap.isNull() or pixmap.width() <= 0:
+            raise AssertionError("预览控件 grab 返回空 pixmap")
+        png_dir = Path(tempfile.mkdtemp(prefix="fblf_plot_png_"))
+        png_path = png_dir / "preview.png"
+        if not pixmap.save(str(png_path), "PNG"):
+            raise AssertionError("预览 PNG 保存失败")
+        png_bytes = png_path.stat().st_size
+
+        # 离线 HTML 报告（同一份 series_for_plot 数据，不为 HTML 再算一遍）。
+        report_dir = Path(tempfile.mkdtemp(prefix="fblf_plot_html_"))
+        out_path = report_dir / report_builder.default_report_name()
+        meta = window._collect_plot_meta("relative_s")
+        result = report_builder.generate_report(plot_data, meta, out_path)
+        if not result.get("ok"):
+            raise AssertionError(f"报告生成失败：{result.get('error')}")
+        if not out_path.is_file():
+            raise AssertionError("报告文件不存在")
+        html_bytes = int(result.get("bytes") or out_path.stat().st_size)
+        if html_bytes >= 8 * 1024 * 1024:
+            raise AssertionError(f"报告体积 {html_bytes} >= 8MB")
+        text = out_path.read_text(encoding="utf-8")
+        if not report_builder.is_self_contained(text):
+            raise AssertionError("报告包含指向 http(s) 的 src/href/fetch 外部引用")
+        if "echarts" not in text.lower():
+            raise AssertionError("报告缺少 echarts 标识")
+        names = {str(item.get("signal")) for item in series}
+        present = sum(1 for name in names if name and name in text)
+        if present < 3:
+            raise AssertionError(f"报告只含 {present} 个信号名（要求 >=3）")
+    except Exception as exc:  # noqa: BLE001 - 自检要把任何异常变成可 grep 的失败行
+        print(f"PLOT_FAIL {type(exc).__name__}: {exc}")
+        return 2
+    finally:
+        if preview is not None:
+            try:
+                preview.close()
+            except RuntimeError:
+                pass
+        if window is not None:
+            _destroy_window(window)
+    print(f"PLOT_OK series={len(series)} buckets={plot_data.get('buckets')} "
+          f"html_bytes={html_bytes} png_bytes={png_bytes}")
+    return 0
+
+
 def _destroy_window(window: QMainWindow) -> None:
     """显式销毁主窗口。
 
@@ -2952,6 +3337,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
     progress_test = "--selftest-progress" in args[1:]
     parse_test = "--selftest-parse" in args[1:]
     fill_test = "--selftest-fill" in args[1:]
+    plot_test = "--selftest-plot" in args[1:]
     dump_target = _dump_target(args[1:])
     app = QApplication.instance() or QApplication(args)
     app.setApplicationName("Fast BLF Converter")
@@ -2968,6 +3354,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
         return run_selftest_progress()
     if parse_test:
         return run_selftest_parse()
+    if plot_test:
+        return run_selftest_plot()
     if deep:
         return run_selftest_deep()
     if dump_target is not None:
