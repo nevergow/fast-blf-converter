@@ -35,7 +35,7 @@ pub use error::{
 };
 pub use exporter::{
     catch_export_panic, export, ExportFormat, ExportOptions, ExportPanicContext, ExportReport,
-    TableResult, TimeFormat,
+    FillPolicy, TableResult, TimeFormat,
 };
 
 // Python 侧异常类名必须是 `CoreError`（见 INTERFACE.md §4），但 Rust 结构体已占用该名字，
@@ -91,10 +91,14 @@ impl ProgressThrottle {
     /// 解码/扫描热路径事件：先做文件维度映射，再按 50ms 节流。
     ///
     /// 返回值表示事件是否被转发（`false` = 被丢弃）。即使被丢弃，文件完成计数仍会推进，
-    /// 避免全局进度因节流而丢步；最后一个文件的完成事件无条件转发，保证 GUI 看到 100%。
+    /// 避免全局进度因节流而丢步；**每个文件的完成事件都无条件转发**（不再只有最后一个），
+    /// 保证 GUI 能看到 `1/N、2/N …` 每一级台阶；帧级事件仍走 50ms 节流。
     pub fn emit_decode(&self, payload: Progress) -> bool {
+        // 在映射（会推进 files_done）之前判断：本事件是否为「单个文件完成」。
+        let is_file_complete =
+            payload.phase == 1 && payload.total > 0 && payload.done >= payload.total;
         let mapped = self.map_file_dimension(payload);
-        if mapped.phase == 1 && mapped.total > 0 && mapped.done >= mapped.total {
+        if is_file_complete {
             self.force(mapped);
             return true;
         }
@@ -569,8 +573,30 @@ pub fn convert<'py>(
     let temp_dir: String = config_required(config, "temp_dir")?;
     let excel_row_limit: u64 = config_optional(config, "excel_row_limit", 1_000_000)?;
     let memory_budget_mb: u64 = config_optional(config, "memory_budget_mb", 1536)?;
-    // ffill 只在「宽表 + 保持原始时序」时生效，由 exporter 判断模式后应用。
+    // Step 14：填充策略与最大保持时长。
+    // `fill_policy` 未显式给出时按路径取默认；`ffill` 是兼容别名（true ⇔ 显式 hold）。
+    let fill_policy_raw: Option<String> = config_optional(config, "fill_policy", None)?;
+    let requested_fill = match fill_policy_raw.as_deref() {
+        Some(raw) => Some(FillPolicy::parse(raw).ok_or_else(|| {
+            CoreError::bad_config(format!(
+                "config 字段 `fill_policy` 非法：`{raw}`（合法值：{}）",
+                FillPolicy::valid_values()
+            ))
+        })?),
+        None => None,
+    };
     let ffill: bool = config_optional(config, "ffill", false)?;
+    let ffill_max_gap_ms: Option<f64> = config_optional(config, "ffill_max_gap_ms", None)?;
+    if let Some(gap) = ffill_max_gap_ms {
+        if !gap.is_finite() || gap <= 0.0 {
+            return Err(CoreError::bad_config(format!(
+                "config 字段 `ffill_max_gap_ms` 必须是有限正数（单位毫秒），收到 {gap}"
+            ))
+            .into());
+        }
+    }
+    // `fill_policy` 优先于 `ffill`（任务书 Step 14 契约）。
+    let explicit_fill = requested_fill.or(if ffill { Some(FillPolicy::Hold) } else { None });
     // 时间列口径：缺省 relative_s；非法值 BAD_CONFIG 并列出 4 个合法值。
     let time_format_raw: String = config_optional(config, "time_format", "relative_s".to_string())?;
     let time_format = TimeFormat::parse(&time_format_raw).ok_or_else(|| {
@@ -615,6 +641,36 @@ pub fn convert<'py>(
             .into());
         }
     }
+
+    // Step 14：把「用户请求 + 路径」解析成**本路径最终生效**的填充策略。
+    // * 拆表：同一报文内周期一致、不产生跨信号空值 → 填充不生效（`None`）；
+    // * 宽表 + 重采样网格：默认 `hold`；显式 `none` 无意义 → 按 `hold` 处理并记 warning；
+    // * 宽表 + 保持原始时序：默认 `none`（= 现状 `ffill=false`），可显式 hold/linear。
+    let mut fill_warnings: Vec<String> = Vec::new();
+    let effective_fill = if split_by_message {
+        FillPolicy::None
+    } else if resample_hz.is_some() {
+        match explicit_fill {
+            Some(FillPolicy::Linear) => FillPolicy::Linear,
+            Some(FillPolicy::None) => {
+                fill_warnings.push(
+                    "重采样网格上 `fill_policy=none` 无意义（网格点必须有值），已按 `hold` 处理"
+                        .to_string(),
+                );
+                FillPolicy::Hold
+            }
+            // 显式 hold，或未显式给出 → 路径默认 hold。
+            _ => FillPolicy::Hold,
+        }
+    } else {
+        explicit_fill.unwrap_or(FillPolicy::None)
+    };
+    // `ffill_max_gap_ms` 仅 `hold` 生效（其它策略即使给了也忽略）。
+    let effective_gap_ms = if effective_fill == FillPolicy::Hold {
+        ffill_max_gap_ms
+    } else {
+        None
+    };
 
     // §5.9：单通道 DBC 失败不得拖垮整体。宽松构建后，失败通道在 plan 里为空，
     // 原因按通道回传（`dbc_errors` + `warnings`）；只有"所选内容全部落空"才 EMPTY_RESULT。
@@ -681,7 +737,8 @@ pub fn convert<'py>(
         format,
         out_dir: PathBuf::from(out_dir),
         excel_row_limit,
-        ffill,
+        fill_policy: effective_fill,
+        ffill_max_gap_ms: effective_gap_ms,
         time_format,
         // 解码期由 ShardSink 原子统计，导出前回填。
         global_min: 0.0,
@@ -819,6 +876,7 @@ pub fn convert<'py>(
     warnings.extend(dbc_warnings);
     warnings.extend(dbc_note_warnings);
     warnings.extend(outcome.warnings);
+    warnings.extend(fill_warnings);
     out.set_item("warnings", warnings)?;
 
     let errors_list = PyList::empty(py);
@@ -841,4 +899,59 @@ fn fast_blf_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(convert, m)?)?;
     m.add("CoreError", m.py().get_type::<CoreErrorPy>())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::{Progress, ProgressThrottle};
+
+    /// 「单个文件完成」事件：`phase=1, done=1, total=1`。
+    fn file_complete() -> Progress {
+        Progress {
+            phase: 1,
+            stage: "decode".to_string(),
+            done: 1,
+            total: 1,
+            file: None,
+            frames_done: 1,
+            message: String::new(),
+        }
+    }
+
+    /// 「文件内帧进度」事件：`phase=1, done=0, total=1`。
+    fn frame_progress() -> Progress {
+        Progress {
+            phase: 1,
+            stage: "decode".to_string(),
+            done: 0,
+            total: 1,
+            file: None,
+            frames_done: 1,
+            message: String::new(),
+        }
+    }
+
+    /// T4/R5：同一节流窗口内，每个「文件完成」事件都必须被转发（不再只放行最后一个）。
+    #[test]
+    fn every_file_completion_is_forwarded_within_one_throttle_window() {
+        let files = 8u64;
+        let throttle = ProgressThrottle::new(None, files);
+        for step in 0..files {
+            assert!(
+                throttle.emit_decode(file_complete()),
+                "第 {} 个文件完成事件被节流吞掉",
+                step + 1
+            );
+        }
+    }
+
+    /// T4/R5：帧级事件仍受 50ms 闸门约束，同一窗口内只应通过第一次。
+    #[test]
+    fn frame_progress_is_still_throttled_within_one_window() {
+        let throttle = ProgressThrottle::new(None, 1);
+        let forwarded = (0..8)
+            .filter(|_| throttle.emit_decode(frame_progress()))
+            .count();
+        assert_eq!(forwarded, 1, "同一节流窗口内帧级事件只应通过第一次");
+    }
 }

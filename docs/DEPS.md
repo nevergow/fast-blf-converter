@@ -266,5 +266,13 @@ SYSTEMTIME 的 8 个 u16 顺序（由 `timestamp_to_systemtime()` 的返回顺�
   大数值 `4294967295`/`3221225472` 均不影响）
 - 同一份字节的不同解码：`cp1252 → "°C"`（正确）／`GB18030 → "癈"`（把 `C` 当尾字节吃掉）
 
+---
 
+## 前端资产（vendor 进仓库，禁止 CDN）
 
+| 资产 | 版本 | 来源 | 大小 | sha256 | 许可 |
+|---|---|---|---|---|---|
+| `gui/assets/echarts.min.js` | Apache ECharts **5.5.1**（UMD min） | `https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js` | 1,030,855 B | `e84270bd0cd5bdf60fefc26d00c2a391cb2e81f4d26a7a9ee16185a54773a3cf` | Apache-2.0（头部保留 ASF 声明） |
+
+用途：v0.3 起「导出 HTML 报告」把该文件**内嵌**进单个 `.html`（报告必须离线可开、可直接发同事）。
+规则：构建期不联网；升级须先校验 sha256 并同步本表与 `gui/assets/NOTICE.txt`。

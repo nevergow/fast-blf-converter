@@ -87,6 +87,66 @@ fast_blf_core.convert(config: dict, progress_cb: Callable[[dict], None] | None =
   直接写出会得到 `0.009999990463256836` 这类尾数；取整到微秒后输出干净且**不损失有效精度**
   （CAN 帧间隔远大于 1µs，取整单调、不会造成乱序或重复）。`absolute` / `unix_s` 不做取整。
 
+### 1.3 `series_for_plot(config) -> dict`（Step 15 新增：画图与统计的唯一数据来源）
+
+```python
+fast_blf_core.series_for_plot(config) -> dict
+```
+
+**为什么单独一个 API**：百万级采样点**绝不能**搬进 Python 再画（内存与卡顿都不可接受）。
+本接口在 Rust 侧完成"解码 + 按时间分桶抽稀"，只把抽稀结果交给 GUI/HTML。
+即：**数据降维在内核里做，画图只画结果**。
+
+config 字段（在 `convert` 的 config 之上）：
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `blf_paths` | `list[str]` | 同 `convert` |
+| `dbc_by_channel` | `dict[int, str]` | 同 `convert` |
+| `selected` | `dict[str, dict[str, list[str]]]` | 同 `convert`（只处理选中的信号） |
+| `time_format` | `str` | 时间轴口径，与导出口径**完全一致**的取值（`relative_s`/`relative_ms`/`absolute`/`unix_s`）。**但返回的 `t` 永远是 float 秒**：`relative_s`→相对秒、`relative_ms`→**秒**（不要返回毫秒，避免两处口径打架）、`unix_s`→epoch 秒、`absolute`→**相对秒**（0 = 全局最早时间戳），同时必须给出 `t_min_str`/`t_max_str`（`YYYY-MM-DD HH:MM:SS.ffffff`，BLF 头墙钟，不换时区）与刻度标签数组（见下） |
+| `buckets` | `int` | 抽稀桶数（屏幕像素宽度量级）。默认 `2000`，允许 `100..20000`，越界报 `CONFIG_INVALID` |
+| `temp_dir` | `str` | 临时目录（复用 convert 语义） |
+
+返回值：
+
+```python
+{
+  "ok": bool,
+  "t_min": float, "t_max": float,        # 全局时间范围（秒；absolute 口径时另给 t_min_str/t_max_str）
+  "buckets": int,                        # 实际使用的桶数
+  "series": [
+    {
+      "channel": int, "message": str, "signal": str, "unit": str | None,
+      "count": int,                      # 该信号的**原始采样点数**（不是桶数）
+      "t":    [float, ...],              # 桶中心时间，长度 = 非空桶数
+      "min":  [float, ...], "max": [float, ...], "mean": [float, ...],
+      "vmin": float, "vmax": float,      # 全量原始数据的最小/最大（不是抽稀后的）
+      "first": float, "last": float,     # 首/末原始采样值
+    }, ...
+  ],
+  "dbc_errors": {"1": str}, "warnings": [str],
+  "errors": [{"file": str, "code": str, "message": str}]
+}
+```
+
+**时间轴与刻度（`absolute` 口径专用，避免前端做字符串数学）**
+* `t_axis`: `[{"t": float, "label": str}, ...]` —— 约 `8~12` 个**等间隔**刻度，`t` 为相对秒，
+  `label` 为该时刻的绝对墙钟字符串（`YYYY-MM-DD HH:MM:SS`，秒级即可，若时间跨度 < 2 秒则给到微秒）。
+  仅当 `time_format == "absolute"` 时返回（其他口径返回 `[]`，前端用数字轴）。
+* `t_min_str` / `t_max_str`：`absolute` 口径时必给；其他口径给 `None`。
+
+**契约要点（逐条实现，缺一条算不合格）**
+1. **抽稀必须是 min/max 包络**：每个桶给出桶内所有采样点的 `min`/`max`/`mean` 与桶中心时间。
+   渲染方按 `min`/`max` 画包络（或用两条折线），**保证不丢峰**——降采样绝不能丢尖峰。
+2. **所有信号共用同一分桶网格**：按全局 `t_min..t_max` 等宽切分，这样多信号可对齐比较；
+   某信号在某桶内无采样 → 该桶位置**跳过不输出**（`t`/`min`/`max`/`mean` 三个数组等长且一一对应）。
+3. **`count`/`vmin`/`vmax`/`first`/`last` 来自全量原始数据**（不是抽稀后算的）——界面要显示
+   "这条曲线背后有 N 个真实采样点"，让用户知道自己在看抽稀结果。
+4. **不返回百万级数组**：每信号返回点数 ≤ `buckets`。
+5. 数值口径与 `convert` 一致：f64 物理量，不做枚举字符串转换。
+6. 宽松构建：单通道 DBC 失败只记 `dbc_errors` 并跳过该通道（同 §5 第 9 条）。
+
 ### 1.2 `convert` 返回值
 
 ```python
@@ -206,6 +266,20 @@ pub struct CoreError { pub code: String, pub message: String, pub detail: Option
 12. **填充策略**：见 §1.1 `fill_policy`。实现必须在**重采样网格**与**保持原始时序**两条路径上都遵循
     `fill_policy`；`linear` 路径必须在 `warnings` 里提示"已对 N 个信号做线性插值（可能出现未采样过的中间值）"。
 13. **`ffill_max_gap_ms`**：仅在 `hold` 生效；超限置空的行数必须计入 `warnings`（人话，带信号名与行数）。
+
+14. **画图预览（Step 16）**：勾选 ≥1 个信号后「📈 预览」打开独立窗口。
+    * 横轴口径必须跟随界面上的「时间格式」下拉（与导出口径一致）；
+    * 不同量纲信号（V / °C / A）**必须分 Y 轴**或归一化，不允许硬塞进同一 Y 轴造成误读；
+    * 界面必须显示每信号的**原始采样点数**与"已抽稀为 N 桶（min/max 包络，不丢峰）"的说明——
+      绝不能让用户以为看到的是全部原始点；
+    * 渲染线程不得参与解码：数据只能来自 `series_for_plot`（见 §1.3），不得在 GUI 里遍历 BLF。
+15. **导出 HTML 报告（Step 16）**：单个 `.html` 文件、**离线可开**、图表库必须内嵌（**禁止 CDN**）；
+    包含：时间范围、每信号的原始点数与 min/max/mean 统计、可缩放/悬停读数的曲线；
+    文件体积 < 8MB；生成失败要有明确错误码，不得产出半截文件。
+16. **不新增 Python 侧依赖**：桌面预览必须走 PySide6 自带能力、自绘（QPainter）或纯 Python 实现
+    （**优先自绘**：min/max 包络与量纲分轴都需要精确控制，且零打包风险）。
+    HTML 报告允许内嵌**已由 Hermes 主会话审阅并 vendor 进仓库的前端库**（必须有 license 说明、
+    记录在 `docs/DEPS.md`、且构建期不联网）；任何 Python/二进制依赖的新增都必须先经批准。
 
 ## 6. 验收标准（由 Hermes 主会话执行，DSH 交付后必须自查一遍）
 

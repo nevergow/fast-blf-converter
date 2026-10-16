@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 
 use fast_blf_core::{
     catch_export_panic, export, normalize_dbc_bytes, process_file, read_file_timing, CoreError,
-    DecodePlan, ExportFormat, ExportOptions, ExportPanicContext, ExportReport, Progress,
-    ProgressThrottle, Selection, ShardSink, TimeFormat, DBC_PARSE, EXPORT_INTERNAL,
+    DecodePlan, ExportFormat, ExportOptions, ExportPanicContext, ExportReport, FillPolicy,
+    Progress, ProgressThrottle, Selection, ShardSink, TimeFormat, DBC_PARSE, EXPORT_INTERNAL,
 };
 use polars::prelude::*;
 use pyo3::prelude::*;
@@ -50,7 +50,8 @@ fn setup() -> Fixture {
 
 /// 跑一遍「解码落分片 → 合并导出」的通用入口，返回 `(report, 解码命中帧数)`。
 ///
-/// * `resample_hz` / `ffill` 透传给 `ExportOptions`；
+/// * `resample_hz` / `ffill` 透传给 [`run_export_fill`]；为兼容旧用例：
+///   `ffill=true` → `hold`；宽表 + 重采样沿用旧的线性插值行为（`linear`）；否则 `none`；
 /// * 结束后清理分片，模拟 `convert` 的行为。
 #[allow(clippy::too_many_arguments)]
 fn run_export_full(
@@ -63,6 +64,41 @@ fn run_export_full(
     excel_row_limit: u64,
     resample_hz: Option<f64>,
     ffill: bool,
+) -> (ExportReport, u64) {
+    let fill_policy = if ffill {
+        FillPolicy::Hold
+    } else if resample_hz.is_some() {
+        FillPolicy::Linear
+    } else {
+        FillPolicy::None
+    };
+    run_export_fill(
+        blf,
+        dbc_map,
+        root,
+        out_name,
+        split,
+        format,
+        excel_row_limit,
+        resample_hz,
+        fill_policy,
+        None,
+    )
+}
+
+/// 同 [`run_export_full`]，但显式指定最终生效的 [`FillPolicy`] 与最大保持时长。
+#[allow(clippy::too_many_arguments)]
+fn run_export_fill(
+    blf: &Path,
+    dbc_map: &BTreeMap<u32, PathBuf>,
+    root: &Path,
+    out_name: &str,
+    split: bool,
+    format: ExportFormat,
+    excel_row_limit: u64,
+    resample_hz: Option<f64>,
+    fill_policy: FillPolicy,
+    ffill_max_gap_ms: Option<f64>,
 ) -> (ExportReport, u64) {
     let plan = DecodePlan::build(dbc_map, &Selection::default()).expect("构建解码计划");
     let temp = root.join(format!("{out_name}_shards"));
@@ -79,7 +115,8 @@ fn run_export_full(
         format,
         out_dir,
         excel_row_limit,
-        ffill,
+        fill_policy,
+        ffill_max_gap_ms,
         time_format: TimeFormat::RelativeS,
         global_min: sink.global_min(),
         file_timings: vec![read_file_timing(blf)],
@@ -603,6 +640,423 @@ fn case11_wide_ffill_fills_internal_nulls() {
             "第 {row} 行 Res 应被前向填充为 42，实际 {value}"
         );
     }
+}
+
+/// 在 DataFrame 里找 `timestamp ≈ target` 的那一行，返回该行某列的值。
+fn value_at_time(df: &DataFrame, column: &str, target: f64) -> Option<f64> {
+    let times = f64_values(df, "timestamp");
+    let values = f64_values(df, column);
+    for (idx, time) in times.iter().enumerate() {
+        if let Some(time) = time {
+            if (time - target).abs() < 1e-9 {
+                return values.get(idx).copied().flatten();
+            }
+        }
+    }
+    None
+}
+
+/// Step 14 用例 1：宽表 + 10Hz 网格 + `hold` → 值全部来自原始采样集合，不造假值。
+///
+/// `Res`（1Hz，原始采样 = {0,1,2,3,4}）在 t=0.5 处必须保持 t=0 的 0.0，
+/// 而线性插值会造出从未采样过的 0.5。
+#[test]
+fn case18_wide_resample_hold_uses_only_original_samples() {
+    let fx = setup();
+    let (report, _) = run_export_fill(
+        &fx.blf,
+        &fx.dbc_map,
+        &fx.out_root,
+        "fill_hold_wide",
+        false,
+        ExportFormat::Csv,
+        1_000_000,
+        Some(10.0),
+        FillPolicy::Hold,
+        None,
+    );
+    let df = read_csv(Path::new(&report.tables[0].path));
+
+    let original: Vec<f64> = (0..=4).map(|i| i as f64).collect();
+    for value in f64_values(&df, "Res").iter().flatten() {
+        assert!(
+            original.contains(value),
+            "hold 产生了原始采样集合之外的值：{value}"
+        );
+    }
+    assert_eq!(
+        value_at_time(&df, "Res", 0.5),
+        Some(0.0),
+        "hold 在 t=0.5 应保持 0.0；出现 0.5 说明误用了线性插值"
+    );
+}
+
+/// Step 14 用例 2：显式 `linear` 必须与旧的重采样行为逐字节一致（回归红线）。
+#[test]
+fn case19_wide_resample_linear_matches_legacy_behavior() {
+    let fx = setup();
+    let (explicit, _) = run_export_fill(
+        &fx.blf,
+        &fx.dbc_map,
+        &fx.out_root,
+        "fill_linear_wide",
+        false,
+        ExportFormat::Csv,
+        1_000_000,
+        Some(10.0),
+        FillPolicy::Linear,
+        None,
+    );
+    // `run_export_full(..., ffill=false)` 在重采样路径沿用旧的线性行为。
+    let (legacy, _) = run_export_full(
+        &fx.blf,
+        &fx.dbc_map,
+        &fx.out_root,
+        "fill_linear_legacy",
+        false,
+        ExportFormat::Csv,
+        1_000_000,
+        Some(10.0),
+        false,
+    );
+
+    let explicit_csv = std::fs::read_to_string(&explicit.tables[0].path).expect("读显式 linear CSV");
+    let legacy_csv = std::fs::read_to_string(&legacy.tables[0].path).expect("读旧行为 CSV");
+    assert_eq!(
+        explicit_csv, legacy_csv,
+        "显式 linear 必须与旧的重采样输出逐字节一致"
+    );
+
+    let df = read_csv(Path::new(&explicit.tables[0].path));
+    assert_eq!(
+        value_at_time(&df, "Res", 0.5),
+        Some(0.5),
+        "linear 在 t=0.5 应插值为 0.5"
+    );
+    assert!(explicit
+        .warnings
+        .iter()
+        .any(|w| w.contains("线性插值") && w.contains("5 个信号")),
+        "linear 必须给出逐信号计数的 warning：{:?}",
+        explicit.warnings
+    );
+}
+
+/// Step 14 用例 3：`hold + ffill_max_gap_ms=50` → 1Hz 的 `Res` 超限点必须置空并计入 warning。
+#[test]
+fn case20_hold_max_gap_nullifies_stale_points() {
+    let fx = setup();
+    let (report, _) = run_export_fill(
+        &fx.blf,
+        &fx.dbc_map,
+        &fx.out_root,
+        "fill_gap_wide",
+        false,
+        ExportFormat::Csv,
+        1_000_000,
+        Some(10.0),
+        FillPolicy::Hold,
+        Some(50.0),
+    );
+    let df = read_csv(Path::new(&report.tables[0].path));
+
+    assert!(
+        df.column("Res").expect("Res 列").null_count() > 0,
+        "1Hz 的 Res 在 10Hz 网格上超过 50ms 的点必须置空"
+    );
+    assert_eq!(
+        df.column("Spd").expect("Spd 列").null_count(),
+        0,
+        "10ms 的 Spd 每拍都有新采样，不应被置空"
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("最大保持时长") && w.contains("Res") && w.contains("50ms")),
+        "超限置空必须给出按信号的人话 warning：{:?}",
+        report.warnings
+    );
+}
+
+/// Step 14 的 `convert` config：按需写入 `fill_policy` / `ffill_max_gap_ms` / `ffill`。
+#[allow(clippy::too_many_arguments)]
+fn fill_config<'py>(
+    py: Python<'py>,
+    fx: &Fixture,
+    out_name: &str,
+    split: bool,
+    resample_hz: Option<f64>,
+    fill_policy: Option<&str>,
+    ffill_max_gap_ms: Option<f64>,
+    ffill: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    let config = PyDict::new(py);
+    config.set_item("blf_paths", vec![fx.blf.to_string_lossy().to_string()])?;
+    let dbc_py: HashMap<u32, String> = fx
+        .dbc_map
+        .iter()
+        .map(|(&channel, path)| (channel, path.to_string_lossy().to_string()))
+        .collect();
+    config.set_item("dbc_by_channel", dbc_py)?;
+    config.set_item(
+        "selected",
+        HashMap::<String, HashMap<String, Vec<String>>>::new(),
+    )?;
+    config.set_item("split_by_message", split)?;
+    match resample_hz {
+        Some(hz) => config.set_item("resample_hz", hz)?,
+        None => config.set_item("resample_hz", py.None())?,
+    }
+    config.set_item("export_format", "csv")?;
+    config.set_item(
+        "out_dir",
+        fx.out_root.join(out_name).to_string_lossy().to_string(),
+    )?;
+    config.set_item(
+        "temp_dir",
+        fx.out_root
+            .join(format!("{out_name}_shards"))
+            .to_string_lossy()
+            .to_string(),
+    )?;
+    config.set_item("excel_row_limit", 1_000_000i64)?;
+    config.set_item("memory_budget_mb", 256i64)?;
+    if let Some(policy) = fill_policy {
+        config.set_item("fill_policy", policy)?;
+    }
+    if let Some(gap) = ffill_max_gap_ms {
+        config.set_item("ffill_max_gap_ms", gap)?;
+    }
+    if ffill {
+        config.set_item("ffill", true)?;
+    }
+    Ok(config)
+}
+
+/// 取 `convert` 报告里第一张表的落盘路径。
+fn first_table_path(report: &Bound<'_, PyDict>) -> String {
+    let tables = report
+        .get_item("tables")
+        .expect("读取 tables")
+        .expect("含 tables")
+        .cast_into::<PyList>()
+        .expect("tables 是 list");
+    let first = tables.get_item(0).expect("第一张表").cast_into::<PyDict>().expect("table 是 dict");
+    first
+        .get_item("path")
+        .expect("读取 path")
+        .expect("含 path")
+        .extract::<String>()
+        .expect("path 是字符串")
+}
+
+/// Step 14 用例 4：非法 `fill_policy` / `ffill_max_gap_ms` 必须是带人话的 `BAD_CONFIG`。
+#[test]
+fn case21_convert_rejects_invalid_fill_config() {
+    let fx = setup();
+    with_python(|py| -> PyResult<()> {
+        let bad_policy = fill_config(
+            py,
+            &fx,
+            "fill_bad_policy",
+            false,
+            Some(10.0),
+            Some("zoh"),
+            None,
+            false,
+        )?;
+        let err = fast_blf_core::convert(py, &bad_policy, None)
+            .expect_err("非法 fill_policy 必须报错")
+            .to_string();
+        assert!(err.contains("BAD_CONFIG"), "错误码应为 BAD_CONFIG：{err}");
+        assert!(err.contains("zoh"), "错误消息应附上收到的值：{err}");
+
+        let bad_gap = fill_config(
+            py,
+            &fx,
+            "fill_bad_gap",
+            false,
+            None,
+            Some("hold"),
+            Some(0.0),
+            false,
+        )?;
+        let err = fast_blf_core::convert(py, &bad_gap, None)
+            .expect_err("ffill_max_gap_ms=0 必须报错")
+            .to_string();
+        assert!(err.contains("BAD_CONFIG"), "错误码应为 BAD_CONFIG：{err}");
+        assert!(
+            err.contains("ffill_max_gap_ms"),
+            "错误消息应点名字段：{err}"
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// Step 14 用例 5：网格路径显式 `none` → 按 `hold` 处理并记 warning；`ffill=true` 仍等价于 hold。
+#[test]
+fn case22_convert_grid_none_falls_back_to_hold_and_ffill_alias_works() {
+    let fx = setup();
+    with_python(|py| -> PyResult<()> {
+        let none_cfg = fill_config(
+            py,
+            &fx,
+            "fill_grid_none",
+            false,
+            Some(10.0),
+            Some("none"),
+            None,
+            false,
+        )?;
+        let none_report = fast_blf_core::convert(py, &none_cfg, None)?;
+        let warnings = warning_texts(&none_report);
+        assert!(
+            warnings.iter().any(|w| w.contains("none") && w.contains("hold")),
+            "网格路径 none 必须按 hold 处理并记 warning：{warnings:?}"
+        );
+
+        // 显式 hold + `ffill=true` 别名都应与 none 回退结果一致。
+        let hold_cfg = fill_config(
+            py,
+            &fx,
+            "fill_grid_hold",
+            false,
+            Some(10.0),
+            Some("hold"),
+            None,
+            false,
+        )?;
+        let hold_report = fast_blf_core::convert(py, &hold_cfg, None)?;
+        let ffill_cfg = fill_config(
+            py,
+            &fx,
+            "fill_grid_alias",
+            false,
+            Some(10.0),
+            None,
+            None,
+            true,
+        )?;
+        let ffill_report = fast_blf_core::convert(py, &ffill_cfg, None)?;
+
+        let none_csv = std::fs::read_to_string(first_table_path(&none_report)).expect("读 none CSV");
+        let hold_csv = std::fs::read_to_string(first_table_path(&hold_report)).expect("读 hold CSV");
+        let ffill_csv =
+            std::fs::read_to_string(first_table_path(&ffill_report)).expect("读 ffill CSV");
+        assert_eq!(none_csv, hold_csv, "网格 none 回退结果必须与显式 hold 一致");
+        assert_eq!(hold_csv, ffill_csv, "ffill=true 必须等价于显式 hold");
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// Step 14 用例 6：宽表 + 保持原始时序 + `linear` → 在并集时间轴上线性插值。
+#[test]
+fn case23_temporal_wide_linear_interpolates_on_union_timeline() {
+    let fx = setup();
+    let (report, _) = run_export_fill(
+        &fx.blf,
+        &fx.dbc_map,
+        &fx.out_root,
+        "fill_linear_temporal",
+        false,
+        ExportFormat::Csv,
+        1_000_000,
+        None,
+        FillPolicy::Linear,
+        None,
+    );
+    let df = read_csv(Path::new(&report.tables[0].path));
+    assert_eq!(
+        value_at_time(&df, "Res", 0.5),
+        Some(0.5),
+        "并集时间轴上 Res 应线性插值为 0.5"
+    );
+    assert_eq!(value_at_time(&df, "Res", 3.5), Some(3.5));
+    assert_eq!(
+        value_at_time(&df, "Res", 0.0),
+        Some(0.0),
+        "首个真实采样处应取原值"
+    );
+}
+
+/// Step 14 用例 7：宽表 + 保持原始时序下 `none` / `hold` / `hold + gap` 的差别。
+#[test]
+fn case24_temporal_hold_max_gap_and_none_semantics() {
+    let fx = setup();
+
+    // none：原时序宽表如实留空。
+    let (none_report, _) = run_export_fill(
+        &fx.blf,
+        &fx.dbc_map,
+        &fx.out_root,
+        "fill_temporal_none",
+        false,
+        ExportFormat::Csv,
+        1_000_000,
+        None,
+        FillPolicy::None,
+        None,
+    );
+    let none_df = read_csv(Path::new(&none_report.tables[0].path));
+    assert!(
+        none_df.column("Res").expect("Res 列").null_count() > 0,
+        "none 时周期不同的 Res 应留空"
+    );
+
+    // hold（不限制 gap）：内部空值全部保持，整列不再有空值。
+    let (hold_report, _) = run_export_fill(
+        &fx.blf,
+        &fx.dbc_map,
+        &fx.out_root,
+        "fill_temporal_hold",
+        false,
+        ExportFormat::Csv,
+        1_000_000,
+        None,
+        FillPolicy::Hold,
+        None,
+    );
+    let hold_df = read_csv(Path::new(&hold_report.tables[0].path));
+    assert_eq!(
+        hold_df.column("Res").expect("Res 列").null_count(),
+        0,
+        "hold 无 gap 时内部空值应全部保持"
+    );
+
+    // hold + gap=50ms：100ms 的 Temp1 陈旧行必须置空，10ms 的 Spd 不受影响。
+    let (gap_report, _) = run_export_fill(
+        &fx.blf,
+        &fx.dbc_map,
+        &fx.out_root,
+        "fill_temporal_gap",
+        false,
+        ExportFormat::Csv,
+        1_000_000,
+        None,
+        FillPolicy::Hold,
+        Some(50.0),
+    );
+    let gap_df = read_csv(Path::new(&gap_report.tables[0].path));
+    assert!(
+        gap_df.column("Temp1").expect("Temp1 列").null_count() > 0,
+        "100ms 的 Temp1 超过 50ms 的行应被置空"
+    );
+    assert_eq!(
+        gap_df.column("Spd").expect("Spd 列").null_count(),
+        0,
+        "10ms 的 Spd 每拍都有新采样，不应被置空"
+    );
+    assert!(
+        gap_report
+            .warnings
+            .iter()
+            .any(|w| w.contains("最大保持时长") && w.contains("Temp1")),
+        "原时序 hold 的超限置空也必须给出 warning：{:?}",
+        gap_report.warnings
+    );
 }
 
 /// 写入一帧（测试辅助）。
@@ -1145,7 +1599,8 @@ fn run_timefmt_export_full(
         format,
         out_dir,
         excel_row_limit: 1_000_000,
-        ffill: false,
+        fill_policy: FillPolicy::None,
+        ffill_max_gap_ms: None,
         time_format,
         global_min: sink.global_min(),
         file_timings: blfs.iter().map(|path| read_file_timing(path)).collect(),

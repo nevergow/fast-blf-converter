@@ -1,0 +1,14 @@
+gui/assets/echarts.min.js —— 溯源与许可
+==========================================
+
+用途：Fast BLF Converter 导出的 **离线 HTML 报告**（v0.3 起）内嵌的图表库。
+    报告必须能发给同事、对方断网也能打开，因此**禁止 CDN**，库文件随包分发。
+
+来源：https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js
+版本：Apache ECharts 5.5.1（UMD 压缩版）
+大小：1,030,855 字节
+sha256：e84270bd0cd5bdf60fefc26d00c2a391cb2e81f4d26a7a9ee16185a54773a3cf
+许可：Apache License 2.0（文件头部保留 ASF 许可声明，未做任何修改）
+
+约束：本文件**只读**，不得修改内容（改动会导致哈希与许可声明不一致）。
+升级流程：下载新版本 → 用 sha256 校验 → 更新本文件的版本/大小/哈希 → 同步 docs/DEPS.md。

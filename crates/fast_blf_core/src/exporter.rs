@@ -74,6 +74,42 @@ impl ExportFormat {
     }
 }
 
+/// 填充策略（`docs/INTERFACE.md` §1.1 的 `fill_policy`）。
+///
+/// * [`FillPolicy::None`]：不填充，原样留空；
+/// * [`FillPolicy::Hold`]：阶梯保持（ZOH）——把最近一次**真实采样**保持到下一拍，
+///   绝不产生原始采样集合之外的值；
+/// * [`FillPolicy::Linear`]：线性插值——会在两个真实采样点之间造出从未采样过的值。
+///
+/// `lib.rs` 负责结合路径（拆表 / 宽表原时序 / 宽表网格）把用户请求解析成这里的
+/// **最终生效策略**，`exporter` 只按它执行，绝不再回读原始 config。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillPolicy {
+    None,
+    Hold,
+    Linear,
+}
+
+impl FillPolicy {
+    /// 三个合法取值（错误消息里按此顺序列出）。
+    pub const VALID: [&'static str; 3] = ["none", "hold", "linear"];
+
+    /// 解析 config 字符串；非法值返回 `None`（由调用方转 `BAD_CONFIG`）。
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.to_ascii_lowercase().as_str() {
+            "none" => Some(FillPolicy::None),
+            "hold" => Some(FillPolicy::Hold),
+            "linear" => Some(FillPolicy::Linear),
+            _ => None,
+        }
+    }
+
+    /// 合法值拼接串，供错误消息使用。
+    pub fn valid_values() -> String {
+        Self::VALID.join(" / ")
+    }
+}
+
 /// `timestamp` 列的四种口径（`docs/INTERFACE.md` §1.1 的 `time_format`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeFormat {
@@ -117,8 +153,11 @@ pub struct ExportOptions {
     pub format: ExportFormat,
     pub out_dir: PathBuf,
     pub excel_row_limit: u64,
-    /// 仅在「宽表 + 保持原始时序」时生效：outer join 后对信号列做前向填充。
-    pub ffill: bool,
+    /// `lib.rs` 结合路径解析出的**最终生效**填充策略（见 [`FillPolicy`]）。
+    pub fill_policy: FillPolicy,
+    /// 仅 `hold` 生效：向前保持超过该毫秒数仍未收到新采样时，该点置空。
+    /// `None` = 不限制。
+    pub ffill_max_gap_ms: Option<f64>,
     /// `timestamp` 列口径；缺省 `relative_s`。
     pub time_format: TimeFormat,
     /// 本次任务全部输入文件全部帧的最小 `msg.timestamp`（解码期原子统计）。
@@ -432,8 +471,8 @@ fn export_inner(
         warnings: Vec::new(),
     };
 
-    // 保持原始时序的宽表本来就会因周期不同产生空值，如实提示（ffill 后不再是问题）。
-    if !opts.split_by_message && opts.resample_hz.is_none() && !opts.ffill {
+    // 保持原始时序的宽表本来就会因周期不同产生空值，如实提示（已填充 / 重采样后不再是问题）。
+    if !opts.split_by_message && opts.resample_hz.is_none() && opts.fill_policy == FillPolicy::None {
         report
             .warnings
             .push("未重采样：宽表会因周期不同产生空值".to_string());
@@ -481,7 +520,8 @@ fn prepare_split_table(
     }
 }
 
-/// 宽表准备：无重采样走 outer join（可选 ffill）；有重采样走全局网格重采样。
+/// 宽表准备：无重采样走 outer join（按 `fill_policy` 可选 hold/linear）；有重采样走全局
+/// 网格重采样（hold/linear 见 [`prepare_wide_resampled`]）。
 ///
 /// 两条分支共用同一份 [`WideNames`] 列名规划，保证宽表列名（含冲突消歧）完全一致。
 fn prepare_wide(
@@ -492,29 +532,69 @@ fn prepare_wide(
 ) -> Result<(DataFrame, Vec<String>), CoreError> {
     let names = plan_wide_names(tables);
     match opts.resample_hz {
-        Some(hz) => prepare_wide_resampled(tables, hz, transform, &names, progress),
+        Some(hz) => prepare_wide_resampled(
+            tables,
+            hz,
+            transform,
+            &names,
+            progress,
+            opts.fill_policy,
+            hold_gap_seconds(opts),
+        ),
         None => {
             let wide = merge_wide(tables, transform, &names, progress)?;
-            let wide = if opts.ffill {
-                forward_fill_frame(&wide)?
-            } else {
-                wide
+            let mut warnings = names.warnings.clone();
+            let wide = match opts.fill_policy {
+                FillPolicy::None => wide,
+                FillPolicy::Hold => {
+                    let (filled, gap_counts) = forward_fill_frame(&wide, hold_gap_seconds(opts))?;
+                    let labels = wide_column_labels(tables, &names);
+                    let labeled: Vec<(String, u64)> = gap_counts
+                        .iter()
+                        .map(|(column, count)| {
+                            let label = labels
+                                .get(column)
+                                .cloned()
+                                .unwrap_or_else(|| column.clone());
+                            (label, *count)
+                        })
+                        .collect();
+                    warnings.extend(format_gap_warnings(&labeled, opts.ffill_max_gap_ms));
+                    filled
+                }
+                FillPolicy::Linear => {
+                    let (filled, count) = linear_fill_frame(&wide)?;
+                    warnings.push(linear_fill_warning(count));
+                    filled
+                }
             };
-            Ok((wide, names.warnings))
+            Ok((wide, warnings))
         }
+    }
+}
+
+/// `hold` 的最大保持时长（秒）；非 `hold` 策略一律返回 `None`（契约：仅 hold 生效）。
+fn hold_gap_seconds(opts: &ExportOptions) -> Option<f64> {
+    if opts.fill_policy == FillPolicy::Hold {
+        opts.ffill_max_gap_ms.map(|ms| ms / 1000.0)
+    } else {
+        None
     }
 }
 
 /// 宽表重采样：全局网格 = 所有表时间戳区间的并集，步长 `1/hz`。
 ///
-/// 第一遍只用 lazy `min/max` 求全局区间（不把数据读进内存），第二遍逐表合并、重采样到
-/// 同一网格后横向拼接；因为所有列共用同一个网格向量，结果按构造**不含空值**。
+/// 第一遍只用 lazy `min/max` 求全局区间（不把数据读进内存），第二遍逐表合并、按
+/// `fill_policy` 落到同一网格后横向拼接；因为所有列共用同一个网格向量，`hold` 下
+/// 网格点之前（该信号尚无真实采样）为 `null`，其余点由最近真实采样保持。
 fn prepare_wide_resampled(
     tables: &BTreeMap<TableKey, TableShards>,
     hz: f64,
     transform: &TimeTransform,
     names: &WideNames,
     progress: &dyn Fn(Progress),
+    fill_policy: FillPolicy,
+    max_gap_s: Option<f64>,
 ) -> Result<(DataFrame, Vec<String>), CoreError> {
     let total = tables.len() as u64;
 
@@ -540,6 +620,10 @@ fn prepare_wide_resampled(
         grid.clone(),
     )));
 
+    let mut warnings: Vec<String> = names.warnings.clone();
+    let mut linear_signals = 0u64;
+    let mut gap_counts: Vec<(String, u64)> = Vec::new();
+
     for (idx, (key, shards)) in tables.iter().enumerate() {
         progress(Progress {
             phase: 2,
@@ -558,17 +642,45 @@ fn prepare_wide_resampled(
         })?;
         for (signal, final_name) in shards.signal_names.iter().zip(finals.iter()) {
             let values = f64_column(&df, signal)?;
-            let resampled = resample_linear(&times, &values, &grid);
-            columns.push(Column::from(Series::from_vec(
-                final_name.as_str().into(),
-                resampled,
-            )));
+            match fill_policy {
+                FillPolicy::Linear => {
+                    let resampled = resample_linear(&times, &values, &grid);
+                    columns.push(Column::from(Series::from_vec(
+                        final_name.as_str().into(),
+                        resampled,
+                    )));
+                    linear_signals += 1;
+                }
+                // `none` 在网格路径上无意义：由 lib.rs 归一成 `hold`，这里也按 hold 兜底。
+                FillPolicy::None | FillPolicy::Hold => {
+                    let (resampled, nulled) =
+                        resample_hold(&times, &values, &grid, max_gap_s);
+                    if nulled > 0 {
+                        gap_counts.push((
+                            format!("Ch{}/{}（信号 {}）", key.channel, key.message, signal),
+                            nulled,
+                        ));
+                    }
+                    columns.push(Column::from(Series::new(
+                        final_name.as_str().into(),
+                        resampled,
+                    )));
+                }
+            }
         }
     }
 
+    if linear_signals > 0 {
+        warnings.push(linear_fill_warning(linear_signals));
+    }
+    warnings.extend(format_gap_warnings(
+        &gap_counts,
+        max_gap_s.map(|gap| gap * 1000.0),
+    ));
+
     let wide = DataFrame::new_infer_height(columns)
         .map_err(|err| CoreError::export_failed(format!("组装重采样宽表失败：{err}")))?;
-    Ok((wide, names.warnings.clone()))
+    Ok((wide, warnings))
 }
 
 // ---------------------------------------------------------------------------
@@ -985,20 +1097,156 @@ fn merge_wide(
         .map_err(|err| CoreError::export_failed(format!("宽表排序失败：{err}")))
 }
 
-/// 对宽表所有列做前向填充（`timestamp` 无空值，填充它无害）。
-fn forward_fill_frame(df: &DataFrame) -> Result<DataFrame, CoreError> {
-    let exprs: Vec<Expr> = df
-        .get_column_names()
+/// 对宽表所有信号列做**阶梯保持**（ZOH）前向填充，并应用最大保持时长。
+///
+/// * 行首（第一个真实采样之前）无值可保持 → 一律 `null`，且不计入"超限置空"；
+/// * 内部空值：若 `max_gap_s` 为 `Some(gap)` 且 `行时间 - 最近真实采样时间 > gap`
+///   → 该行置空并计入返回的按列超限计数，否则保持最近真实采样值；
+/// * 输出值**严格取自该列的原始采样值集合**，不做任何插值。
+///
+/// 返回 `(填充后的 DataFrame, 每列超限置空行数)`。
+fn forward_fill_frame(
+    df: &DataFrame,
+    max_gap_s: Option<f64>,
+) -> Result<(DataFrame, Vec<(String, u64)>), CoreError> {
+    let times = f64_column(df, "timestamp")?;
+    let mut columns: Vec<Column> = Vec::with_capacity(df.width());
+    let timestamp = df
+        .column("timestamp")
+        .map_err(|err| CoreError::export_failed(format!("缺少列 `timestamp`：{err}")))?
+        .clone();
+    columns.push(timestamp);
+
+    let mut gap_counts: Vec<(String, u64)> = Vec::new();
+    for name in df.get_column_names() {
+        if name.as_str() == "timestamp" {
+            continue;
+        }
+        let values = f64_column(df, name.as_str())?;
+        let mut out: Vec<Option<f64>> = Vec::with_capacity(times.len());
+        // 最近一次真实采样：`(时间, 值)`。
+        let mut last: Option<(f64, f64)> = None;
+        let mut nulled = 0u64;
+        for (idx, value) in values.iter().enumerate() {
+            if value.is_nan() {
+                match last {
+                    Some((sample_time, held)) => {
+                        let too_old = max_gap_s
+                            .map(|gap| times[idx] - sample_time > gap)
+                            .unwrap_or(false);
+                        if too_old {
+                            out.push(None);
+                            nulled += 1;
+                        } else {
+                            out.push(Some(held));
+                        }
+                    }
+                    None => out.push(None),
+                }
+            } else {
+                last = Some((times[idx], *value));
+                out.push(Some(*value));
+            }
+        }
+        if nulled > 0 {
+            gap_counts.push((name.to_string(), nulled));
+        }
+        columns.push(Column::from(Series::new(name.as_str().into(), out)));
+    }
+
+    let filled = DataFrame::new_infer_height(columns)
+        .map_err(|err| CoreError::export_failed(format!("宽表前向填充失败：{err}")))?;
+    Ok((filled, gap_counts))
+}
+
+/// 在并集时间轴上对宽表每个信号做线性插值（复用 [`resample_linear`] 的插值实现）。
+///
+/// 返回 `(插值后的 DataFrame, 被插值的信号数)`。行首（第一个真实采样之前）沿用
+/// [`resample_linear`] 的 backward clamp 语义，与网格路径保持一致。
+fn linear_fill_frame(df: &DataFrame) -> Result<(DataFrame, u64), CoreError> {
+    let times = f64_column(df, "timestamp")?;
+    let mut columns: Vec<Column> = Vec::with_capacity(df.width());
+    let timestamp = df
+        .column("timestamp")
+        .map_err(|err| CoreError::export_failed(format!("缺少列 `timestamp`：{err}")))?
+        .clone();
+    columns.push(timestamp);
+
+    let mut signal_count = 0u64;
+    for name in df.get_column_names() {
+        if name.as_str() == "timestamp" {
+            continue;
+        }
+        let values = f64_column(df, name.as_str())?;
+        let mut sample_times: Vec<f64> = Vec::new();
+        let mut sample_values: Vec<f64> = Vec::new();
+        for (idx, value) in values.iter().enumerate() {
+            if !value.is_nan() {
+                sample_times.push(times[idx]);
+                sample_values.push(*value);
+            }
+        }
+        let out: Vec<Option<f64>> = if sample_times.is_empty() {
+            vec![None; times.len()]
+        } else {
+            resample_linear(&sample_times, &sample_values, &times)
+                .into_iter()
+                .map(Some)
+                .collect()
+        };
+        signal_count += 1;
+        columns.push(Column::from(Series::new(name.as_str().into(), out)));
+    }
+
+    let filled = DataFrame::new_infer_height(columns)
+        .map_err(|err| CoreError::export_failed(format!("宽表线性插值失败：{err}")))?;
+    Ok((filled, signal_count))
+}
+
+/// 宽表最终列名 → `Ch{ch}/{msg}（信号 {sig}）` 标签，供填充类 warning 定位到信号。
+fn wide_column_labels(
+    tables: &BTreeMap<TableKey, TableShards>,
+    names: &WideNames,
+) -> BTreeMap<String, String> {
+    let mut labels: BTreeMap<String, String> = BTreeMap::new();
+    for (key, shards) in tables {
+        let Some(finals) = names.per_table.get(key) else {
+            continue;
+        };
+        for (signal, final_name) in shards.signal_names.iter().zip(finals.iter()) {
+            labels.insert(
+                final_name.clone(),
+                format!("Ch{}/{}（信号 {}）", key.channel, key.message, signal),
+            );
+        }
+    }
+    labels
+}
+
+/// 线性插值 warning（契约 §5.12）。
+fn linear_fill_warning(signals: u64) -> String {
+    format!("已对 {signals} 个信号做线性插值（可能包含从未采样过的中间值）")
+}
+
+/// 把 `(标签, 超限行数)` 列表格式化为 `ffill_max_gap_ms` 的人话 warning。
+fn format_gap_warnings(counts: &[(String, u64)], max_gap_ms: Option<f64>) -> Vec<String> {
+    let ms_text = max_gap_ms.map(format_gap_ms).unwrap_or_else(|| "?".to_string());
+    counts
         .iter()
-        .map(|name| {
-            col(name.as_str()).fill_null_with_strategy(FillNullStrategy::Forward(None))
+        .filter(|(_label, count)| *count > 0)
+        .map(|(label, count)| {
+            format!("{label}：{count} 行因超过最大保持时长（{ms_text}ms）被置空")
         })
-        .collect();
-    df.clone()
-        .lazy()
-        .with_columns(exprs)
         .collect()
-        .map_err(|err| CoreError::export_failed(format!("宽表前向填充失败：{err}")))
+}
+
+/// 毫秒数的人话格式：整数不带 `.0` 尾巴，非整数保留原样。
+fn format_gap_ms(ms: f64) -> String {
+    if ms.is_finite() && ms.fract() == 0.0 && ms.abs() < i64::MAX as f64 {
+        format!("{}", ms as i64)
+    } else {
+        format!("{ms}")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,6 +1313,53 @@ pub fn resample_linear(times: &[f64], values: &[f64], grid: &[f64]) -> Vec<f64> 
         out.push(value);
     }
     out
+}
+
+/// 纯函数：把 `(times, values)`（按时间升序）**阶梯保持**到 `grid`。
+///
+/// 语义：
+/// 1. 网格点取「`≤` 该点的最近一个真实采样」——值严格来自 `values`，绝不插值；
+/// 2. 早于首样本的网格点 → `None`（行首无值可保持，不得用首值回填）；
+/// 3. `max_gap_s = Some(gap)` 时，若 `网格点 - 最近真实采样时间 > gap` → `None`，
+///    并计入返回的超限行数；`None` 表示不限制；
+/// 4. 空输入 → 全部 `None`，绝不 panic。
+///
+/// 返回 `(保持结果, 因超过最大保持时长被置空的行数)`。
+pub fn resample_hold(
+    times: &[f64],
+    values: &[f64],
+    grid: &[f64],
+    max_gap_s: Option<f64>,
+) -> (Vec<Option<f64>>, u64) {
+    let len = times.len().min(values.len());
+    if len == 0 || grid.is_empty() {
+        return (vec![None; grid.len()], 0);
+    }
+    let times = &times[..len];
+    let values = &values[..len];
+
+    let mut out: Vec<Option<f64>> = Vec::with_capacity(grid.len());
+    let mut nulled = 0u64;
+    for &point in grid {
+        // 前 `idx` 个样本的时间 <= point。
+        let idx = times.partition_point(|&t| t <= point);
+        if idx == 0 {
+            // point 早于首样本：无值可保持。
+            out.push(None);
+            continue;
+        }
+        let sample_time = times[idx - 1];
+        let too_old = max_gap_s
+            .map(|gap| point - sample_time > gap)
+            .unwrap_or(false);
+        if too_old {
+            out.push(None);
+            nulled += 1;
+        } else {
+            out.push(Some(values[idx - 1]));
+        }
+    }
+    (out, nulled)
 }
 
 /// 把一张表的全部信号列重采样到给定网格，返回 `timestamp = grid` 的新表。
@@ -1244,7 +1539,7 @@ fn xlsx_error(what: &str, err: XlsxError) -> CoreError {
 
 #[cfg(test)]
 mod tests {
-    use super::resample_linear;
+    use super::{resample_hold, resample_linear};
 
     /// ① 网格点正好命中样本 → 原值。
     #[test]
@@ -1309,5 +1604,91 @@ mod tests {
     fn resample_empty_input_returns_empty() {
         assert!(resample_linear(&[], &[], &[1.0, 2.0]).is_empty());
         assert!(resample_linear(&[0.0], &[1.0], &[]).is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Step 14：hold / linear / ffill_max_gap_ms 的纯函数单元测试
+    // ------------------------------------------------------------------
+
+    /// T1-hold：阶梯保持的值必须**全部来自原始采样集合**，且行首（首样本之前）为 `null`。
+    #[test]
+    fn hold_values_stay_in_original_sample_set() {
+        let times = [0.0, 1.0, 2.0];
+        let values = [10.0, 20.0, 30.0];
+        let grid = [-0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5];
+        let (out, nulled) = resample_hold(&times, &values, &grid, None);
+
+        assert_eq!(nulled, 0, "不限制 gap 时不应有超限置空");
+        assert_eq!(out.len(), grid.len());
+        // 行首：首个真实采样之前必须是 null（不得用第一个值回填）。
+        assert_eq!(out[0], None, "首样本之前必须为 null");
+        // 阶梯取值：命中样本取原值，两点之间保持左侧最近样本。
+        assert_eq!(out[1], Some(10.0));
+        assert_eq!(out[2], Some(10.0));
+        assert_eq!(out[3], Some(20.0));
+        assert_eq!(out[4], Some(20.0));
+        assert_eq!(out[5], Some(30.0));
+        assert_eq!(out[6], Some(30.0));
+        // 核心断言：没有任何非空值不在原始采样集合里。
+        for value in out.iter().flatten() {
+            assert!(
+                values.contains(value),
+                "hold 产生了原始采样集合之外的值：{value}"
+            );
+        }
+    }
+
+    /// T1-gap：`行时间 - 最近真实采样时间 > gap` 处必须为 `null`，`<= gap` 处必须保持。
+    #[test]
+    fn hold_respects_max_gap_boundary() {
+        let times = [0.0, 1.0, 3.0];
+        let values = [1.0, 2.0, 3.0];
+        // gap = 0.5s。
+        let grid = [0.0, 0.5, 0.9, 1.0, 1.5, 2.0, 3.0, 3.4];
+        let (out, nulled) = resample_hold(&times, &values, &grid, Some(0.5));
+
+        assert_eq!(out[0], Some(1.0), "差距 0 <= gap 必须保持");
+        assert_eq!(out[1], Some(1.0), "差距 == gap（边界）必须保持");
+        assert_eq!(out[2], None, "差距 0.9 > 0.5 必须置空");
+        assert_eq!(out[3], Some(2.0));
+        assert_eq!(out[4], Some(2.0), "差距 == gap（边界）必须保持");
+        assert_eq!(out[5], None, "差距 1.0 > 0.5 必须置空");
+        assert_eq!(out[6], Some(3.0));
+        assert_eq!(out[7], Some(3.0), "差距 0.4 <= gap 必须保持");
+        assert_eq!(nulled, 2, "跨越 >gap 的行数应被统计出来");
+        for value in out.iter().flatten() {
+            assert!(values.contains(value), "带 gap 的 hold 也绝不造值：{value}");
+        }
+    }
+
+    /// T1-linear：相邻插值点落在两端真实采样之间（此处为 0→10 的单调斜坡）。
+    #[test]
+    fn linear_interpolation_points_stay_between_samples() {
+        let times = [0.0, 1.0];
+        let values = [0.0, 10.0];
+        let grid: Vec<f64> = (0..=8).map(|i| i as f64 * 0.125).collect();
+        let out = resample_linear(&times, &values, &grid);
+        for (idx, value) in out.iter().enumerate() {
+            let point = grid[idx];
+            assert!(
+                *value >= 0.0 - 1e-12 && *value <= 10.0 + 1e-12,
+                "t={point} 的插值 {value} 超出两端采样范围"
+            );
+            if idx > 0 {
+                assert!(
+                    *value >= out[idx - 1] - 1e-12,
+                    "线性插值在单调数据上必须单调不减"
+                );
+            }
+        }
+        assert!((out[4] - 5.0).abs() < 1e-9, "t=0.5 应为 5.0，实际 {}", out[4]);
+    }
+
+    /// T1-hold：空输入 → 全部 `null`，绝不 panic。
+    #[test]
+    fn hold_empty_input_is_all_null() {
+        let (out, nulled) = resample_hold(&[], &[], &[1.0, 2.0], Some(0.05));
+        assert_eq!(out, vec![None, None]);
+        assert_eq!(nulled, 0);
     }
 }

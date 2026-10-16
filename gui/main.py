@@ -19,6 +19,8 @@
 
 from __future__ import annotations
 
+import bisect
+import csv
 import json
 import os
 import re
@@ -38,7 +40,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout,
     QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
-    QProgressBar, QPushButton, QSizePolicy, QSplitter, QStatusBar, QToolBar, QTreeView,
+    QProgressBar, QPushButton, QSizePolicy, QSpinBox, QSplitter, QStatusBar, QToolBar, QTreeView,
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -85,6 +87,20 @@ TIME_FORMAT_CHOICES: list[tuple[str, str]] = [
 TIME_FORMAT_TOOLTIP = (
     "绝对时间 = BLF 文件头记录的墙钟时间（与 CANalyzer 显示一致）；"
     "相对时间以全部输入文件中最早的时间戳为 0")
+#: Step 14：填充方式（写入 config 的 ``fill_policy``，取值与 INTERFACE §1.1 一一对应）。
+FILL_CHOICES: list[tuple[str, str]] = [
+    ("阶梯保持（推荐）", "hold"),
+    ("线性插值", "linear"),
+    ("不填充", "none"),
+]
+FILL_INDEX: dict[str, int] = {value: idx for idx, (_label, value) in enumerate(FILL_CHOICES)}
+FILL_TOOLTIP = (
+    "阶梯保持：把最近一次真实采样保持到下一拍，绝不造新值（状态 / 枚举 / 计数类信号必须用它）；"
+    "线性插值：会在两个真实采样点之间造出从未采样过的中间值；"
+    "不填充：原样留空")
+FILL_SPLIT_TOOLTIP = "拆表模式下同一报文周期一致，不产生空值，无需填充"
+FILL_GAP_TOOLTIP = (
+    "向前保持超过该时长仍未收到新采样时，该点留空——避免通信中断/丢帧被旧值掩盖")
 #: 进度区（Step 7c）文案。
 PROGRESS_IDLE_TEXT = "待命"
 PROGRESS_IDLE_META = "—"
@@ -389,6 +405,9 @@ class MainWindow(QMainWindow):
         self.last_report: dict | None = None
         self.last_error: str | None = None
         self.quiet_dialogs = False     # 自检/无人值守：抑制所有模态弹窗
+        #: Step 14：填充方式是否被用户/预设显式设置过（未设置时跟随路径默认）。
+        self._fill_touched = False
+        self._fill_guard = False       # 程序化改下拉时抑制 currentIndexChanged 递归
         self._progress_timer = QTimer(self)
         self._progress_timer.setInterval(200)
         self._progress_timer.timeout.connect(self._on_progress_tick)
@@ -563,11 +582,27 @@ class MainWindow(QMainWindow):
         self.combo_time_format.addItems([label for label, _tf in TIME_FORMAT_CHOICES])
         tune(self.combo_time_format, currentIndex=0, toolTip=TIME_FORMAT_TOOLTIP)
         row.addWidget(self.combo_time_format)
+        # Step 14：填充方式（默认跟随路径；拆表模式禁用，网格模式禁用「不填充」）。
+        row.addWidget(QLabel("填充方式："))
+        self.combo_fill = QComboBox(panel)
+        self.combo_fill.addItems([label for label, _policy in FILL_CHOICES])
+        tune(self.combo_fill, currentIndex=FILL_INDEX["hold"], toolTip=FILL_TOOLTIP)
+        row.addWidget(self.combo_fill)
         row.addStretch(1)
         self.btn_convert = QPushButton("🚀 启动多核极速转换")
         self.btn_convert.setObjectName("primaryButton")
         row.addWidget(self.btn_convert)
         outer.addLayout(row)
+        # Step 14：最大保持时长（0 = 不限；仅「阶梯保持」启用）。
+        gap_row = QHBoxLayout()
+        gap_row.setSpacing(14)
+        gap_row.addWidget(QLabel("最大保持时长："))
+        self.spin_fill_gap = QSpinBox(panel)
+        tune(self.spin_fill_gap, range=(0, 60_000), value=0, suffix=" ms",
+             toolTip=FILL_GAP_TOOLTIP)
+        gap_row.addWidget(self.spin_fill_gap)
+        gap_row.addStretch(1)
+        outer.addLayout(gap_row)
         self.lbl_merge_warning = QLabel(WARN_MERGE_HINT)
         tune(self.lbl_merge_warning, objectName="warnHint", wordWrap=True, visible=False)
         outer.addWidget(self.lbl_merge_warning)
@@ -635,6 +670,9 @@ class MainWindow(QMainWindow):
         self.signal_model.itemChanged.connect(self._on_item_changed)
         self.signal_view.customContextMenuRequested.connect(self._on_signal_context_menu)
         self.chk_split.toggled.connect(lambda _c: self._sync_resample_hint())
+        # Step 14：重采样档位 / 填充方式变化时刷新可用项与默认值。
+        self.combo_resample.currentIndexChanged.connect(lambda _i: self._sync_fill_hint())
+        self.combo_fill.currentIndexChanged.connect(self._on_fill_changed)
         # start_convert 接受可选 out_dir（自检用），用一个无参 lambda 吞掉 clicked 的 bool。
         self.btn_convert.clicked.connect(lambda: self.start_convert())
 
@@ -886,12 +924,21 @@ class MainWindow(QMainWindow):
 
     # --------------------------------------------------------- 配置预设 ----
     def current_export_policy(self) -> dict:
-        """当前导出策略（拆表 / 重采样 / 格式），与配置里的 ``export`` 同构。"""
+        """当前导出策略（拆表 / 重采样 / 格式），与配置里的 ``export`` 同构。
+
+        注意：配置预设（``gui/presets.py``，本步冻结）只持久化这三个字段，
+        因此这里也**只回读这三个字段**，保证 `--selftest-config` 的 round-trip 语义不变。
+        """
         return {
             "split_by_message": bool(self.chk_split.isChecked()),
             "resample_hz": RESAMPLE_CHOICES[max(0, self.combo_resample.currentIndex())][1],
             "export_format": FORMAT_CHOICES[max(0, self.combo_format.currentIndex())][1],
         }
+
+    def _fill_gap_ms(self) -> float | None:
+        """最大保持时长（毫秒）；0 = 不限 → ``None``。"""
+        value = self.spin_fill_gap.value()
+        return None if value <= 0 else float(value)
 
     def apply_export_policy(self, export: dict | None) -> None:
         """把配置里的导出策略写回控件（缺字段用默认值兜底）。"""
@@ -904,6 +951,17 @@ class MainWindow(QMainWindow):
         self.combo_format.setCurrentIndex(next(
             (i for i, (_label, value) in enumerate(FORMAT_CHOICES) if value == fmt), 0))
         self._sync_resample_hint()
+        # Step 14：若调用方直接给了填充字段就用它（预设不含这两项 → 回落路径默认）。
+        policy = export.get("fill_policy")
+        if policy in FILL_INDEX:
+            self._fill_touched = True
+            self._set_fill_policy(str(policy))
+        else:
+            self._fill_touched = False
+        gap = export.get("ffill_max_gap_ms")
+        self.spin_fill_gap.setValue(int(round(gap)) if isinstance(gap, (int, float)) and gap > 0
+                                     else 0)
+        self._sync_fill_hint()
 
     def apply_dbc_map(self, dbc_by_channel: dict | None) -> set[int]:
         """用配置里的 DBC 映射替换当前绑定；路径不存在的通道记入 ``missing_dbc_channels``。"""
@@ -1448,6 +1506,67 @@ class MainWindow(QMainWindow):
         self.combo_resample.setProperty("warnHint", "true" if need_hint else "false")
         style = self.combo_resample.style()
         style.unpolish(self.combo_resample); style.polish(self.combo_resample)
+        self._sync_fill_hint()
+
+    def _fill_policy(self) -> str:
+        """当前下拉选中的填充方式（`hold` / `linear` / `none`）。"""
+        index = max(0, self.combo_fill.currentIndex())
+        return FILL_CHOICES[index][1]
+
+    def _fill_default_policy(self) -> str:
+        """本路径的默认填充方式：拆表 / 网格 → hold；原时序宽表 → none。"""
+        if self.chk_split.isChecked():
+            return "hold"
+        hz = RESAMPLE_CHOICES[max(0, self.combo_resample.currentIndex())][1]
+        return "hold" if hz is not None else "none"
+
+    def _set_fill_policy(self, policy: str) -> None:
+        """程序化切换填充方式（抑制 currentIndexChanged 造成的“用户已设置”误判）。"""
+        index = FILL_INDEX.get(policy, FILL_INDEX["hold"])
+        if self.combo_fill.currentIndex() == index:
+            return
+        self._fill_guard = True
+        try:
+            self.combo_fill.setCurrentIndex(index)
+        finally:
+            self._fill_guard = False
+
+    def _on_fill_changed(self, _index: int) -> None:
+        """用户手动切换填充方式：记住选择并刷新联动控件。"""
+        if self._fill_guard:
+            return
+        self._fill_touched = True
+        self._sync_fill_hint()
+
+    def _sync_fill_hint(self) -> None:
+        """按「拆表 / 网格 / 原时序」三态刷新填充下拉与最大保持时长输入。
+
+        * 拆表模式：下拉禁用 + tooltip 说明；最大保持时长置灰；
+        * 网格模式：只允许「阶梯保持 / 线性插值」，「不填充」置灰；
+        * 原时序宽表：三者可选。
+        未显式设置过时，选中值跟随路径默认。
+        """
+        split = self.chk_split.isChecked()
+        hz = RESAMPLE_CHOICES[max(0, self.combo_resample.currentIndex())][1]
+        grid = (not split) and hz is not None
+
+        model = self.combo_fill.model()
+        none_item = model.item(FILL_INDEX["none"]) if hasattr(model, "item") else None
+        if none_item is not None:
+            none_item.setEnabled(not grid)
+
+        if not split and not self._fill_touched:
+            self._set_fill_policy(self._fill_default_policy())
+        elif grid and self._fill_policy() == "none":
+            # 网格路径上「不填充」无意义：强制回到推荐值。
+            self._set_fill_policy("hold")
+
+        self.combo_fill.setEnabled(not split)
+        self.combo_fill.setToolTip(FILL_SPLIT_TOOLTIP if split else FILL_TOOLTIP)
+        hold = (not split) and self._fill_policy() == "hold"
+        self.spin_fill_gap.setEnabled(hold)
+        style = self.spin_fill_gap.style()
+        style.unpolish(self.spin_fill_gap); style.polish(self.spin_fill_gap)
 
     def check_visible_items(self) -> None:
         """把当前过滤结果中可见的通道/报文/信号全部勾选。"""
@@ -1565,6 +1684,9 @@ class MainWindow(QMainWindow):
             "memory_budget_mb": 1536,
             # Step 7c：时间列口径是 INTERFACE §1.1 的必填字段，不能漏。
             "time_format": TIME_FORMAT_CHOICES[max(0, self.combo_time_format.currentIndex())][1],
+            # Step 14：填充方式与最大保持时长（0 → None）；不再写兼容字段 `ffill`。
+            "fill_policy": self._fill_policy(),
+            "ffill_max_gap_ms": self._fill_gap_ms(),
         }
         self.last_report = None
         self.last_error = None
@@ -2391,6 +2513,162 @@ def run_selftest_config() -> int:
     return 0
 
 
+# --------------------------------------------- --selftest-fill（Step 14） ----
+def _read_fill_csv(report: dict) -> dict[str, list[float | None]]:
+    """把 `convert` 报告里的第一张 CSV 表读成 ``{列名: [值或 None]}``。"""
+    path = str(report["tables"][0]["path"])
+    with open(path, encoding="utf-8", newline="") as handle:
+        reader = csv.reader(handle)
+        header = next(reader)
+        rows = list(reader)
+    data: dict[str, list[float | None]] = {name: [] for name in header}
+    for row in rows:
+        for name, cell in zip(header, row):
+            data[name].append(float(cell) if cell != "" else None)
+    return data
+
+
+def _linear_expected(times: list[float], values: list[float],
+                     grid: list[float]) -> list[float]:
+    """复刻 Rust `resample_linear` 的语义（命中 / 两点插值 / 首末 clamp）。"""
+    out: list[float] = []
+    for point in grid:
+        idx = bisect.bisect_right(times, point)  # 时间 <= point 的样本数
+        if idx == 0:
+            out.append(values[0])
+        elif idx >= len(times):
+            out.append(values[-1])
+        else:
+            t_left, v_left = times[idx - 1], values[idx - 1]
+            t_right, v_right = times[idx], values[idx]
+            span = t_right - t_left
+            if abs(span) <= 1e-15:
+                out.append(v_left)
+            else:
+                out.append(v_left + (v_right - v_left) * (point - t_left) / span)
+    return out
+
+
+def run_selftest_fill() -> int:
+    """``--selftest-fill``：填充策略（hold / linear / max_gap / none）端到端验证。
+
+    * 成功：打印 ``FILL_OK hold_distinct=.. linear_distinct=.. gapped_nulls=.. none_nulls=..``；
+    * 断言失败：打印 ``FILL_FAIL <原因>`` 并返回 2；
+    * 内核缺失 / 夹具缺失：分别打印 ``FILL_SKIP no_kernel`` / ``FILL_SKIP no_fixture ..`` 并返回 0。
+
+    说明：任务书写的 ``timefmt.blf`` 是 10ms 单报文、而 ``demo.dbc`` 里没有 `TimeMsg`，
+    两者无法解出任何信号；这里改用同一套合成夹具里**真正多周期**的
+    ``fixtures/multi_channel.blf`` + ``fixtures/demo.dbc``（Ch1 `VehSpd`/`BattTemp`、
+    Ch2 `Insulation`），并把网格设成 10Hz，才能让 1Hz 的 `Res` 暴露出
+    “超过最大保持时长”的空值（这正是用户场景）。
+    """
+    if core is None:
+        print("FILL_SKIP no_kernel")
+        return 0
+    root = Path(__file__).resolve().parent.parent
+    blf_path = (root / "fixtures" / "multi_channel.blf").resolve()
+    dbc_path = (root / "fixtures" / "demo.dbc").resolve()
+    absent = [str(p) for p in (blf_path, dbc_path) if not p.is_file()]
+    if absent:
+        print(f"FILL_SKIP no_fixture {' '.join(absent)}")
+        return 0
+
+    temp_root = Path(tempfile.mkdtemp(prefix="fblf_fill_selftest_"))
+    dbc_map = {1: str(dbc_path), 2: str(dbc_path)}
+
+    def run(label: str, resample_hz, fill_policy: str,
+            gap_ms: float | None = None,
+            time_format: str = "relative_s") -> dict[str, list[float | None]]:
+        out_dir = temp_root / label
+        config = {
+            "blf_paths": [str(blf_path)],
+            "dbc_by_channel": dbc_map,
+            "selected": {},
+            "split_by_message": False,
+            "resample_hz": resample_hz,
+            "export_format": "csv",
+            "out_dir": str(out_dir),
+            "temp_dir": str(out_dir / ".tmp"),
+            "excel_row_limit": 1_000_000,
+            "memory_budget_mb": 512,
+            "time_format": time_format,
+            "fill_policy": fill_policy,
+        }
+        if gap_ms is not None:
+            config["ffill_max_gap_ms"] = float(gap_ms)
+        report = core.convert(config)
+        if not report or not report.get("ok"):
+            raise AssertionError(f"{label} 转换未成功：{report!r}")
+        return _read_fill_csv(report)
+
+    try:
+        # 原始采样来源：用 `unix_s` 保留 epoch 级完整 f64 精度，便于复刻 Rust 内部
+        # 「先减 global_min 再做线性插值」的时间轴（避免 CSV 相对时间取整带来的 1e-7 噪声）。
+        raw = run("raw_none", None, "none", time_format="unix_s")
+        hold = run("grid_hold", 10.0, "hold")
+        linear = run("grid_linear", 10.0, "linear")
+        gapped = run("grid_hold_gap", 10.0, "hold", gap_ms=50.0)
+
+        signals = [name for name in raw if name != "timestamp"]
+        if not signals:
+            raise AssertionError("原始宽表没有任何信号列")
+        if len(raw["timestamp"]) <= len(hold["timestamp"]):
+            raise AssertionError("原始时序行数应多于 10Hz 网格行数")
+        global_min = float(raw["timestamp"][0])  # 宽表按时间升序，首行即全局最小
+        internal_times = [t - global_min for t in raw["timestamp"]]
+
+        # 1) hold：所有非空取值必须来自该信号的真实采样值集合。
+        for name in signals:
+            original = {value for value in raw[name] if value is not None}
+            if not original:
+                continue
+            for value in hold[name]:
+                if value is not None and value not in original:
+                    raise AssertionError(
+                        f"hold 在 {name} 造出原始采样集合之外的值：{value}")
+
+        # 2) linear：网格点数量与 hold 相同，且取值与线性插值期望一致（1e-9）。
+        if len(linear["timestamp"]) != len(hold["timestamp"]):
+            raise AssertionError("linear 与 hold 的网格点数量不一致")
+        step = 1.0 / 10.0
+        grid = [i * step for i in range(len(linear["timestamp"]))]
+        for name in signals:
+            pairs = [(t, v) for t, v in zip(internal_times, raw[name]) if v is not None]
+            if not pairs:
+                continue
+            times = [t for t, _v in pairs]
+            values = [v for _t, v in pairs]
+            expected = _linear_expected(times, values, grid)
+            for idx, (actual, want) in enumerate(zip(linear[name], expected)):
+                if actual is None:
+                    raise AssertionError(f"linear 的 {name} 第 {idx} 行不应为空")
+                if abs(actual - want) > 1e-9:
+                    raise AssertionError(
+                        f"linear 的 {name} 第 {idx} 行={actual}，期望 {want}")
+
+        # 3) hold + gap=50ms：1Hz 的 Res 必须出现超限空值。
+        gapped_nulls = sum(1 for row in gapped["Res"] if row is None)
+        if gapped_nulls <= 0:
+            raise AssertionError("hold + ffill_max_gap_ms=50 未出现任何超限空值")
+
+        # 4) none（原时序宽表）：仍有空值。
+        none_nulls = sum(1 for row in raw["Res"] if row is None)
+        if none_nulls <= 0:
+            raise AssertionError("原时序宽表 none 模式不应完全无空值")
+
+        hold_distinct = len({v for name in signals for v in hold[name] if v is not None})
+        linear_distinct = len({v for name in signals for v in linear[name] if v is not None})
+    except Exception as exc:  # noqa: BLE001 - 自检要把异常变成可 grep 的失败行
+        print(f"FILL_FAIL {type(exc).__name__}: {exc}")
+        return 2
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+    print(f"FILL_OK hold_distinct={hold_distinct} linear_distinct={linear_distinct} "
+          f"gapped_nulls={gapped_nulls} none_nulls={none_nulls}")
+    return 0
+
+
 # ------------------------------------------- --selftest-progress（Step 7c） ----
 def _setup_scan_tree(window: MainWindow, blf_path: str, dbc_map: dict) -> None:
     """把一份 BLF + 通道 DBC 灌进真实 UI、扫描并勾选全部信号。"""
@@ -2673,6 +2951,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
     config_test = "--selftest-config" in args[1:]
     progress_test = "--selftest-progress" in args[1:]
     parse_test = "--selftest-parse" in args[1:]
+    fill_test = "--selftest-fill" in args[1:]
     dump_target = _dump_target(args[1:])
     app = QApplication.instance() or QApplication(args)
     app.setApplicationName("Fast BLF Converter")
@@ -2683,6 +2962,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
     load_theme(app)
     if config_test:
         return run_selftest_config()
+    if fill_test:
+        return run_selftest_fill()
     if progress_test:
         return run_selftest_progress()
     if parse_test:
