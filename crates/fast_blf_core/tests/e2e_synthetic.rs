@@ -11,9 +11,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use fast_blf_core::{
-    catch_export_panic, export, process_file, read_file_timing, CoreError, DecodePlan,
-    ExportFormat, ExportOptions, ExportPanicContext, ExportReport, Progress, ProgressThrottle,
-    Selection, ShardSink, TimeFormat, EXPORT_INTERNAL,
+    catch_export_panic, export, normalize_dbc_bytes, process_file, read_file_timing, CoreError,
+    DecodePlan, ExportFormat, ExportOptions, ExportPanicContext, ExportReport, Progress,
+    ProgressThrottle, Selection, ShardSink, TimeFormat, DBC_PARSE, EXPORT_INTERNAL,
 };
 use polars::prelude::*;
 use pyo3::prelude::*;
@@ -1912,3 +1912,687 @@ fn export_internal_error_is_returned_instead_of_panic() {
     let ok = catch_export_panic(&ctx, || Ok::<u32, CoreError>(7)).expect("正常路径应透传");
     assert_eq!(ok, 7);
 }
+
+// ---------------------------------------------------------------------------
+// Step 9：DBC 预规范化（BOM / GBK 编码 / can-dbc 不支持的段）
+// ---------------------------------------------------------------------------
+
+/// Step 9 现场：单报文（`VehSpd` 0x123 / `Spd`）×3 帧的合成 BLF + 任意字节 DBC。
+struct NormFixture {
+    _dir: tempfile::TempDir,
+    blf: PathBuf,
+    dbc: PathBuf,
+}
+
+/// 写入 3 帧 `VehSpd`（0x123）：`Spd` 原始值 = 1、2、3（Intel 16bit，factor 0.01）。
+fn write_norm_blf(path: &Path) {
+    let mut writer = blf_asc::BlfWriter::create(path).expect("创建合成 BLF");
+    for i in 1u32..=3 {
+        let mut data = vec![0u8; 8];
+        data[0] = (i & 0xFF) as u8;
+        data[1] = ((i >> 8) & 0xFF) as u8;
+        push_msg(&mut writer, 0, 0x123, (i - 1) as f64 * 0.01, data);
+    }
+    writer.finish().expect("完成合成 BLF");
+}
+
+/// 用给定的 DBC 字节建一个隔离现场。
+fn setup_norm(dbc_bytes: &[u8]) -> NormFixture {
+    let dir = tempfile::tempdir().expect("创建临时目录");
+    let blf = dir.path().join("norm.blf");
+    write_norm_blf(&blf);
+    let dbc = dir.path().join("norm.dbc");
+    std::fs::write(&dbc, dbc_bytes).expect("写入 DBC");
+    NormFixture {
+        _dir: dir,
+        blf,
+        dbc,
+    }
+}
+
+/// 组装一个只勾选全部信号（空 selected）的 `convert` config。
+fn norm_config<'py>(
+    py: Python<'py>,
+    fx: &NormFixture,
+    out_name: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    let config = PyDict::new(py);
+    config.set_item("blf_paths", vec![fx.blf.to_string_lossy().to_string()])?;
+    let mut dbc_py: HashMap<u32, String> = HashMap::new();
+    dbc_py.insert(1u32, fx.dbc.to_string_lossy().to_string());
+    config.set_item("dbc_by_channel", dbc_py)?;
+    config.set_item(
+        "selected",
+        HashMap::<String, HashMap<String, Vec<String>>>::new(),
+    )?;
+    config.set_item("split_by_message", true)?;
+    config.set_item("resample_hz", py.None())?;
+    config.set_item("export_format", "csv")?;
+    config.set_item(
+        "out_dir",
+        fx._dir
+            .path()
+            .join("out")
+            .join(out_name)
+            .to_string_lossy()
+            .to_string(),
+    )?;
+    config.set_item(
+        "temp_dir",
+        fx._dir
+            .path()
+            .join(format!("{out_name}_shards"))
+            .to_string_lossy()
+            .to_string(),
+    )?;
+    config.set_item("excel_row_limit", 1_000_000i64)?;
+    config.set_item("memory_budget_mb", 256i64)?;
+    config.set_item("ffill", false)?;
+    Ok(config)
+}
+
+/// 从 `convert` 返回值取 `warnings` 文本列表。
+fn warning_texts(report: &Bound<'_, PyDict>) -> Vec<String> {
+    report
+        .get_item("warnings")
+        .expect("读取 warnings 失败")
+        .expect("返回值必须含 warnings")
+        .cast_into::<PyList>()
+        .expect("warnings 必须是 list")
+        .iter()
+        .map(|item| item.extract::<String>().expect("warning 必须是字符串"))
+        .collect()
+}
+
+/// 取某张子表的行数。
+fn norm_table_rows(report: &Bound<'_, PyDict>, name: &str) -> u64 {
+    let tables = report
+        .get_item("tables")
+        .expect("读取 tables 失败")
+        .expect("返回值必须含 tables")
+        .cast_into::<PyList>()
+        .expect("tables 必须是 list");
+    for item in tables.iter() {
+        let table = item.cast_into::<PyDict>().expect("table 必须是 dict");
+        let table_name = table
+            .get_item("name")
+            .expect("读取 name 失败")
+            .expect("table 必须含 name")
+            .extract::<String>()
+            .expect("name 必须是字符串");
+        if table_name == name {
+            return table
+                .get_item("rows")
+                .expect("读取 rows 失败")
+                .expect("table 必须含 rows")
+                .extract::<u64>()
+                .expect("rows 必须是整数");
+        }
+    }
+    panic!("缺少子表 {name}");
+}
+
+/// 含中文 `CM_` 注释 + 中文 `VAL_` 值表的 **GBK 编码** DBC 字节。
+///
+/// 中文定值（GBK 字节，独立于源码的 UTF-8 编码）：
+/// * `车速信号` = `B3 B5 CB D9 D0 C5 BA C5`
+/// * `停止`     = `CD A3 D6 B9`
+/// * `行驶`     = `D0 D0 CA BB`
+fn gbk_dbc_bytes() -> Vec<u8> {
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.extend_from_slice(b"VERSION \"\"\n\n");
+    bytes.extend_from_slice(b"BO_ 291 VehSpd: 8 Vector__XXX\n");
+    bytes.extend_from_slice(b" SG_ Spd : 0|16@1+ (0.01,0) [0|0] \"km/h\" Vector__XXX\n\n");
+    // CM_ BO_ 291 "车速信号";
+    bytes.extend_from_slice(b"CM_ BO_ 291 \"");
+    bytes.extend_from_slice(&[0xB3, 0xB5, 0xCB, 0xD9, 0xD0, 0xC5, 0xBA, 0xC5]);
+    bytes.extend_from_slice(b"\";\n");
+    // VAL_ 291 Spd 0 "停止" 1 "行驶" ;
+    bytes.extend_from_slice(b"VAL_ 291 Spd 0 \"");
+    bytes.extend_from_slice(&[0xCD, 0xA3, 0xD6, 0xB9]);
+    bytes.extend_from_slice(b"\" 1 \"");
+    bytes.extend_from_slice(&[0xD0, 0xD0, 0xCA, 0xBB]);
+    bytes.extend_from_slice(b"\" ;\n");
+    bytes
+}
+
+/// Step 9 用例 1：GBK 编码 DBC 能解析、中文保留、warnings 出现 GB18030。
+#[test]
+fn dbcnorm_gbk_encoded_dbc_parses_and_chinese_survives() {
+    let raw = gbk_dbc_bytes();
+
+    // 纯函数层：按 GB18030 解码，中文注释/枚举值保持可读。
+    let outcome = normalize_dbc_bytes(&raw, "gbk.dbc").expect("GBK DBC 应可规范化");
+    assert!(
+        outcome.notes.iter().any(|note| note.contains("GB18030")),
+        "notes 应说明 GB18030 解码：{:?}",
+        outcome.notes
+    );
+    assert!(
+        outcome.text.contains("车速信号"),
+        "中文注释应保留：{}",
+        outcome.text
+    );
+    assert!(outcome.text.contains("停止") && outcome.text.contains("行驶"));
+
+    // 端到端：convert 成功、3 行解出、warnings 出现 GB18030。
+    let fx = setup_norm(&raw);
+    with_python(|py| -> PyResult<()> {
+        let config = norm_config(py, &fx, "gbk")?;
+        let report =
+            fast_blf_core::convert(py, &config, None).expect("GBK DBC 必须能成功转换");
+        assert_eq!(
+            report.get_item("total_rows")?.unwrap().extract::<u64>()?,
+            3
+        );
+        assert_eq!(norm_table_rows(&report, "Ch1_VehSpd"), 3);
+        let warnings = warning_texts(&report);
+        assert!(
+            warnings.iter().any(|text| text.contains("GB18030")),
+            "warnings 应出现 GB18030：{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|text| text.contains("norm.dbc")),
+            "warnings 应带文件名前缀：{warnings:?}"
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// Step 9 用例 2：UTF-8 BOM 被去除并留痕。
+#[test]
+fn dbcnorm_utf8_bom_is_stripped() {
+    let mut raw = vec![0xEF, 0xBB, 0xBF];
+    raw.extend_from_slice(make_fixtures::DEMO_DBC.as_bytes());
+
+    let outcome = normalize_dbc_bytes(&raw, "bom.dbc").expect("BOM DBC 应可规范化");
+    assert!(outcome.text.starts_with("VERSION"), "BOM 应被去掉");
+    assert!(
+        outcome.notes.iter().any(|note| note.contains("BOM")),
+        "notes 应说明去 BOM：{:?}",
+        outcome.notes
+    );
+
+    // 端到端：用 BOM 版 DEMO_DBC 覆盖 norm.dbc，3 帧 VehSpd 照常解出。
+    let fx = setup_norm(&raw);
+    with_python(|py| -> PyResult<()> {
+        let config = norm_config(py, &fx, "bom")?;
+        let report = fast_blf_core::convert(py, &config, None).expect("BOM DBC 必须能转换");
+        assert_eq!(norm_table_rows(&report, "Ch1_VehSpd"), 3);
+        let warnings = warning_texts(&report);
+        assert!(
+            warnings.iter().any(|text| text.contains("BOM")),
+            "warnings 应提示去 BOM：{warnings:?}"
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// Step 9 用例 3：`CM_ BA_` 属性注释 + 相对属性定义被整段忽略，信号照常解出。
+#[test]
+fn dbcnorm_attribute_comment_and_relative_attrs_are_ignored() {
+    let text = r#"VERSION ""
+
+BU_: ECU1
+
+BO_ 291 VehSpd: 8 ECU1
+ SG_ Spd : 0|16@1+ (0.01,0) [0|0] "km/h" ECU1
+
+BA_DEF_ "Attr" STRING ;
+CM_ BA_ "Attr" "属性注释";
+BA_DEF_REL_ BU_SG_REL_ "RelAttr" STRING ;
+BA_DEF_DEF_REL_ "RelAttr" "";
+"#;
+
+    let outcome = normalize_dbc_bytes(text.as_bytes(), "rel.dbc").expect("应可规范化");
+    let note = outcome.notes.join("\n");
+    assert!(note.contains("已忽略 3 条"), "应汇总 3 条：{note}");
+    assert!(note.contains("CM_ BA_"), "应点名 CM_ BA_：{note}");
+    assert!(note.contains("BA_DEF_REL_"), "应点名 BA_DEF_REL_：{note}");
+    assert!(!outcome.text.contains("CM_ BA_"));
+    assert!(!outcome.text.contains("BA_DEF_REL_"));
+    assert!(!outcome.text.contains("BA_DEF_DEF_REL_"));
+    assert!(
+        outcome.text.contains("BA_DEF_ \"Attr\" STRING ;"),
+        "普通 BA_DEF_ 必须保留"
+    );
+
+    // 信号照常解出。
+    let fx = setup_norm(text.as_bytes());
+    with_python(|py| -> PyResult<()> {
+        let config = norm_config(py, &fx, "rel")?;
+        let report = fast_blf_core::convert(py, &config, None).expect("忽略元数据段后必须能转换");
+        assert_eq!(norm_table_rows(&report, "Ch1_VehSpd"), 3);
+        let warnings = warning_texts(&report);
+        assert!(
+            warnings
+                .iter()
+                .any(|text| text.contains("已忽略 3 条") && text.contains("CM_ BA_")),
+            "warnings 应说明忽略了哪些语句与条数：{warnings:?}"
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// Step 9 用例 4：`VAL_` / `VAL_TABLE_` / `SG_MUL_VAL_` / `SIG_VALTYPE_` /
+/// `SIG_GROUP_` / `BO_TX_BU_` / `EV_` **不被剔除**，且报文/信号照常解出。
+#[test]
+fn dbcnorm_keeps_supported_sections_intact() {
+    let text = r#"VERSION ""
+
+BU_: ECU1 ECU2
+
+BO_ 291 VehSpd: 8 ECU1
+ SG_ Spd : 0|16@1+ (0.01,0) [0|0] "km/h" ECU2
+
+BO_ 256 MuxMsg: 8 ECU1
+ SG_ Mode M : 0|8@1+ (1,0) [0|255] "" ECU2
+ SG_ MuxA m0 : 8|8@1+ (1,0) [0|255] "" ECU2
+
+BO_ 512 SimpleMsg: 8 ECU1
+ SG_ Counter : 0|8@1+ (1,0) [0|255] "" ECU2
+
+VAL_TABLE_ ModeTable 0 "Off" 1 "On" ;
+VAL_ 256 Mode 0 "Off" 1 "On" ;
+SG_MUL_VAL_ 256 MuxA Mode 0-0 ;
+SIG_VALTYPE_ 512 Counter : 1 ;
+SIG_GROUP_ 512 Group1 1 : Counter ;
+BO_TX_BU_ 512 : ECU1, ECU2 ;
+EV_ EnvVar: 0 [0|100] "" 0 0 DUMMY_NODE_VECTOR0 ECU1;
+"#;
+
+    let outcome = normalize_dbc_bytes(text.as_bytes(), "supported.dbc").expect("应可规范化");
+    for keyword in [
+        "VAL_",
+        "VAL_TABLE_",
+        "SG_MUL_VAL_",
+        "SIG_VALTYPE_",
+        "SIG_GROUP_",
+        "BO_TX_BU_",
+        "EV_",
+    ] {
+        assert!(
+            outcome.text.contains(keyword),
+            "{keyword} 不应被剔除：{}",
+            outcome.text
+        );
+    }
+    // 没有任何语句被忽略 → 不应产生“已忽略”note。
+    assert!(
+        !outcome.notes.iter().any(|note| note.contains("已忽略")),
+        "支持段不应触发忽略 note：{:?}",
+        outcome.notes
+    );
+
+    let fx = setup_norm(text.as_bytes());
+    with_python(|py| -> PyResult<()> {
+        let config = norm_config(py, &fx, "supported")?;
+        let report =
+            fast_blf_core::convert(py, &config, None).expect("支持段齐全的 DBC 必须能转换");
+        assert_eq!(norm_table_rows(&report, "Ch1_VehSpd"), 3);
+        assert!(warning_texts(&report).iter().all(|w| !w.contains("已忽略")));
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// Step 9 用例 5：跨 3 行的语句整段剔除后，后续 `BO_`/`SG_` 行号与内容不受影响。
+#[test]
+fn dbcnorm_multiline_statement_removal_is_line_safe() {
+    let text = "VERSION \"\"\n\nBA_DEF_REL_ BU_SG_REL_ \"RelAttr\"\n    STRING ;\n\nBU_: ECU1\n\nBO_ 291 VehSpd: 8 ECU1\n SG_ Spd : 0|16@1+ (0.01,0) [0|0] \"km/h\" ECU1\n";
+    let outcome = normalize_dbc_bytes(text.as_bytes(), "multi.dbc").expect("应可规范化");
+
+    // 行数不变，BO_/SG_ 行号与内容逐字不变。
+    let input_lines: Vec<&str> = text.lines().collect();
+    let output_lines: Vec<&str> = outcome.text.lines().collect();
+    assert_eq!(input_lines.len(), output_lines.len(), "行数必须保持不变");
+    let bo_idx = input_lines
+        .iter()
+        .position(|line| line.starts_with("BO_ 291"))
+        .expect("输入应含 BO_ 行");
+    assert_eq!(output_lines[bo_idx], "BO_ 291 VehSpd: 8 ECU1");
+    assert_eq!(
+        output_lines[bo_idx + 1],
+        " SG_ Spd : 0|16@1+ (0.01,0) [0|0] \"km/h\" ECU1"
+    );
+    assert!(!outcome.text.contains("BA_DEF_REL_"));
+    assert!(!outcome.text.contains("STRING ;"));
+
+    // 后续报文照常解出。
+    let fx = setup_norm(text.as_bytes());
+    with_python(|py| -> PyResult<()> {
+        let config = norm_config(py, &fx, "multi")?;
+        let report = fast_blf_core::convert(py, &config, None).expect("必须能转换");
+        assert_eq!(norm_table_rows(&report, "Ch1_VehSpd"), 3);
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// Step 9 用例 6：无法用 UTF-8/GB18030 解释的字节 → 明确错误（含文件名），不 panic。
+#[test]
+fn dbcnorm_invalid_utf8_and_not_gbk_reports_clear_error() {
+    // 0xFF 在 GB18030 中不是合法首字节，必然无法解码。
+    let raw: Vec<u8> = vec![0xFF, 0xFF, 0xFF, 0xFF];
+
+    let err = normalize_dbc_bytes(&raw, "broken_encoding.dbc").expect_err("必须报错");
+    assert!(
+        err.contains("broken_encoding.dbc") && err.contains("GB18030"),
+        "错误应带文件名与编码原因：{err}"
+    );
+
+    let fx = setup_norm(&raw);
+    let mut dbc_map = BTreeMap::new();
+    dbc_map.insert(1u32, fx.dbc.clone());
+
+    // build_lenient 不 panic，错误消息带文件名（convert / scan 走同一条路径）。
+    let (plan, errors, _notes) = DecodePlan::build_lenient(&dbc_map, &Selection::default());
+    assert!(plan.is_empty(), "无法解码时计划必须为空");
+    let build_err = errors.get(&1).expect("通道 1 应有错误");
+    assert_eq!(build_err.code, DBC_PARSE);
+    assert!(
+        build_err.message.contains("norm.dbc"),
+        "错误消息应带文件名：{}",
+        build_err.message
+    );
+    assert!(
+        build_err.message.contains("GB18030"),
+        "错误消息应带编码原因：{}",
+        build_err.message
+    );
+
+    // `build`（严格路径）同样返回结构化 DBC_PARSE，而不是 panic。
+    let strict = DecodePlan::build(&dbc_map, &Selection::default()).expect_err("必须返回 Err");
+    assert_eq!(strict.code, DBC_PARSE);
+}
+
+// ---------------------------------------------------------------------------
+// Step 10：DBC 规范化误伤修复（NS_ 段 / 列 0 规则 / 证据驱动剔除清单 / 不变量）
+// ---------------------------------------------------------------------------
+
+/// 统计顶层定义行数：`trim_start` 后以 `prefix + 空白` 开头。
+///
+/// 与 `dbc_norm.rs` 内部实现同口径：`BO_` 不误计 `BO_TX_BU_`、`SG_` 不误计 `SG_MUL_VAL_`。
+fn count_definition_lines(text: &str, prefix: &str) -> usize {
+    text.split_inclusive('\n')
+        .filter(|line| match line.trim_start().strip_prefix(prefix) {
+            Some(rest) => rest.starts_with(' ') || rest.starts_with('\t'),
+            None => false,
+        })
+        .count()
+}
+
+/// 回归现场：`NS_ :` 段列出常见元关键字 + 1 个报文 2 个信号。
+///
+/// Step 9 的 bug 会把 `NS_` 段关键字当成剔除起点，进而吞掉整个报文定义段 →
+/// `scan` 返回 0 报文且无错误（静默丢数据）。本常量是直接复现用例。
+const NS_SECTION_VARIANT_DBC: &str = r#"VERSION ""
+
+NS_ :
+    NS_DESC_
+    CM_
+    BA_DEF_
+    BA_
+    VAL_
+    CAT_DEF_
+    CAT_
+    FILTER
+    BA_DEF_DEF_
+    EV_DATA_
+    ENVVAR_DATA_
+    SGTYPE_
+    SGTYPE_VAL_
+    BA_DEF_SGTYPE_
+    BA_SGTYPE_
+    SIG_TYPE_REF_
+    VAL_TABLE_
+    SIG_GROUP_
+    SIG_VALTYPE_
+    SIGTYPE_VALTYPE_
+    BO_TX_BU_
+    BA_DEF_REL_
+    BA_REL_
+    BA_DEF_DEF_REL_
+    BU_SG_REL_
+    BU_EV_REL_
+    BU_BO_REL_
+    SG_MUL_VAL_
+
+BS_:
+
+BU_: ECU1
+
+BO_ 291 VehSpd: 8 ECU1
+ SG_ Spd : 0|16@1+ (0.01,0) [0|0] "km/h" ECU1
+ SG_ SpdValid : 16|1@1+ (1,0) [0|0] "" ECU1
+"#;
+
+/// Step 10 用例 1（回归复现）：`NS_ :` 段关键字绝不能被剔除，报文/信号数保持 1/2。
+#[test]
+fn dbcnorm_ns_section_keywords_are_not_stripped() {
+    let outcome =
+        normalize_dbc_bytes(NS_SECTION_VARIANT_DBC.as_bytes(), "ns_variant.dbc").expect("应可规范化");
+
+    // NS_ 段关键字一个都不能少。
+    for keyword in [
+        "CAT_DEF_",
+        "CAT_",
+        "FILTER",
+        "SGTYPE_",
+        "SGTYPE_VAL_",
+        "BA_DEF_SGTYPE_",
+        "SIGTYPE_VALTYPE_",
+        "SIG_TYPE_REF_",
+        "EV_DATA_",
+        "ENVVAR_DATA_",
+        "BA_REL_",
+        "BU_SG_REL_",
+        "BU_EV_REL_",
+        "BU_BO_REL_",
+        "BA_DEF_REL_",
+        "BA_DEF_DEF_REL_",
+    ] {
+        assert!(
+            outcome.text.contains(keyword),
+            "{keyword} 在 NS_ 段内不应被剔除：{}",
+            outcome.text
+        );
+    }
+
+    // 直接复现主模型实测：规范化后报文 1 个、信号 2 个（Step 9 此处是 0 / 0）。
+    let dbc = can_dbc::Dbc::try_from(outcome.text.as_str()).expect("规范化后必须能解析");
+    assert_eq!(dbc.messages.len(), 1, "报文数必须为 1");
+    assert_eq!(dbc.messages[0].signals.len(), 2, "信号数必须为 2");
+    assert!(
+        !outcome.notes.iter().any(|note| note.contains("已忽略")),
+        "NS_ 段不应触发任何剔除：{:?}",
+        outcome.notes
+    );
+}
+
+/// Step 10 用例 2（不变量）：规范化后 `BO_` / `SG_` 行数与原文本严格相等。
+#[test]
+fn dbcnorm_never_reduces_bo_and_sg_lines() {
+    let outcome =
+        normalize_dbc_bytes(NS_SECTION_VARIANT_DBC.as_bytes(), "ns_variant.dbc").expect("应可规范化");
+    assert_eq!(
+        count_definition_lines(&outcome.text, "BO_"),
+        count_definition_lines(NS_SECTION_VARIANT_DBC, "BO_"),
+        "BO_ 行数不得减少"
+    );
+    assert_eq!(
+        count_definition_lines(&outcome.text, "SG_"),
+        count_definition_lines(NS_SECTION_VARIANT_DBC, "SG_"),
+        "SG_ 行数不得减少"
+    );
+}
+
+/// Step 10 用例 3（证据驱动）：剔除清单 == 证据表里所有「期望剔除」项。
+///
+/// 对每个候选关键字构造「最小 DBC + 该关键字的真实出现形态」，**绕过规范化**直接调用
+/// `can_dbc::Dbc::try_from`：解析失败 ⇒ 必须剔除；解析成功 ⇒ 绝对不能剔除。
+/// 再用 `normalize_dbc_bytes` 验证运行期清单行为与证据表一致。
+#[test]
+fn dbcnorm_strip_list_matches_evidence() {
+    const BASE: &str = "VERSION \"\"\n\nBU_: ECU1\n\nBO_ 291 VehSpd: 8 ECU1\n SG_ Spd : 0|16@1+ (0.01,0) [0|0] \"km/h\" ECU1\n";
+
+    // (关键字, 真实出现形态的语句, 该语句是否位于 NS_ 段, 期望是否剔除)
+    let table: &[(&str, &str, bool, bool)] = &[
+        ("CM_ BA_", "CM_ BA_ \"Attr\" \"comment\";", false, true),
+        (
+            "BA_DEF_REL_",
+            "BA_DEF_REL_ BU_SG_REL_ \"RelAttr\"\n    STRING ;",
+            false,
+            true,
+        ),
+        (
+            "BA_DEF_DEF_REL_",
+            "BA_DEF_DEF_REL_ \"RelAttr\"\n    \"\";",
+            false,
+            true,
+        ),
+        (
+            "BA_REL_",
+            "BA_REL_ \"RelAttr\" BU_SG_REL_ ECU1 SG_ 291 Spd 1;",
+            false,
+            false,
+        ),
+        ("ENVVAR_DATA_", "ENVVAR_DATA_ SomeEnv: 10;", false, false),
+        ("CAT_", "CAT_", true, false),
+        ("CAT_DEF_", "CAT_DEF_", true, false),
+        ("FILTER", "FILTER", true, false),
+        ("EV_DATA_", "EV_DATA_", true, false),
+        ("SGTYPE_", "SGTYPE_", true, false),
+        ("SGTYPE_VAL_", "SGTYPE_VAL_", true, false),
+        ("BA_DEF_SGTYPE_", "BA_DEF_SGTYPE_", true, false),
+        ("BA_SGTYPE_", "BA_SGTYPE_", true, false),
+        ("SIG_TYPE_REF_", "SIG_TYPE_REF_", true, false),
+        ("SIGTYPE_VALTYPE_", "SIGTYPE_VALTYPE_", true, false),
+        ("BU_SG_REL_", "BU_SG_REL_", true, false),
+        ("BU_EV_REL_", "BU_EV_REL_", true, false),
+        ("BU_BO_REL_", "BU_BO_REL_", true, false),
+    ];
+
+    let mut expected_strip: Vec<&str> = Vec::new();
+
+    for &(keyword, statement, in_ns, expect_strip) in table {
+        // ① 原始文本（真实出现形态）必须能被/不能被底层解析器接受。
+        let raw = if in_ns {
+            format!(
+                "VERSION \"\"\n\nNS_ :\n    {statement}\n\nBU_: ECU1\n\nBO_ 291 VehSpd: 8 ECU1\n SG_ Spd : 0|16@1+ (0.01,0) [0|0] \"km/h\" ECU1\n"
+            )
+        } else {
+            format!("{BASE}{statement}\n")
+        };
+        let parsed = can_dbc::Dbc::try_from(raw.as_str());
+        if expect_strip {
+            assert!(
+                parsed.is_err(),
+                "{keyword}: 原始文本被证明解析失败，故必须在剔除清单里"
+            );
+            expected_strip.push(keyword);
+        } else {
+            assert!(
+                parsed.is_ok(),
+                "{keyword}: 原始文本解析成功，故绝对不能剔除（实际错误：{:?}）",
+                parsed.err().map(|err| err.to_string())
+            );
+        }
+
+        // ② 运行期清单行为：顶层出现时，期望剔除的关键字必须消失，其余必须保留。
+        let probe = format!("{BASE}{statement}\n");
+        let outcome = normalize_dbc_bytes(probe.as_bytes(), "evidence.dbc").expect("应可规范化");
+        assert_eq!(
+            !outcome.text.contains(keyword),
+            expect_strip,
+            "{keyword}: 规范化行为与证据表不一致\n{}",
+            outcome.text
+        );
+    }
+
+    expected_strip.sort_unstable();
+    assert_eq!(
+        expected_strip,
+        vec!["BA_DEF_DEF_REL_", "BA_DEF_REL_", "CM_ BA_"],
+        "剔除清单必须恰好是证据证明会失败的关键字集合"
+    );
+}
+
+/// Step 10 用例 4：跨行待剔除语句后紧跟 `BO_`/`SG_` 时，报文定义必须完好。
+#[test]
+fn dbcnorm_multiline_strip_cannot_eat_message_definitions() {
+    let text = "VERSION \"\"\n\nNS_ :\n    CAT_\n    FILTER\n\nBU_: ECU1\n\nBA_DEF_REL_ BU_SG_REL_ \"RelAttr\"\nBO_ 291 VehSpd: 8 ECU1\n SG_ Spd : 0|16@1+ (0.01,0) [0|0] \"km/h\" ECU1\n\nBO_ 418 BattTemp: 8 ECU1\n SG_ Temp1 : 7|8@0- (1,0) [0|0] \"degC\" ECU1\n";
+
+    let outcome = normalize_dbc_bytes(text.as_bytes(), "multi.dbc").expect("应可规范化");
+
+    // 不变量：BO_/SG_ 行数一致。
+    assert_eq!(
+        count_definition_lines(&outcome.text, "BO_"),
+        count_definition_lines(text, "BO_")
+    );
+    assert_eq!(
+        count_definition_lines(&outcome.text, "SG_"),
+        count_definition_lines(text, "SG_")
+    );
+
+    // 两个报文、两个信号都在。
+    assert!(outcome.text.contains("BO_ 291 VehSpd: 8 ECU1"));
+    assert!(outcome.text.contains("BO_ 418 BattTemp: 8 ECU1"));
+    assert!(outcome.text.contains(" SG_ Spd : 0|16@1+ (0.01,0) [0|0] \"km/h\" ECU1"));
+    assert!(outcome.text.contains(" SG_ Temp1 : 7|8@0- (1,0) [0|0] \"degC\" ECU1"));
+
+    // 未找到 `;` 时保守：只剔除起始行，并留痕。
+    assert!(!outcome.text.contains("BA_DEF_REL_"));
+    assert!(
+        outcome.notes.join("\n").contains("保守处理"),
+        "应记保守剔除 note：{:?}",
+        outcome.notes
+    );
+
+    let dbc = can_dbc::Dbc::try_from(outcome.text.as_str()).expect("规范化后必须能解析");
+    assert_eq!(dbc.messages.len(), 2, "两个报文定义必须完好");
+    assert_eq!(
+        dbc.messages.iter().map(|m| m.signals.len()).sum::<usize>(),
+        2,
+        "两个信号定义必须完好"
+    );
+}
+
+/// Step 10 用例 5：Step 9 的两个核心用例（GBK 中文注释 / UTF-8 BOM）仍工作。
+#[test]
+fn dbcnorm_gbk_and_bom_still_work() {
+    // GBK 中文注释 + 中文 VAL_。
+    let gbk = gbk_dbc_bytes();
+    let outcome = normalize_dbc_bytes(&gbk, "gbk.dbc").expect("GBK DBC 应可规范化");
+    assert!(
+        outcome.notes.iter().any(|note| note.contains("GB18030")),
+        "notes 应说明 GB18030 解码：{:?}",
+        outcome.notes
+    );
+    assert!(outcome.text.contains("车速信号"), "中文注释应保留");
+    assert!(outcome.text.contains("停止") && outcome.text.contains("行驶"));
+    assert!(
+        can_dbc::Dbc::try_from(outcome.text.as_str()).is_ok(),
+        "GBK 解码后的文本必须能被底层解析器接受"
+    );
+
+    // UTF-8 BOM。
+    let mut bom = vec![0xEF, 0xBB, 0xBF];
+    bom.extend_from_slice(make_fixtures::DEMO_DBC.as_bytes());
+    let outcome = normalize_dbc_bytes(&bom, "bom.dbc").expect("BOM DBC 应可规范化");
+    assert!(outcome.text.starts_with("VERSION"), "BOM 应被去掉");
+    assert!(
+        outcome.notes.iter().any(|note| note.contains("BOM")),
+        "notes 应说明去 BOM：{:?}",
+        outcome.notes
+    );
+    assert!(
+        can_dbc::Dbc::try_from(outcome.text.as_str()).is_ok(),
+        "去 BOM 后的文本必须能被底层解析器接受"
+    );
+}
+
+

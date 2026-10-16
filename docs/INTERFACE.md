@@ -36,6 +36,8 @@ fast_blf_core.scan(blf_paths: list[str], dbc_by_channel: dict[int, str],
     #   "files":   [{"path": str, "size": int, "ok": bool, "error": str|None}],
     #   "channels": {
     #      "1": {"dbc": str|None, "dbc_error": str|None,
+    #            "dbc_note": str|None,   # 该通道 DBC 被规范化时的说明（去 BOM / 按 GB18030 解码 /
+    #                                    # 忽略 N 条不支持的语句…）；未规范化则为 None
     #            "messages": [{"id": int,       # 原始 CAN ID（含扩展帧标志位则按原始值）
     #                          "id_hex": str,   # "0x1A2"，GUI 直接显示
     #                          "name": str,     # 无 DBC 时为 "ID_0x1A2"

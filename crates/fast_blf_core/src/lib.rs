@@ -17,11 +17,13 @@ use pyo3::types::{PyDict, PyList};
 use rayon::prelude::*;
 
 mod bit_slice;
+mod dbc_norm;
 mod decoder;
 mod error;
 mod exporter;
 
 pub use bit_slice::{decode_physical, extract_bits, ByteOrder};
+pub use dbc_norm::{normalize_dbc_bytes, NormOutcome};
 pub use decoder::{
     process_file, read_file_timing, sanitize_identifier, scan_file, table_name, DecodePlan,
     FileScan, FileStat, FileTiming, GlobalMin, MessagePlan, Progress, Selection, ShardRef,
@@ -229,7 +231,9 @@ pub fn scan<'py>(
 
     // 宽松构建：某个通道 DBC 解析失败不影响其它通道（scan 要能把错误显示给 GUI）。
     // 空 Selection ⇒ 计划收录全部 DBC 报文；scan 阶段不做过滤。
-    let (plan, dbc_errors) = DecodePlan::build_lenient(&dbc_map, &Selection::default());
+    // scan 的返回契约（§1）没有 warnings 字段，规范化 notes 已并入对应通道的 `dbc_error`
+    // 错误消息（解析失败时）；解析成功时无展示位，故此处忽略。
+    let (plan, dbc_errors, _dbc_notes) = DecodePlan::build_lenient(&dbc_map, &Selection::default());
 
     // 重活全程 detach：释放 GIL 后用 rayon 并行扫描文件。
     let paths: Vec<PathBuf> = blf_paths.iter().map(PathBuf::from).collect();
@@ -599,7 +603,7 @@ pub fn convert<'py>(
 
     // §5.9：单通道 DBC 失败不得拖垮整体。宽松构建后，失败通道在 plan 里为空，
     // 原因按通道回传（`dbc_errors` + `warnings`）；只有"所选内容全部落空"才 EMPTY_RESULT。
-    let (plan, dbc_errors) = DecodePlan::build_lenient(&dbc_map, &selection);
+    let (plan, dbc_errors, dbc_notes) = DecodePlan::build_lenient(&dbc_map, &selection);
     let dbc_error_reasons: BTreeMap<u32, String> = dbc_errors
         .iter()
         .map(|(&channel, err)| (channel, err.message.clone()))
@@ -613,6 +617,20 @@ pub fn convert<'py>(
             )
         })
         .collect();
+
+    // Step 9：DBC 预规范化 notes（去 BOM / GB18030 解码 / 忽略不支持语句）逐条并入 warnings，
+    // 统一带 `DBC「<文件名>」：` 前缀，便于用户定位到具体通道/文件。
+    let mut dbc_note_warnings: Vec<String> = Vec::new();
+    for (channel, notes) in &dbc_notes {
+        let label = dbc_map
+            .get(channel)
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("通道 {channel}"));
+        for note in notes {
+            dbc_note_warnings.push(format!("DBC「{label}」：{note}"));
+        }
+    }
 
     if plan.is_empty() {
         return Err(CoreError::empty_result(empty_selection_message(
@@ -784,6 +802,7 @@ pub fn convert<'py>(
 
     let mut warnings = report.warnings;
     warnings.extend(dbc_warnings);
+    warnings.extend(dbc_note_warnings);
     warnings.extend(outcome.warnings);
     out.set_item("warnings", warnings)?;
 

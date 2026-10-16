@@ -662,6 +662,7 @@ dependencies = [
  "blf_asc",
  "can-dbc",
  "chrono",
+ "encoding_rs",
  "polars",
  "pyo3",
  "rayon",

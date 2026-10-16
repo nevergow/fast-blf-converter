@@ -30,6 +30,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use polars::prelude::*;
 
 use crate::bit_slice::{decode_physical, extract_bits, ByteOrder};
+use crate::dbc_norm::normalize_dbc_bytes;
 use crate::error::CoreError;
 
 /// 绝对时间口径要求 BLF 文件头携带可用墙钟，但文件头无效（Step 7b）。
@@ -290,7 +291,7 @@ impl DecodePlan {
         dbc_by_channel: &BTreeMap<u32, PathBuf>,
         selected: &Selection,
     ) -> Result<Self, CoreError> {
-        let (plan, errors) = Self::build_lenient(dbc_by_channel, selected);
+        let (plan, errors, _notes) = Self::build_lenient(dbc_by_channel, selected);
         if let Some((channel, err)) = errors.into_iter().next() {
             return Err(CoreError::with_detail(
                 err.code,
@@ -301,19 +302,32 @@ impl DecodePlan {
         Ok(plan)
     }
 
-    /// 宽松构建：解析失败的通道记入返回的 `errors`，但不影响其它通道（供 scan 使用）。
+    /// 宽松构建：解析失败的通道记入返回的 `errors`，但不影响其它通道（供 scan / convert 使用）。
     ///
-    /// 返回值 `.1` 的 key 是 1-based 通道号，`CoreError` 的 `Display` 即 `"{code}: {message}"`。
+    /// 返回值：
+    /// * `.0` = 解码计划；
+    /// * `.1` 的 key 是 1-based 通道号，`CoreError` 的 `Display` 即 `"{code}: {message}"`；
+    /// * `.2` = 每个通道的 **DBC 规范化 notes**（去 BOM / GB18030 解码 / 忽略语句），
+    ///   由调用方加 `DBC「<文件名>」：` 前缀后并入 `warnings`；解析失败的通道也会带上，
+    ///   且同样的 notes 已写进 `.1` 的错误消息里，便于用户定位。
+    ///
+    /// 编码与不支持段的预规范化统一走 [`normalize_dbc_bytes`]，scan 与 convert 共用同一条路径。
     pub fn build_lenient(
         dbc_by_channel: &BTreeMap<u32, PathBuf>,
         selected: &Selection,
-    ) -> (Self, BTreeMap<u32, CoreError>) {
+    ) -> (
+        Self,
+        BTreeMap<u32, CoreError>,
+        BTreeMap<u32, Vec<String>>,
+    ) {
         let mut map: HashMap<(u32, u32), MessagePlan> = HashMap::new();
         let mut errors: BTreeMap<u32, CoreError> = BTreeMap::new();
+        let mut notes_by_channel: BTreeMap<u32, Vec<String>> = BTreeMap::new();
 
         for (&channel, path) in dbc_by_channel {
-            let text = match std::fs::read_to_string(path) {
-                Ok(text) => text,
+            // 读原始字节（不要 read_to_string：GBK/ANSI 文件在严格 UTF-8 下会直接失败）。
+            let raw = match std::fs::read(path) {
+                Ok(raw) => raw,
                 Err(err) => {
                     errors.insert(
                         channel,
@@ -325,19 +339,43 @@ impl DecodePlan {
                     continue;
                 }
             };
-            let dbc = match Dbc::try_from(text.as_str()) {
-                Ok(dbc) => dbc,
-                Err(err) => {
+
+            // 文件名用于 warning/错误前缀；没有文件名时退回完整路径。
+            let label = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| path.display().to_string());
+
+            let outcome = match normalize_dbc_bytes(&raw, &label) {
+                Ok(outcome) => outcome,
+                Err(reason) => {
                     errors.insert(
                         channel,
-                        CoreError::dbc_parse(format!(
-                            "解析 DBC 失败：{}（{err}）",
-                            path.display()
-                        )),
+                        CoreError::dbc_parse(format!("解析 DBC 失败：{}（{reason}）", path.display())),
                     );
                     continue;
                 }
             };
+            let notes = outcome.notes;
+
+            let dbc = match Dbc::try_from(outcome.text.as_str()) {
+                Ok(dbc) => dbc,
+                Err(err) => {
+                    let mut message = format!("解析 DBC 失败：{}（{err}）", path.display());
+                    if !notes.is_empty() {
+                        message.push_str(&format!("；规范化说明：{}", notes.join("；")));
+                    }
+                    errors.insert(channel, CoreError::dbc_parse(message));
+                    if !notes.is_empty() {
+                        notes_by_channel.insert(channel, notes);
+                    }
+                    continue;
+                }
+            };
+            if !notes.is_empty() {
+                notes_by_channel.insert(channel, notes);
+            }
 
             for msg in &dbc.messages {
                 // 只收录被选中的报文；未命中即跳过，convert 阶段也就零信号解码开销。
@@ -364,7 +402,7 @@ impl DecodePlan {
             }
         }
 
-        (Self { map }, errors)
+        (Self { map }, errors, notes_by_channel)
     }
 
     /// O(1) 查找：`channel` 为 1-based，`frame_id` 为归一化 raw id。
