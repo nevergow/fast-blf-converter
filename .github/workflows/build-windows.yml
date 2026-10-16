@@ -80,13 +80,25 @@ jobs:
           Write-Host "zip 大小: $([math]::Round($zip.Length/1MB,1)) MB"
 
       # 关键验收：跑打包后的真 exe（离屏自检），确认内核与主题在冻结态可用
+      # 注意：console=False 的 GUI 程序用 `&` 调用时 PowerShell 不等待、$LASTEXITCODE 为空，
+      #       必须用 Start-Process -Wait -PassThru 取真实退出码；并断言输出里出现内核版本号。
       - name: 冻结态自检（跑真 exe）
         shell: pwsh
         run: |
           $env:QT_QPA_PLATFORM = "offscreen"
-          & "dist\FastBLFConverter\FastBLFConverter.exe" --selftest
-          if ($LASTEXITCODE -ne 0) { throw "冻结态自检失败，exit=$LASTEXITCODE" }
-          Write-Host "冻结态自检通过"
+          $dir = "dist\FastBLFConverter"
+          if (-not (Test-Path "$dir\FastBLFConverter.exe")) { throw "产物里没有 exe" }
+          if (-not (Test-Path "$dir\_internal\gui\theme.qss")) { throw "主题资源未打进包（_internal/gui/theme.qss 缺失）" }
+          $out = Join-Path $env:TEMP "selftest.out"
+          $err = Join-Path $env:TEMP "selftest.err"
+          $p = Start-Process -FilePath "$dir\FastBLFConverter.exe" -ArgumentList "--selftest" `
+               -Wait -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+          $log = ((Get-Content $out -Raw) + "`n" + (Get-Content $err -Raw))
+          Write-Host "exe 退出码: $($p.ExitCode)"
+          Write-Host $log
+          if ($p.ExitCode -ne 0) { throw "冻结态自检失败，exit=$($p.ExitCode)" }
+          if ($log -notmatch '0\.1\.0') { throw "自检输出里没有内核版本号，疑似 Rust 内核未加载" }
+          Write-Host "冻结态自检通过（exe 运行 + 内核加载 + 主题就位）"
 
       - name: 上传 artifact（保留 30 天）
         uses: actions/upload-artifact@v4
