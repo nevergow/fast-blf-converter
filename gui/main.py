@@ -2098,14 +2098,17 @@ def run_selftest_config() -> int:
     os.environ["FBLF_CONFIG_DIR"] = str(temp_root)  # 用临时目录当配置目录
     app = QApplication.instance()
     window: MainWindow | None = None
+    print("[config] 0/6 开始（自给自足夹具已写入临时目录）", flush=True)
     try:
         assert app is not None, "QApplication 未构造"
         window = MainWindow()
+        print("[config] 1/6 MainWindow 构建完成", flush=True)
         selected = {"1": {"SelfMsg": ["SelfVal"]}}
         export = {"split_by_message": False, "resample_hz": 10.0, "export_format": "parquet"}
         # 1) 构造配置并保存，逐字段核对 JSON。
         saved = preset_store.save_preset("BMS项目A", {1: dbc, 2: dbc}, selected, export)
         assert saved.is_file(), "保存后文件不存在"
+        print("[config] 2/6 预设已保存并落盘", flush=True)
         raw = json.loads(saved.read_text(encoding="utf-8"))
         assert raw.get("schema") == 1, f"schema={raw.get('schema')!r}"
         assert raw.get("name") == "BMS项目A", f"name={raw.get('name')!r}"
@@ -2128,11 +2131,13 @@ def run_selftest_config() -> int:
         assert window.last_restore.get("restored") == 1, f"恢复信号={window.last_restore!r}"
         assert window.last_restore.get("missed") == 0, f"未匹配={window.last_restore!r}"
         assert window.build_selection() == selected, f"恢复后勾选={window.build_selection()!r}"
+        print("[config] 3/6 加载预设 + 自动解析 + 勾选恢复完成", flush=True)
         # 3) UI 侧保存路径同样可往返（复用已恢复的勾选）。
         ui_saved = window.save_preset("UI往返")
         ui_raw = json.loads(ui_saved.read_text(encoding="utf-8"))
         assert ui_raw.get("selected") == selected, f"UI 保存 selected={ui_raw.get('selected')!r}"
         assert ui_raw.get("dbc_by_channel") == {"1": dbc, "2": dbc}, "UI 保存 DBC 不一致"
+        print("[config] 4/6 UI 侧保存往返完成", flush=True)
         channels = len(window.dbc_by_channel)
         signals = int(window.last_restore["restored"])
         policy = window.current_export_policy()
@@ -2145,6 +2150,7 @@ def run_selftest_config() -> int:
         assert _pump_scan(app, window), "缺失 DBC 配置的自动解析超时"
         assert 2 in window.missing_dbc_channels, f"缺失集合={window.missing_dbc_channels}"
         assert window.dbc_by_channel.get(1) == dbc, "正常通道的 DBC 被误改"
+        print("[config] 5/6 缺失 DBC 场景完成", flush=True)
         missing_count = len(window.missing_dbc_channels)
     except Exception as exc:  # noqa: BLE001 - 自检要把任何异常变成可 grep 的失败行
         print(f"CONFIG_FAIL {type(exc).__name__}: {exc}")
@@ -2153,6 +2159,7 @@ def run_selftest_config() -> int:
         if window is not None:
             _destroy_window(window)
     hz = policy["resample_hz"]
+    print("[config] 6/6 全部断言通过", flush=True)
     print(f"CONFIG_OK saved={saved.name} channels={channels} signals={signals} "
           f"export={policy['export_format']}/{hz} missing={missing_count}")
     return 0
