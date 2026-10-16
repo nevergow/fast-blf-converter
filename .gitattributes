@@ -1,0 +1,4 @@
+# 内嵌的第三方前端库必须逐字节稳定：禁止 git 做换行/编码转换，
+# 否则 Windows runner 上 autocrlf 会 LF→CRLF，导致产物与 NOTICE 记录的 sha256 不一致。
+gui/assets/*.js -text
+gui/assets/*.min.js -text

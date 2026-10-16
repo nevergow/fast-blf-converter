@@ -278,7 +278,7 @@ pub struct CoreError { pub code: String, pub message: String, pub detail: Option
     * 渲染线程不得参与解码：数据只能来自 `series_for_plot`（见 §1.3），不得在 GUI 里遍历 BLF。
 15. **导出 HTML 报告（Step 16）**：单个 `.html` 文件、**离线可开**、图表库必须内嵌（**禁止 CDN**）；
     包含：时间范围、每信号的原始点数与 min/max/mean 统计、可缩放/悬停读数的曲线；
-    文件体积 < 8MB；生成失败要有明确错误码，不得产出半截文件。
+    文件体积 **≤ 8 MiB（8,388,608 字节）**（消除 8MB/8MiB 歧义：按 MiB 计；超限按相邻桶合并，仍不丢峰）；生成失败要有明确错误码，不得产出半截文件。
 16. **不新增 Python 侧依赖**：桌面预览必须走 PySide6 自带能力、自绘（QPainter）或纯 Python 实现
     （**优先自绘**：min/max 包络与量纲分轴都需要精确控制，且零打包风险）。
     HTML 报告允许内嵌**已由 Hermes 主会话审阅并 vendor 进仓库的前端库**（必须有 license 说明、
