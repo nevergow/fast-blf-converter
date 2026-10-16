@@ -1,0 +1,103 @@
+name: Build Windows Portable
+
+# 只在手动触发或打 tag 时跑（不在每次 push 时跑，避免消耗 Actions 分钟）。
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # tag 触发时要创建 Release 并上传附件
+
+jobs:
+  windows-portable:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      # Polars 依赖树很大，缓存 target 目录能显著缩短第二次构建
+      - name: 缓存 cargo 构建产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/fast_blf_core
+
+      - name: 建 venv 并安装构建期依赖
+        shell: pwsh
+        run: |
+          python -m venv .venv-win
+          $py = ".venv-win\Scripts\python.exe"
+          & $py -m pip install --upgrade pip
+          & $py -m pip install maturin pyinstaller PySide6 xlsxwriter
+          & $py -c "import sys, PySide6; print('venv python', sys.version.split()[0], '| PySide6', PySide6.__version__)"
+
+      # 与 build_windows_portable.bat 第 [4/8] 步完全一致：从仓库根目录调用 maturin
+      - name: 编译 Rust 扩展（release, abi3）
+        shell: pwsh
+        env:
+          PYO3_PYTHON: ${{ github.workspace }}\.venv-win\Scripts\python.exe
+        run: |
+          $py = ".venv-win\Scripts\python.exe"
+          & $py -m maturin build --release --features extension-module --out dist\wheels
+          if ($LASTEXITCODE -ne 0) { throw "maturin build 失败" }
+          Get-ChildItem dist\wheels\*.whl | ForEach-Object { Write-Host "wheel: $($_.Name) ($([math]::Round($_.Length/1MB,1)) MB)" }
+
+      - name: 安装扩展并做冒烟测试
+        shell: pwsh
+        run: |
+          $py = ".venv-win\Scripts\python.exe"
+          $wheel = (Get-ChildItem dist\wheels\*.whl | Select-Object -First 1).FullName
+          & $py -m pip install --force-reinstall --no-deps $wheel
+          if ($LASTEXITCODE -ne 0) { throw "wheel 安装失败" }
+          & $py -c "import fast_blf_core; print('fast_blf_core', fast_blf_core.version())"
+
+      - name: PyInstaller onedir 打包
+        shell: pwsh
+        run: |
+          $py = ".venv-win\Scripts\python.exe"
+          & $py -m PyInstaller --noconfirm --clean packaging\FastBLFConverter.spec
+          if ($LASTEXITCODE -ne 0) { throw "PyInstaller 打包失败" }
+          if (-not (Test-Path "dist\FastBLFConverter\FastBLFConverter.exe")) { throw "未找到 exe" }
+          if (Test-Path "dist\FastBLFConverter\FastBLFConverter.onefile*") { throw "出现 onefile 产物（禁止）" }
+
+      - name: 复制使用说明 + 打包绿色 zip
+        shell: pwsh
+        run: |
+          Copy-Item "使用说明.txt" "dist\FastBLFConverter\" -Force
+          Copy-Item "gui\theme.qss" "dist\FastBLFConverter\gui\" -Force -ErrorAction SilentlyContinue
+          Compress-Archive -Path "dist\FastBLFConverter\*" -DestinationPath "dist\FastBLFConverter-portable.zip" -Force
+          $zip = Get-Item "dist\FastBLFConverter-portable.zip"
+          Write-Host "zip 大小: $([math]::Round($zip.Length/1MB,1)) MB"
+
+      # 关键验收：跑打包后的真 exe（离屏自检），确认内核与主题在冻结态可用
+      - name: 冻结态自检（跑真 exe）
+        shell: pwsh
+        run: |
+          $env:QT_QPA_PLATFORM = "offscreen"
+          & "dist\FastBLFConverter\FastBLFConverter.exe" --selftest
+          if ($LASTEXITCODE -ne 0) { throw "冻结态自检失败，exit=$LASTEXITCODE" }
+          Write-Host "冻结态自检通过"
+
+      - name: 上传 artifact（保留 30 天）
+        uses: actions/upload-artifact@v4
+        with:
+          name: FastBLFConverter-portable-windows
+          path: dist/FastBLFConverter-portable.zip
+          retention-days: 30
+
+      - name: 打 tag 时发布 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/FastBLFConverter-portable.zip
+          generate_release_notes: true

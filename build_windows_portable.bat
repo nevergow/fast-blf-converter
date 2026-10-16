@@ -118,15 +118,17 @@ rem       --out 到 dist\wheels，便于留档与在离线机器上复用。
 rem ============================================================================
 if not exist "%WHEEL_DIR%" mkdir "%WHEEL_DIR%"
 
-echo [4/8] 编译 Rust 扩展（crates\fast_blf_core, release）
-pushd "%ROOT%crates\fast_blf_core"
+rem      从【仓库根目录】调用 maturin（不要 pushd 到 crate 目录）：pyproject.toml 的
+rem      [tool.maturin] 指定了 manifest-path / module-name，从根目录跑才生效；
+rem      这条调用路径已在本机对同一份 pyproject 实测通过。
+cd /d "%ROOT%"
+echo [4/8] 编译 Rust 扩展（release -> dist\wheels）
 rem      显式指定 pyo3 使用的解释器。仓库里的 .cargo/config.toml 是为 macOS 开发写的
 rem      （PYO3_PYTHON=/opt/anaconda3/bin/python3）；cargo 的 [env] 只在变量【未设置】时才生效，
 rem      所以这里先设好，Windows 构建就不会被那份 macOS 配置带偏。
 set "PYO3_PYTHON=%VPY%"
 "%VPY%" -m maturin build --release --features extension-module --out "%WHEEL_DIR%"
 set "MATURIN_RC=%errorlevel%"
-popd
 if not "%MATURIN_RC%"=="0" (
     set "ERRMSG=Rust 扩展编译失败（请确认已安装 Rust 工具链：rustup / cargo）。"
     goto :fail
