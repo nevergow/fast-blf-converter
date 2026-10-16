@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -62,6 +63,10 @@ KERNEL_READY: bool = core is not None
 # ------------------------------------------------------------------- 常量 ----
 APP_TITLE = "Fast BLF Converter · 多核 BLF 极速转换"
 CHANNEL_CHOICES = ["Ch1", "Ch2", "Ch3", "Ch4", "Ch5", "Ch6", "Ch7", "Ch8"]
+#: Step 13：手动添加通道的统一文案（工具栏按钮 + 信号树空白处右键菜单共用）。
+ADD_CHANNEL_TEXT = "➕ 添加通道…"
+ADD_CHANNEL_STATUS_TIP = ("手动添加一个通道节点（通道号 1~64，默认预填当前最大通道号 +1）；"
+                          "添加后可在该节点上右键「📄 添加 DBC…」")
 KERNEL_MISSING_TEXT = "⚠ Rust 内核未就绪（请先 maturin develop）"
 STATUS_PENDING, STATUS_PARSING, STATUS_DONE, STATUS_FAILED = "待处理", "解析中", "✓ 已完成", "✗ 失败"
 RESAMPLE_CHOICES: list[tuple[str, float | None]] = [
@@ -371,6 +376,9 @@ class MainWindow(QMainWindow):
         #: Step 6c：当前配置名 / 缺失 DBC 的通道 / 加载后待恢复的勾选。
         self.current_preset_name: str | None = None
         self.missing_dbc_channels: set[int] = set()
+        #: Step 13：通道节点粘性 —— 已出现过的通道号集合（预置 / 手动添加 / 扫描观测），
+        #: 树重建时并集参与，只增不减；`_seed_channels()` 之后预置 Ch1~Ch8。
+        self.channel_slots: set[int] = set()
         self._pending_restore: dict | None = None
         self.last_restore: dict = {}
         #: Step 7c：进度区状态机 + 最后一次转换结果（供无人值守自检读取）。
@@ -389,6 +397,9 @@ class MainWindow(QMainWindow):
         self._build_statusbar()
         self._connect_signals()
         self._seed_channels()
+        # Step 13 B1：预置 Ch1~Ch8 常驻通道槽位（`_seed_channels` 已逐个登记一次，
+        # 这里显式补齐，保证"先绑 DBC 再统一解析"时通道节点永不因重建而消失）。
+        self.channel_slots = set(range(1, len(CHANNEL_CHOICES) + 1))
         self._sync_resample_hint()
         self._refresh_action_state()
         self._progress_idle()
@@ -435,6 +446,10 @@ class MainWindow(QMainWindow):
         self.act_clear_dbc = QAction("🗑 全部清除 DBC", self)
         tune(self.act_clear_dbc, statusTip="清空所有通道的 DBC 绑定与树里的 DBC 节点（需二次确认）")
         bar.addAction(self.act_clear_dbc)
+        # Step 13 B4：手动添加通道（工具入口之一；另一处在信号树空白处右键）。
+        self.act_add_channel = QAction(ADD_CHANNEL_TEXT, self)
+        tune(self.act_add_channel, statusTip=ADD_CHANNEL_STATUS_TIP)
+        bar.addAction(self.act_add_channel)
         bar.addSeparator()
         # Step 6c：配置预设三入口（保存 / 加载 / 删除）。
         self.act_save_config = QAction("💾 保存配置", self)
@@ -607,6 +622,7 @@ class MainWindow(QMainWindow):
         self.act_add_blf.triggered.connect(self.add_blf_dialog)
         self.btn_parse.clicked.connect(self.start_parse_signals)
         self.act_clear_dbc.triggered.connect(self.clear_dbc_bindings)
+        self.act_add_channel.triggered.connect(self.add_channel_dialog)
         self.act_save_config.triggered.connect(self.save_config_dialog)
         self.act_load_config.triggered.connect(self.load_config_dialog)
         self.act_delete_config.triggered.connect(self.delete_config_dialog)
@@ -713,7 +729,33 @@ class MainWindow(QMainWindow):
                 target = row
                 break
         self.signal_model.insertRow(target, item)
+        # Step 13 B3：新建节点即登记槽位，保证手动添加的通道在下次解析重建后依然存在。
+        self.channel_slots.add(int(channel))
         return item
+
+    def add_channel_dialog(self) -> None:
+        """「➕ 添加通道…」：取通道号后交给 :meth:`_add_channel`（弹窗只负责取号）。"""
+        default = (max(self.channel_slots) + 1) if self.channel_slots else 1
+        channel, accepted = QInputDialog.getInt(
+            self, "添加通道", "通道号（1~64）：", value=default, min=1, max=64)
+        if not accepted:
+            return
+        self._add_channel(int(channel))
+
+    def _add_channel(self, channel: int) -> bool:
+        """把通道号加入 ``channel_slots`` 并确保树里有节点；返回是否为新建。
+
+        已存在时不重复建节点、不弹错误框，只在状态栏提示（Step 13 B4）。
+        """
+        channel = int(channel)
+        if channel in self.channel_slots:
+            self.statusBar().showMessage(f"通道 Ch{channel} 已存在")
+            return False
+        self.channel_slots.add(channel)
+        self._channel_item(channel)
+        self.signal_view.expandToDepth(0)
+        self.statusBar().showMessage(f"已添加通道 Ch{channel}，可在其上右键添加 DBC")
+        return True
 
     @staticmethod
     def _is_checkable(item: QStandardItem | None) -> bool:
@@ -734,9 +776,15 @@ class MainWindow(QMainWindow):
                         yield grand
 
     def _on_signal_context_menu(self, pos) -> None:
-        """只在通道节点上弹出「📄 添加 DBC…」（Step 6a §2）。"""
+        """通道节点上弹「📄 添加 DBC…」；空白处弹「➕ 添加通道…」（Step 13 B4）。"""
         index = self.signal_view.indexAt(pos)
         if not index.isValid():
+            # 点在信号树空白处：只提供"添加通道"入口（与工具栏同一个动作文案）。
+            menu = QMenu(self.signal_view)
+            action = menu.addAction(ADD_CHANNEL_TEXT)
+            chosen = menu.exec(self.signal_view.viewport().mapToGlobal(pos))
+            if chosen is action:
+                self.add_channel_dialog()
             return
         item = self.signal_model.itemFromIndex(self.signal_proxy.mapToSource(index))
         if item is None or item.data(NODE_ROLE) != NODE_CHANNEL:
@@ -1038,7 +1086,12 @@ class MainWindow(QMainWindow):
         self._check_snapshot = self._capture_checks()
         if self.entries:
             self._mark_all(STATUS_PARSING)
-        self._begin_busy("Phase 1/2 · 扫描中…")
+            # Step 13 A2：有 BLF 时 scan 的进度回调带真实文件级 done/total，
+            # 必须走确定进度条，禁止再用 0→100→0 的不确定态乒乓动画。
+            self._begin_determinate("解析中…")
+        else:
+            # 无 BLF（只按 DBC 列信号）时 total 恒为 0，才允许不确定态。
+            self._begin_busy("Phase 1/2 · 扫描中…")
         self.lbl_status.setText("正在解析信号…")
         self.statusBar().showMessage("正在解析信号…")
         self.scan_worker = Worker("scan", blf_paths=[e.path for e in self.entries],
@@ -1048,16 +1101,36 @@ class MainWindow(QMainWindow):
         self._refresh_action_state()
 
     def _on_scan_progress(self, payload: dict) -> None:
-        """解析进度来自工作线程，只更新文本与进度条（解析期间状态栏提示不变）。"""
+        """解析进度来自工作线程：按文件级 ``done/total`` 驱动确定进度条（Step 13 A3）。"""
         message = str(payload.get("message") or "正在解析信号…")
         done, total = int(payload.get("done", 0) or 0), int(payload.get("total", 0) or 0)
-        label = "正在解析信号…"
+        frames = int(payload.get("frames_done", 0) or 0)
+        file_path = payload.get("file")
+        pv = self._pv
         if total > 0:
-            label = f"正在解析信号… ({done}/{total})"
+            # 确定态：busy 必须关掉，否则 200ms 心跳又会把进度条来回扫动（A5）。
+            pv["active"] = True
+            pv["busy"] = False
+            pv["done"], pv["total"], pv["frames"] = done, total, frames
+            if file_path:
+                pv["file"] = str(file_path)
+            # 单调不减：新值小于当前值就保持当前值；done 追平/超过 total 直接满格。
+            value = int(100 * done / total)
+            if done >= total:
+                value = 100
+            value = max(self.progress_bar.value(), value)
+            pv["value"] = value
+            pv["label_override"] = (f"解析中 · {os.path.basename(str(file_path))}"
+                                    if file_path else "解析中")
+            pv["meta_override"] = f"文件 {done}/{total} · 本文件已扫 {frames:,} 帧"
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(value)
+            self._render_progress()
+        label = f"正在解析信号… ({done}/{total})" if total > 0 else "正在解析信号…"
         self.lbl_status.setText(label)
         self.statusBar().showMessage(f"正在解析信号… {message}")
-        if payload.get("file"):
-            self._set_file_status(str(payload["file"]), STATUS_PARSING)
+        if file_path:
+            self._set_file_status(str(file_path), STATUS_PARSING)
 
     def _on_scan_ok(self, report: dict) -> None:
         for info in report.get("files") or []:
@@ -1073,6 +1146,21 @@ class MainWindow(QMainWindow):
         self.channel_summary = report.get("channels") or {}
         self._populate_signal_tree()
         self._check_snapshot = None
+        # Step 13 A4：解析终态必须明确停在 100%，不能被 `_on_scan_thread_done` 复位。
+        self._progress_timer.stop()
+        pv = self._pv
+        pv["active"] = True
+        pv["finished"] = True
+        pv["busy"] = False
+        pv["value"] = 100
+        pv["label_override"] = None
+        pv["meta_override"] = None
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
+        self.lbl_progress_status.setText("解析完成")
+        self.lbl_progress_status.setToolTip("解析完成")
+        self.lbl_progress_meta.setText("100%")
+        self._set_progress_state("done")
         pending, self._pending_restore = self._pending_restore, None
         if pending is not None:  # Step 6c：配置加载 → 解析完成后恢复勾选
             restored, missed = self._restore_selection(pending.get("selected") or {})
@@ -1096,6 +1184,9 @@ class MainWindow(QMainWindow):
     def _on_scan_failed(self, message: str) -> None:
         self._check_snapshot = None
         self._mark_all(STATUS_FAILED, message)
+        # Step 13 A4：失败时进度区回到待命，绝不停在中间百分比；红色失败文案保留在
+        # 文件列表行（STATUS_FAILED 红字 + tooltip）与状态栏/lbl_status。
+        self._progress_idle()
         self.lbl_status.setText(f"解析失败：{message}"); self.statusBar().showMessage(message)
 
     def _on_scan_thread_done(self) -> None:
@@ -1221,20 +1312,41 @@ class MainWindow(QMainWindow):
             channels = dict(self.channel_summary)
             keys = {int(k) for k in channels if str(k).isdigit()}
             keys |= {int(k) for k in self.dbc_by_channel}
+            # Step 13 B2：重建不得丢掉"没有帧观测 / 没绑 DBC"的通道 —— 并上常驻槽位。
+            keys |= set(self.channel_slots)
+            self.channel_slots |= keys  # 只增不减：扫描观测到的新通道也变成常驻槽位
             for channel in sorted(keys):
-                ch_info = channels.get(str(channel)) or channels.get(channel) or {}
+                ch_info = channels.get(str(channel))
+                observed = ch_info is not None
+                if ch_info is None:  # 兼容 int 键的报告
+                    ch_info = channels.get(channel)
+                    observed = ch_info is not None
+                ch_info = ch_info or {}
                 dbc_error = ch_info.get("dbc_error")
                 dbc_path = ch_info.get("dbc") or self.dbc_by_channel.get(channel)
                 is_missing = channel in self.missing_dbc_channels
-                suffix = ("（DBC 解析失败）" if dbc_error else
-                          DBC_MISSING_SUFFIX if is_missing else "")
+                # Step 13 B5：有 DBC（含失败/缺失）维持现状；无 DBC 再分"有/无帧观测"。
+                if dbc_error:
+                    suffix = "（DBC 解析失败）"
+                elif is_missing:
+                    suffix = DBC_MISSING_SUFFIX
+                elif not dbc_path and observed:
+                    suffix = "（未绑定 DBC，显示原始 ID）"
+                elif not dbc_path:
+                    suffix = "（无帧观测，右键可添加 DBC）"
+                else:
+                    suffix = ""
                 if dbc_error:
                     tip = str(dbc_error)
                 elif is_missing:
                     tip = f"Ch{channel}\nDBC 文件不存在：{dbc_path or '（未记录路径）'}"
+                elif dbc_path:
+                    tip = f"Ch{channel}\nDBC：{dbc_path}"
+                elif observed:
+                    tip = f"Ch{channel}\n未绑定 DBC，显示原始 ID"
                 else:
-                    tip = (f"Ch{channel}" + (f"\nDBC：{dbc_path}" if dbc_path
-                                             else "\n未绑定 DBC，显示原始 ID"))
+                    tip = (f"Ch{channel}\n该通道在当前 BLF 中没有帧，或尚未添加 BLF；\n"
+                           "添加 DBC 后点「🔍 解析信号」即可列出报文")
                 ch_item = self._make_node(f"通道 Ch{channel}{suffix}", NODE_CHANNEL,
                                           f"Ch{channel}", tip, tristate=True, channel=channel)
                 if dbc_error or is_missing:
@@ -1473,6 +1585,7 @@ class MainWindow(QMainWindow):
             "rate": 0.0, "rate_unit": "帧/s", "rate_file": None, "rate_frames": 0,
             "rate_at": 0.0, "started": 0.0, "done_files": set(), "bytes_done": 0,
             "bytes_total": 0, "est_total_frames": 0.0, "label_override": None,
+            "meta_override": None,
             "done_exact": True, "phase1_complete": False,
         }
 
@@ -1504,6 +1617,29 @@ class MainWindow(QMainWindow):
         pv["busy"] = True
         pv["started"] = time.monotonic()
         pv["label_override"] = text
+        self._busy_pos = 0
+        self._busy_step = 8
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self._set_progress_state("working")
+        self._render_progress()
+        self._progress_timer.start()
+
+    def _begin_determinate(self, text: str) -> None:
+        """确定态（Step 13 A1）：解析信号按文件级 ``done/total`` 推进。
+
+        与 :meth:`_begin_busy` 的区别：这里由 ``_on_scan_progress`` 用真实进度驱动
+        进度条，``busy`` 会在首个回调里关掉，因此不会出现 0→100→0 的乒乓动画。
+        """
+        self._progress_timer.stop()
+        pv = self._new_progress_state()
+        self._pv = pv
+        pv["active"] = True
+        pv["busy"] = True
+        pv["started"] = time.monotonic()
+        pv["label_override"] = text
+        # 复位不确定态乒乓位置/方向：即便首个真实回调到来前心跳触发过，也只会从 0
+        # 单调向上（残留的负 step 会让 `_on_progress_tick` 把进度条往回扫）。
         self._busy_pos = 0
         self._busy_step = 8
         self.progress_bar.setRange(0, 100)
@@ -1664,10 +1800,14 @@ class MainWindow(QMainWindow):
         self.lbl_progress_status.setText(status)
         self.lbl_progress_status.setToolTip(status)
         percent = pv["value"]
-        percent_text = f"{percent}%" if percent is not None else "—"
-        bytes_text = self._bytes_progress_text()
-        self.lbl_progress_meta.setText(f"{percent_text} · {bytes_text}" if bytes_text
-                                       else percent_text)
+        if pv.get("meta_override"):
+            # Step 13 A3：解析副文本固定为「文件 d/t · 本文件已扫 n 帧」，心跳重绘不得覆盖。
+            self.lbl_progress_meta.setText(str(pv["meta_override"]))
+        else:
+            percent_text = f"{percent}%" if percent is not None else "—"
+            bytes_text = self._bytes_progress_text()
+            self.lbl_progress_meta.setText(f"{percent_text} · {bytes_text}" if bytes_text
+                                           else percent_text)
         if percent is not None and not pv["busy"]:
             self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(int(percent))
@@ -1984,8 +2124,9 @@ def run_selftest_deep() -> int:
         window._populate_signal_tree()
 
         channels = window.signal_model.rowCount()
-        if channels != 2:
-            print(f"DEEP_FAIL channels={channels} expected=2")
+        # Step 13 B：通道集合并上常驻 channel_slots（Ch1~Ch8），故不再是 2 个通道。
+        if channels != len(CHANNEL_CHOICES):
+            print(f"DEEP_FAIL channels={channels} expected={len(CHANNEL_CHOICES)}")
             return 2
         dbc_nodes = sum(
             1 for row in range(channels)
@@ -2070,6 +2211,91 @@ def _pump_convert(app: QApplication, window: MainWindow, timeout: float = 600.0)
             return True
         time.sleep(0.002)
     return False
+
+
+def run_selftest_parse() -> int:
+    """``--selftest-parse``：解析信号确定进度 + 通道粘性 / 手动添加的无人值守验证。
+
+    * 成功：打印 ``PARSE_OK values=[...] channels=N added_ch9=ok``，返回 0；
+    * 断言失败：打印 ``PARSE_FAIL <原因>``，返回 2；
+    * 内核 / 夹具缺失：打印 ``PARSE_SKIP ...``，返回 0（与 no_kernel 同一约定）。
+    """
+    if core is None:
+        print("PARSE_SKIP no_kernel")
+        return 0
+    root = Path(__file__).resolve().parent.parent
+    src = root / "fixtures" / "multi_channel.blf"
+    dbc = root / "fixtures" / "demo.dbc"
+    missing = [str(p) for p in (src, dbc) if not p.is_file()]
+    if missing:
+        print(f"PARSE_SKIP no_fixture {' '.join(missing)}")
+        return 0
+    app = QApplication.instance()
+    if app is None:
+        print("PARSE_FAIL no_qapplication")
+        return 2
+    window: MainWindow | None = None
+    try:
+        window = MainWindow()
+        window.quiet_dialogs = True  # 无人值守：任何模态弹窗都会挂死自检
+        temp_root = Path(tempfile.mkdtemp(prefix="fblf_parse_selftest_"))
+        blf_paths = []
+        for index in range(3):  # 复制 3 份：让文件级进度有 3 格
+            dst = temp_root / f"copy{index + 1}.blf"
+            shutil.copyfile(src, dst)
+            blf_paths.append(str(dst.resolve()))
+        window.clear_files()
+        window.add_blf_paths(blf_paths)
+        window.dbc_by_channel = {1: str(dbc.resolve()), 2: str(dbc.resolve())}
+        window._refresh_dbc_label()
+        # valueChanged 只在数值"变化"时触发；3 份小 BLF 的扫描可能在 200ms 心跳前
+        # 就从 0 直接跳到 100，故把起始值也纳入序列，保证 ≥2 个不同取值可被观测。
+        recorded: list[int] = [window.progress_bar.value()]
+        window.progress_bar.valueChanged.connect(lambda value: recorded.append(int(value)))
+        window.start_parse_signals()
+        if window.scan_worker is None:
+            print("PARSE_FAIL scan_not_started")
+            return 2
+        if not _pump_scan(app, window, timeout=60.0):
+            print("PARSE_FAIL timeout")
+            return 2
+        for previous, current in zip(recorded, recorded[1:]):
+            if current < previous:
+                print(f"PARSE_FAIL non_monotonic values={recorded}")
+                return 2
+        if not recorded or recorded[-1] != 100:
+            print(f"PARSE_FAIL not_100 values={recorded}")
+            return 2
+        unique = sorted(set(recorded))
+        if len(unique) < 2:
+            print(f"PARSE_FAIL too_few_values values={unique}")
+            return 2
+        channels = window.signal_model.rowCount()
+        if channels < len(CHANNEL_CHOICES):
+            print(f"PARSE_FAIL channels={channels} expected>={len(CHANNEL_CHOICES)}")
+            return 2
+        if window._channel_item(7) is None:
+            print("PARSE_FAIL channel_7_missing")
+            return 2
+        before = window.signal_model.rowCount()
+        if not window._add_channel(9):
+            print("PARSE_FAIL add_ch9_first_false")
+            return 2
+        after = window.signal_model.rowCount()
+        if after <= before:
+            print(f"PARSE_FAIL rowcount_not_grown before={before} after={after}")
+            return 2
+        if window._add_channel(9):
+            print("PARSE_FAIL add_ch9_second_true")
+            return 2
+    except Exception as exc:  # noqa: BLE001 - 自检要把任何异常变成可 grep 的失败行
+        print(f"PARSE_FAIL {type(exc).__name__}: {exc}")
+        return 2
+    finally:
+        if window is not None:
+            _destroy_window(window)
+    print(f"PARSE_OK values={unique} channels={channels} added_ch9=ok")
+    return 0
 
 
 def run_selftest_config() -> int:
@@ -2446,6 +2672,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
     deep = "--selftest-deep" in args[1:]
     config_test = "--selftest-config" in args[1:]
     progress_test = "--selftest-progress" in args[1:]
+    parse_test = "--selftest-parse" in args[1:]
     dump_target = _dump_target(args[1:])
     app = QApplication.instance() or QApplication(args)
     app.setApplicationName("Fast BLF Converter")
@@ -2458,6 +2685,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
         return run_selftest_config()
     if progress_test:
         return run_selftest_progress()
+    if parse_test:
+        return run_selftest_parse()
     if deep:
         return run_selftest_deep()
     if dump_target is not None:

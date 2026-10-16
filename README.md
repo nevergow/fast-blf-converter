@@ -74,7 +74,7 @@ gui/main.py (PySide6, 暗色 Fluent)  ──QThread──►  fast_blf_core (Rus
 | 单元 + 集成测试 | **89 项全绿**（39 单元 + 50 集成 `tests/e2e_synthetic.rs`） |
 | 端到端验收 `tests/acceptance.py` | **55/55 通过**（A4 三格式/无空值、A5 百万行防呆、**A6 坏 DBC 容错**、**A6' 空 BLF 扫描**、**A7 时间口径 4 选 1 精确比对**、**A9 宽表同名信号**） |
 | DBC 解析矩阵 | **24/25 种真实写法可解析**（空 `NS_` 段 / `SG_MUL_VAL_` / `SIG_VALTYPE_` / `EV_` / 扩展帧 / CRLF / ENUM 越界…）；唯一失败用例是文件本身引号不规范，按预期给出精确行号 |
-| GUI 无人值守自检 | 5 条全过：`--selftest` / `--selftest-deep`（`DEEP_OK channels=2 dbc_nodes=2 messages=3`）/ `--selftest-config`（`CONFIG_OK`）/ `--selftest-progress`（`PROGRESS_OK phase1=2 phase2=2 frames_max=1212600`）/ `--dump-check-states`（`DUMP_OK`） |
+| GUI 无人值守自检 | **6 条全过**：`--selftest` / **`--selftest-parse`**（`PARSE_OK` 解析进度单调→100 + Ch1~Ch8 不消失）/ `--selftest-deep`（`DEEP_OK channels=8 dbc_nodes=2 messages=3`）/ `--selftest-config`（`CONFIG_OK`）/ `--selftest-progress`（`PROGRESS_OK`）/ `--dump-check-states`（`DUMP_OK`） |
 | GUI 交互路径独立探针 | **11/11**：通道级绑 DBC → 解析 → 报文名从 `ID_0x123` 变真名 → 取消勾选 → **重解析后勾选被恢复** → 全部清除 |
 | 冻结态（PyInstaller onedir，本机实跑） | `--selftest` 内核就绪 0.2.0 / `--selftest-config` **`CONFIG_OK`（预设保存·加载·DBC 缺失处理在打包后可用）** / `--selftest-deep` `DEEP_SKIP no_fixture` / `--dump-check-states` `DUMP_OK` 23079B；`theme.qss` 落在 `_internal/gui/theme.qss` |
 | 位序正确性 | Intel/Motorola 与 `cantools` **1440 组随机对拍 0 不一致**（见 `docs/DEPS.md` §7） |

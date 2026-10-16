@@ -72,7 +72,9 @@ fast_blf_core.convert(config: dict, progress_cb: Callable[[dict], None] | None =
 | `temp_dir` | `str` | Parquet 分片临时目录（不存在则创建；结束前清空其内容） |
 | `excel_row_limit` | `int` | 默认 `1_000_000`；xlsx 模式超过即降级 |
 | `memory_budget_mb` | `int` | 默认 `1536`；分片缓冲达到该值即 flush 落盘 |
-| `ffill` | `bool` | 默认 `false`。仅在 `split_by_message == false` 且 `resample_hz == None`（保持原始时序）时生效：对 outer join 后的宽表做前向填充 |
+| `ffill` | `bool` | **兼容别名**（Step 14 起，等价于 `fill_policy="hold"`），默认 `false`。仅在 `split_by_message == false` 且 `resample_hz == None`（保持原始时序）时生效：对 outer join 后的宽表做前向填充 |
+| `fill_policy` | `str` | 填充策略：`none`（不填充，留空）\| `hold`（阶梯保持/ZOH：把最近一次**真实采样**保持到下一拍，**不造新值**）\| `linear`（线性插值：**会在两个真实采样点之间造出从未采样过的数值**）。**未显式给出时按路径取默认**：重采样网格路径（`resample_hz != None`）= `hold`；保持原始时序的宽表 = `none`（即 `ffill=false` 的现状）。`ffill=true` 等价于显式指定 `hold`。拆表模式下不生效（同一报文内周期一致、不产生跨信号空值）；宽表-原时序与宽表-网格按上述默认生效。**状态/枚举/计数类信号必须用 `hold`**——线性插值会把档位 1→2 插成 1.5、把累加计数插成小数。`none` 在网格路径上无意义（网格点必须有值）→ 按 `hold` 处理并记 `warnings` |
+| `ffill_max_gap_ms` | `float \| None` | 默认 `None`。仅 `hold` 生效：某行往前超过该毫秒数找不到新采样时**不再保持**，该行置空——防止"通信中断/丢帧"被旧值掩盖成"一直正常"。受影响行数按信号计入 `warnings` |
 | `time_format` | `str` | 时间列口径，默认 `"relative_s"`。取值：`relative_s`（相对秒，float）\| `relative_ms`（相对毫秒，float）\| `absolute`（`YYYY-MM-DD HH:MM:SS.ffffff` 字符串）\| `unix_s`（绝对秒，float）。列名统一保持 `timestamp` |
 
 **`time_format` 的语义（务必逐条实现，口径错了等于导出错数据）：**
@@ -129,7 +131,19 @@ fast_blf_core.convert(config: dict, progress_cb: Callable[[dict], None] | None =
 - `frames_done` 每帧更新是廉价的（原子计数），**不要**每帧都回调 Python（只更新计数，回调仍按节流触发）。
 - GUI 侧禁止在回调里直接碰控件：必须 `Signal` 转发到主线程。
 
-## 3. Rust 内部 seam（文件归属冻结，禁止跨文件重命名/搬运）
+```
+（Step 13 冻结）**GUI 消费契约**：
+
+* `done`/`total` 是**文件级**计数（`ProgressThrottle` 已把每个文件的 0→1 映射成全局文件计数），
+  **不是帧数**；帧数看 `frames_done`（本文件内已扫/已解码帧数）。`total==0` 表示"没有文件"。
+* **`--selftest-parse`（解析信号）必须使用确定进度**：`percent = 100 * done / total`。
+  禁止使用 `_begin_busy()` 那套"不确定态乒乓动画"（0→100→0 循环）来表现解析过程——
+  用户会误读成"跑完了又回退"。`total==0`（无 BLF 文件、只按 DBC 列信号）时才允许不确定态。
+* **进度条必须单调不减**：同一任务内 `progress_bar.value()` 不得出现回退；任务结束必须**停在 100%**。
+* 副文本（`lbl_progress_meta`）格式：`文件 {done}/{total} · 本文件已扫 {frames_done} 帧`。
+* 阶段文案：`解析中 · {文件名}`；结束时 `解析完成`（勾选恢复等文案沿用 §5 既有要求）。
+
+
 
 ```rust
 // error.rs —— 稳定错误模型（thiserror），所有错误码集中在这里定义
@@ -179,6 +193,19 @@ pub struct CoreError { pub code: String, pub message: String, pub detail: Option
    - 某通道 DBC 读取/解析失败 → 该通道报文一律跳过，原因记入返回值的 `dbc_errors`，并在 `warnings` 里给人话提示；
    - **只有**当用户实际选中的信号全部落在"失败通道或未绑 DBC 的通道"上时，才报 `EMPTY_RESULT`，且错误消息必须点名是哪些通道、原因是什么；
    - 用户没勾选的通道，其 DBC 失败**绝不能**导致转换失败。
+
+10. **通道集合只增不减（粘性）**：信号树重建时，通道集合 =
+    `scan.channels` ∪ `dbc_by_channel` ∪ `self.channel_slots`，其中 `channel_slots` 在启动时预置
+    `CHANNEL_CHOICES`（Ch1~Ch8），并随用户手动添加而增长，**只增不减**（除非整个程序重启）。
+    **不得因为"该通道没有帧观测 / 没有绑 DBC"而丢弃通道节点**——用户看到的通道凭空消失且无法找回，
+    是本项目已发生的真实事故（用户原话："其他通道都消失了，不知道怎么增加通道"）。
+11. **必须有「➕ 添加通道…」入口**：工具栏按钮 + 信号树空白处右键菜单，允许添加 1~64 的任意通道号
+    （默认预填"当前最大通道号 +1"），添加后该通道节点立即可右键「📄 添加 DBC…」。
+    空通道节点的显示文案：`通道 Ch{N}（无帧观测，右键可添加 DBC）`，tooltip 说明"该通道在当前 BLF 中
+    没有帧，或尚未添加 BLF；添加 DBC 后点『🔍 解析信号』即可列出报文"。
+12. **填充策略**：见 §1.1 `fill_policy`。实现必须在**重采样网格**与**保持原始时序**两条路径上都遵循
+    `fill_policy`；`linear` 路径必须在 `warnings` 里提示"已对 N 个信号做线性插值（可能出现未采样过的中间值）"。
+13. **`ffill_max_gap_ms`**：仅在 `hold` 生效；超限置空的行数必须计入 `warnings`（人话，带信号名与行数）。
 
 ## 6. 验收标准（由 Hermes 主会话执行，DSH 交付后必须自查一遍）
 
