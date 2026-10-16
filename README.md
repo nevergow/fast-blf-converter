@@ -87,7 +87,18 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python gui/main.py --selftest
 
 ## Windows 绿色版打包
 
-### 方式 A（推荐）：让 GitHub 帮你编（不需要装任何工具链）
+### 方式 A（推荐）：直接下载已发布的绿色包
+
+**https://github.com/nevergow/fast-blf-converter/releases/tag/v0.1.0** → 下载 `FastBLFConverter-portable.zip`（72.6 MB）
+
+```bash
+# 或用 gh CLI（私有仓库需先登录）
+gh release download v0.1.0 -D ./ci-out
+```
+
+sha256：`10c6fa8e7a7a4a27f40813585428eb9c277ce49464da45d1328bfdef8a230b81`
+
+### 方式 A2：自己触发一次构建（改动后出包用这条）
 
 仓库里的 `.github/workflows/build-windows.yml` 在 **真 Windows 机器**上构建，产出可直接用的绿色 zip：
 
