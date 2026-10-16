@@ -1026,7 +1026,11 @@ class MainWindow(QMainWindow):
         if not KERNEL_READY:
             self.statusBar().showMessage(KERNEL_MISSING_TEXT)
             return
-        if not self.entries and not self.dbc_by_channel:
+        # 树与 self.dbc_by_channel 是两份状态（历史上有过"绑了 DBC 却解不出信号"的坑）：
+        # 守卫与扫描输入都必须用**合并后**的映射，缺一侧也能自愈。
+        merged_dbc = dict(self.dbc_by_channel)
+        merged_dbc.update(self._collect_dbc_by_channel())
+        if not self.entries and not merged_dbc:
             self.statusBar().showMessage("请先添加 BLF 或绑定 DBC")
             return
         if self.scan_worker is not None and self.scan_worker.isRunning():
@@ -1037,12 +1041,8 @@ class MainWindow(QMainWindow):
         self._begin_busy("Phase 1/2 · 扫描中…")
         self.lbl_status.setText("正在解析信号…")
         self.statusBar().showMessage("正在解析信号…")
-        # 注意：树与 self.dbc_by_channel 是两份状态，历史上有过"绑了 DBC 却解不出信号"的坑。
-        # 这里以「树里实际存在的绑定」覆盖字典，缺一侧也能自愈。
-        merged_dbc = dict(self.dbc_by_channel)
-        merged_dbc.update(self._collect_dbc_by_channel())
         self.scan_worker = Worker("scan", blf_paths=[e.path for e in self.entries],
-                                  dbc_map=dict(merged_dbc), parent=self)
+                                  dbc_map=merged_dbc, parent=self)
         self._spawn(self.scan_worker, self._on_scan_progress, self._on_scan_ok,
                     self._on_scan_failed, self._on_scan_thread_done)
         self._refresh_action_state()
@@ -1241,13 +1241,20 @@ class MainWindow(QMainWindow):
                     ch_item.setForeground(DBC_ERROR_COLOR)
                 if dbc_path:
                     parsed = bool(ch_info.get("dbc"))
+                    dbc_note = ch_info.get("dbc_note")
                     status = (DBC_STATUS_FAIL if (dbc_error or is_missing) else
                               DBC_STATUS_OK if parsed else DBC_STATUS_PENDING)
                     node_tip = (str(dbc_error) if dbc_error else
                                 f"{dbc_path}\nDBC 文件不存在" if is_missing
                                 else f"{dbc_path}\n{status}")
+                    # Step 11：解析成功且被规范化过时，状态后缀追加「（已规范化）」，
+                    # 完整说明放 tooltip（悬停可见），绝不弹窗；失败时 tooltip 仍是 dbc_error。
+                    node_status = status
+                    if not (dbc_error or is_missing) and parsed and dbc_note:
+                        node_status = f"{status}（已规范化）"
+                        node_tip = f"{dbc_path}\n{status}\n规范化说明：{dbc_note}"
                     node = self._make_node(
-                        f"📄 {os.path.basename(str(dbc_path))}   {status}", NODE_DBC,
+                        f"📄 {os.path.basename(str(dbc_path))}   {node_status}", NODE_DBC,
                         os.path.basename(str(dbc_path)), node_tip,
                         checkable=False, channel=channel, dbc_path=str(dbc_path))
                     if dbc_error or is_missing:
@@ -1843,8 +1850,17 @@ class MainWindow(QMainWindow):
             event.ignore()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
-        if self.convert_worker is not None and self.convert_worker.isRunning():
-            self.convert_worker.cancel(); self.convert_worker.wait(3000)
+        # 关闭窗口时把两类工作线程都收掉：只处理转换线程时，扫描中关窗可能让进程退不出去。
+        for worker in (self.convert_worker, self.scan_worker):
+            if worker is None or not worker.isRunning():
+                continue
+            cancel = getattr(worker, "cancel", None)
+            if callable(cancel):
+                try:
+                    cancel()
+                except Exception:  # noqa: BLE001 - 关闭阶段不允许再抛
+                    pass
+            worker.wait(3000)
         event.accept()
 
 
@@ -1990,6 +2006,38 @@ def run_selftest_deep() -> int:
         collected = window._collect_dbc_by_channel()
         if collected != dbc_map:
             print(f"DEEP_FAIL dbc_readback={collected!r} expected={dbc_map!r}")
+            return 2
+
+        # Step 11：DBC 节点要能反映"该 DBC 被规范化过"。
+        def _dbc_node_texts(model) -> list[str]:
+            return [
+                str(model.item(row).child(idx).text())
+                for row in range(model.rowCount())
+                for idx in range(model.item(row).rowCount())
+                if model.item(row).child(idx).data(NODE_ROLE) == NODE_DBC
+            ]
+
+        # 1) 纯 ASCII 夹具 DBC 未被规范化 → 节点文本绝不能出现「已规范化」。
+        clean_texts = _dbc_node_texts(window.signal_model)
+        if any("已规范化" in text for text in clean_texts):
+            print(f"DEEP_FAIL clean_dbc_marked_normalized texts={clean_texts!r}")
+            return 2
+        # 2) 临时 GBK DBC（含中文 CM_ 注释）走一次扫描 → 节点文本必须出现「已规范化」。
+        gbk_dir = Path(tempfile.mkdtemp(prefix="fblf_deep_gbk_"))
+        gbk_dbc = gbk_dir / "gbk.dbc"
+        gbk_dbc.write_bytes(
+            b'VERSION ""\n\n'
+            b"BO_ 291 VehSpd: 8 Vector__XXX\n"
+            b' SG_ Spd : 0|16@1+ (0.01,0) [0|0] "km/h" Vector__XXX\n\n'
+            b'CM_ BO_ 291 "\xB3\xB5\xCB\xD9\xD0\xC5\xBA\xC5";\n'
+        )
+        gbk_report = core.scan([], {1: str(gbk_dbc)})
+        window.dbc_by_channel = {1: str(gbk_dbc)}
+        window.channel_summary = gbk_report.get("channels") or {}
+        window._populate_signal_tree()
+        gbk_texts = _dbc_node_texts(window.signal_model)
+        if not any("已规范化" in text for text in gbk_texts):
+            print(f"DEEP_FAIL gbk_dbc_not_marked texts={gbk_texts!r}")
             return 2
     except Exception as exc:  # noqa: BLE001 - 自检要把任何异常变成可 grep 的失败行
         print(f"DEEP_FAIL {type(exc).__name__}: {exc}")
@@ -2385,7 +2433,7 @@ def _dump_target(args: list[str]) -> str | None:
     return None
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main_impl(argv: list[str] | None = None) -> int:
     args = list(sys.argv if argv is None else argv)
     selftest = "--selftest" in args[1:]
     deep = "--selftest-deep" in args[1:]
@@ -2420,6 +2468,23 @@ def main(argv: list[str] | None = None) -> int:
     rc = int(app.exec())
     _destroy_window(window)
     return rc
+
+
+def main(argv: list[str] | None = None) -> int:
+    """进程入口。
+
+    退出时**强制终止**（``os._exit``）而不是走解释器正常关闭流程 —— 历史上出现过：
+    打包态下 ``--selftest-config`` 在 CI 上迟迟不退出（残留 Qt/工作线程让 shutdown 阻塞），
+    结果整轮 Windows 构建被挂住、白烧 CI 额度。GUI 程序在关闭窗口后也不需要 Python 的
+    额外清理，硬退出是这里正确的语义。
+    """
+    code = _main_impl(argv)
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001 - 关闭阶段不允许再抛
+        pass
+    os._exit(int(code))
 
 
 if __name__ == "__main__":

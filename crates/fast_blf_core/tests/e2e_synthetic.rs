@@ -2595,4 +2595,108 @@ fn dbcnorm_gbk_and_bom_still_work() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Step 11：scan 每个通道回传 `dbc_note`（解析成功但被规范化过时的一行说明）
+// ---------------------------------------------------------------------------
+
+/// 取 `scan` 返回值里某通道的 `dbc_note` 原始对象（断言键必须存在）。
+fn scan_channel<'py>(tree: &Bound<'py, PyDict>, channel: &str) -> Bound<'py, PyDict> {
+    let channels = tree
+        .get_item("channels")
+        .expect("读取 channels 失败")
+        .expect("scan 必须含 channels")
+        .cast_into::<PyDict>()
+        .expect("channels 必须是 dict");
+    channels
+        .get_item(channel)
+        .expect("读取通道失败")
+        .unwrap_or_else(|| panic!("通道 {channel} 必须出现"))
+        .cast_into::<PyDict>()
+        .expect("通道必须是 dict")
+}
+
+/// 用空 BLF 列表扫描一个只绑 Ch1 的 DBC，返回通道 1 的 dict。
+fn scan_single_dbc<'py>(py: Python<'py>, dbc: &Path) -> PyResult<Bound<'py, PyDict>> {
+    let mut dbc_py: HashMap<u32, String> = HashMap::new();
+    dbc_py.insert(1u32, dbc.to_string_lossy().to_string());
+    let tree = fast_blf_core::scan(py, Vec::<String>::new(), dbc_py, None)?;
+    let ch1 = scan_channel(&tree, "1");
+    Ok(ch1)
+}
+
+/// Step 11 用例 1：GBK 编码 DBC 解析成功 → `dbc_note` 非空且含 `GB18030`，`dbc_error=None`。
+#[test]
+fn scan_reports_dbc_note_for_gbk_dbc() {
+    let fx = setup_norm(&gbk_dbc_bytes());
+    with_python(|py| -> PyResult<()> {
+        let ch1 = scan_single_dbc(py, &fx.dbc)?;
+        assert!(
+            ch1.get_item("dbc_error")?.expect("必须含 dbc_error").is_none(),
+            "GBK DBC 必须解析成功"
+        );
+        let note = ch1.get_item("dbc_note")?.expect("通道必须含 dbc_note 键");
+        assert!(!note.is_none(), "GBK DBC 应被规范化，dbc_note 不能为空");
+        let note_text = note.extract::<String>()?;
+        assert!(
+            note_text.contains("GB18030"),
+            "dbc_note 应说明 GB18030：{note_text}"
+        );
+
+        // 报文可解：空观测时也按 DBC 列出报文并带信号。
+        let messages = ch1
+            .get_item("messages")?
+            .expect("通道必须含 messages")
+            .cast_into::<PyList>()?;
+        assert!(!messages.is_empty(), "GBK DBC 的报文应可解出");
+        let first = messages.get_item(0)?.cast_into::<PyDict>()?;
+        let signals = first
+            .get_item("signals")?
+            .expect("报文必须含 signals")
+            .cast_into::<PyList>()?;
+        assert!(!signals.is_empty(), "报文信号应可解出");
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// Step 11 用例 2：纯 ASCII DBC 未被规范化 → `dbc_note is None`。
+#[test]
+fn scan_dbc_note_is_none_for_clean_dbc() {
+    let fx = setup_norm(make_fixtures::DEMO_DBC.as_bytes());
+    with_python(|py| -> PyResult<()> {
+        let ch1 = scan_single_dbc(py, &fx.dbc)?;
+        let note = ch1.get_item("dbc_note")?.expect("通道必须含 dbc_note 键");
+        assert!(note.is_none(), "纯 ASCII DBC 不应有 dbc_note");
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// Step 11 用例 3：含 `CM_ BA_` / `BA_DEF_REL_` 的 DBC → `dbc_note` 提到忽略了语句。
+#[test]
+fn scan_dbc_note_present_for_ignored_statements() {
+    let text = "VERSION \"\"\n\nBU_: ECU1\n\nBO_ 291 VehSpd: 8 ECU1\n SG_ Spd : 0|16@1+ (0.01,0) [0|0] \"km/h\" ECU1\n\nCM_ BA_ \"Attr\" \"comment\";\nBA_DEF_REL_ BU_SG_REL_ \"RelAttr\"\n    STRING ;\n";
+    let fx = setup_norm(text.as_bytes());
+    with_python(|py| -> PyResult<()> {
+        let ch1 = scan_single_dbc(py, &fx.dbc)?;
+        assert!(
+            ch1.get_item("dbc_error")?.expect("必须含 dbc_error").is_none(),
+            "剔除不支持语句后 DBC 必须解析成功"
+        );
+        let note = ch1.get_item("dbc_note")?.expect("通道必须含 dbc_note 键");
+        assert!(!note.is_none(), "剔除语句属于规范化，dbc_note 不能为空");
+        let note_text = note.extract::<String>()?;
+        assert!(
+            note_text.contains("已忽略"),
+            "dbc_note 应提到忽略了语句：{note_text}"
+        );
+        assert!(
+            note_text.contains("CM_ BA_"),
+            "dbc_note 应点名 CM_ BA_：{note_text}"
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
 

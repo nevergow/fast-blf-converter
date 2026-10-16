@@ -231,9 +231,9 @@ pub fn scan<'py>(
 
     // 宽松构建：某个通道 DBC 解析失败不影响其它通道（scan 要能把错误显示给 GUI）。
     // 空 Selection ⇒ 计划收录全部 DBC 报文；scan 阶段不做过滤。
-    // scan 的返回契约（§1）没有 warnings 字段，规范化 notes 已并入对应通道的 `dbc_error`
-    // 错误消息（解析失败时）；解析成功时无展示位，故此处忽略。
-    let (plan, dbc_errors, _dbc_notes) = DecodePlan::build_lenient(&dbc_map, &Selection::default());
+    // scan 的返回契约（§1）没有 warnings 字段：解析失败时规范化 notes 已并入对应通道的
+    // `dbc_error` 错误消息；解析成功但被规范化过时，经 Step 11 新增的 `dbc_note` 展示给 GUI。
+    let (plan, dbc_errors, dbc_notes) = DecodePlan::build_lenient(&dbc_map, &Selection::default());
 
     // 重活全程 detach：释放 GIL 后用 rayon 并行扫描文件。
     let paths: Vec<PathBuf> = blf_paths.iter().map(PathBuf::from).collect();
@@ -302,6 +302,21 @@ pub fn scan<'py>(
         match dbc_errors.get(&channel) {
             Some(err) => channel_dict.set_item("dbc_error", err.to_string())?,
             None => channel_dict.set_item("dbc_error", py.None())?,
+        }
+        // Step 11：解析成功但被规范化过（去 BOM / GB18030 解码 / 忽略不支持语句）时，
+        // 把 notes 拼成一行短文本回传给 GUI；未规范化 → None；解析失败 → None
+        // （失败原因连同 notes 已在 `dbc_error` 里）。
+        let dbc_note: Option<String> = if dbc_errors.contains_key(&channel) {
+            None
+        } else {
+            dbc_notes
+                .get(&channel)
+                .filter(|notes| !notes.is_empty())
+                .map(|notes| notes.join("；"))
+        };
+        match dbc_note {
+            Some(note) => channel_dict.set_item("dbc_note", note)?,
+            None => channel_dict.set_item("dbc_note", py.None())?,
         }
 
         let messages_list = PyList::empty(py);

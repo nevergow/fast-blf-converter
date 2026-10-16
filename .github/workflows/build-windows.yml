@@ -12,6 +12,8 @@ permissions:
 jobs:
   windows-portable:
     runs-on: windows-latest
+    # 硬上限：正常一轮 ~55 分钟（Rust release 编译占大头）；万一某步挂死，
+    # 90 分钟即被平台掐掉，不会把整轮 CI 拖成默认的 6 小时。
     timeout-minutes: 90
 
     steps:
@@ -92,7 +94,8 @@ jobs:
           $out = Join-Path $env:TEMP "selftest.out"
           $err = Join-Path $env:TEMP "selftest.err"
           $p = Start-Process -FilePath "$dir\FastBLFConverter.exe" -ArgumentList "--selftest" `
-               -Wait -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+               -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+          if (-not $p.WaitForExit(180000)) { $p.Kill(); throw "冻结态自检超时（>180 秒），疑似进程挂死；已强杀" }
           $log = ((Get-Content $out -Raw) + "`n" + (Get-Content $err -Raw))
           Write-Host "exe 退出码: $($p.ExitCode)"
           Write-Host $log
@@ -111,7 +114,8 @@ jobs:
           $out = Join-Path $env:TEMP "selftest_cfg.out"
           $err = Join-Path $env:TEMP "selftest_cfg.err"
           $p = Start-Process -FilePath "$dir\FastBLFConverter.exe" -ArgumentList "--selftest-config" `
-               -Wait -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+               -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+          if (-not $p.WaitForExit(180000)) { $p.Kill(); throw "冻结态配置自检超时（>180 秒），疑似进程挂死；已强杀" }
           $log = ((Get-Content $out -Raw) + "`n" + (Get-Content $err -Raw))
           Write-Host $log
           if ($p.ExitCode -ne 0) { throw "冻结态配置自检失败，exit=$($p.ExitCode)" }
