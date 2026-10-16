@@ -8,6 +8,8 @@
 |---|---|
 | `multi_channel.blf` | 5 秒合成数据；Ch1 两报文 + Ch2 一波形，含 1 帧 CAN FD |
 | `demo.dbc` | 三条报文的 DBC 定义 |
+| `timefmt.blf` / `timefmt.dbc` | 单报文时间口径夹具（首帧 `TIME_FMT_START`，101 帧 10ms） |
+| `collide.blf` / `collide.dbc` | Step 8 同名信号夹具：`MsgA`（10ms×10，`Counter`/`OnlyA`）与 `MsgB`（50ms×10，`Counter`）都有 `Counter` |
 | `README.md` | 本文件 |
 
 ## 通道 / 报文 / 周期 / 信号

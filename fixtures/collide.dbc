@@ -1,0 +1,8 @@
+VERSION ""
+
+BO_ 256 MsgA: 8 Vector__XXX
+ SG_ Counter : 0|8@1+ (1,0) [0|255] "" Vector__XXX
+ SG_ OnlyA : 8|8@1+ (1,0) [0|255] "" Vector__XXX
+
+BO_ 512 MsgB: 8 Vector__XXX
+ SG_ Counter : 0|8@1+ (1,0) [0|255] "" Vector__XXX

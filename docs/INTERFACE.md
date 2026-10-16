@@ -29,6 +29,8 @@ fast_blf_core.version() -> str
 fast_blf_core.scan(blf_paths: list[str], dbc_by_channel: dict[int, str],
                    progress_cb: Callable[[dict], None] | None = None) -> dict
     # 只读扫描：给 GUI 建三级信号树。dbc_by_channel 的 key=通道号(int)，value=dbc 绝对路径
+    # blf_paths 允许为**空列表**：此时只按已绑 DBC 列出报文/信号，frame_count=0、cycle_ms=None、
+    # is_fd=false（用于"还没加 BLF 就先解析 DBC 看信号树"的场景）。
     # 返回:
     # {
     #   "files":   [{"path": str, "size": int, "ok": bool, "error": str|None}],
@@ -69,6 +71,17 @@ fast_blf_core.convert(config: dict, progress_cb: Callable[[dict], None] | None =
 | `excel_row_limit` | `int` | 默认 `1_000_000`；xlsx 模式超过即降级 |
 | `memory_budget_mb` | `int` | 默认 `1536`；分片缓冲达到该值即 flush 落盘 |
 | `ffill` | `bool` | 默认 `false`。仅在 `split_by_message == false` 且 `resample_hz == None`（保持原始时序）时生效：对 outer join 后的宽表做前向填充 |
+| `time_format` | `str` | 时间列口径，默认 `"relative_s"`。取值：`relative_s`（相对秒，float）\| `relative_ms`（相对毫秒，float）\| `absolute`（`YYYY-MM-DD HH:MM:SS.ffffff` 字符串）\| `unix_s`（绝对秒，float）。列名统一保持 `timestamp` |
+
+**`time_format` 的语义（务必逐条实现，口径错了等于导出错数据）：**
+- `relative_s` / `relative_ms`：相对**本次任务全部输入文件中最早的时间戳**（全局基准 = 0）。单文件时等价于"相对测量开始"；多文件切片合并后仍保持单调递增。
+- `absolute`：= **该帧所属文件的 BLF 头部墙钟时间（原样，不做时区换算）** + 相对偏移，格式 `YYYY-MM-DD HH:MM:SS.ffffff`。这就是 CANalyzer 显示/导出的那套时间。
+- `unix_s`：绝对秒（float）= BLF 头部时间按 **UTC** 解释的 epoch 秒 + 相对偏移（与 `blf_asc` 的 `Message.timestamp` 口径一致，即不加偏移直接输出）。
+- 时间列永远是输出表的**第一列**，名字永远叫 `timestamp`（脚本兼容性）。
+- **相对时间列的精度**：`relative_s` 按 **1e-6 s（微秒）** 取整、`relative_ms` 按 **1e-3 ms（=1 微秒）** 取整后再写出。
+  原因：BLF 的时间戳在 epoch 量级（~1.76e9）上以 f64 表示，相邻帧相减会带出 ~1e-7 s 的表示噪声，
+  直接写出会得到 `0.009999990463256836` 这类尾数；取整到微秒后输出干净且**不损失有效精度**
+  （CAN 帧间隔远大于 1µs，取整单调、不会造成乱序或重复）。`absolute` / `unix_s` 不做取整。
 
 ### 1.2 `convert` 返回值
 
@@ -86,6 +99,8 @@ fast_blf_core.convert(config: dict, progress_cb: Callable[[dict], None] | None =
               "rows": int,
               "path": str,            # 绝对路径（xlsx 多 Sheet 时为同一个 .xlsx 路径）
               "sheet": str|None}],    # xlsx 时的 Sheet 名（<=31 字符、已规范化）
+  "dbc_errors": {"1": str},           # 按通道报告 DBC 构建失败原因（通道号字符串 → 人话原因）
+                                      # 这些通道的报文一律不参与变换；全部失败且无所选时见 §5.9
   "warnings": [str],                  # 非致命问题（如空信号、无 DBC 的报文被跳过）
   "errors":   [{"file": str, "code": str, "message": str}]   # 单文件失败不中断整体
 }
@@ -93,18 +108,23 @@ fast_blf_core.convert(config: dict, progress_cb: Callable[[dict], None] | None =
 
 ## 2. 进度回调协议（唯一线程接口）
 
-`progress_cb` 由 **Rust 工作线程**调用，参数是单个 dict：
+`progress_cb` 由 **Rust 工作线程**调用（**并行解码期间就必须持续调用**，不能等收集阶段才批量发），参数是单个 dict：
 
 ```python
 {"phase": 1|2,          # 1=并行解码, 2=合并与导出
  "stage": "scan"|"decode"|"merge"|"export",
- "done": int, "total": int,
- "file": str|None,                      # 当前文件（decode 阶段）
- "message": str}                        # 可直接显示的短句
+ "done": int, "total": int,          # 文件维度（phase 1）= 已完成文件数 / 文件总数；
+                                     # phase 2 = 已完成步数 / 总步数
+ "file": str|None,                   # 当前文件（decode 阶段）
+ "frames_done": int,                 # 【新增】当前文件内已解码帧数（单调递增，用于显示"在动"+算速率）
+ "message": str}                     # 可直接显示的短句
 ```
 
-- 回调**必须**被 `py.allow_threads()` 包裹的重活中调用，调用频率上限 ~20 次/秒（内部节流）。
-- 回调抛出的 Python 异常不得导致进程崩溃：Rust 侧捕获、记录到 `warnings`、继续跑。
+- 回调**必须**被 `py.detach()` 包裹的重活中调用；**允许来自 rayon 工作线程**，但必须满足：
+  - 用 `Mutex<Instant>`（或等价物）做节流：同一进程内相邻两次回调间隔 ≥ 50ms；
+  - 每次调用内部 `Python::attach` 取 GIL（GIL 会串行化，天然安全）；
+  - 回调抛出的 Python 异常必须被吞掉并计入 `warnings`，**不得**导致进程崩溃或任务失败。
+- `frames_done` 每帧更新是廉价的（原子计数），**不要**每帧都回调 Python（只更新计数，回调仍按节流触发）。
 - GUI 侧禁止在回调里直接碰控件：必须 `Signal` 转发到主线程。
 
 ## 3. Rust 内部 seam（文件归属冻结，禁止跨文件重命名/搬运）
@@ -153,6 +173,10 @@ pub struct CoreError { pub code: String, pub message: String, pub detail: Option
 6. 打包只允许 PyInstaller `--onedir`（禁止 `--onefile`）。
 7. 时间戳：输出列名统一 `timestamp`，单位秒（float64，BLF 原始分辨率）。
 8. 拆表模式输出命名：`Merged_Ch{ch}_{MsgName}.csv` / `Ch{ch}_{MsgName}`（子表名）；宽表：`Merged_All_Signals`；xlsx 统一 `Merged_Report.xlsx` + Sheet 名截断到 31 字符并做非法字符替换。
+9. **单通道 DBC 失败不得拖垮整体转换**（`convert` 与 `scan` 一致使用宽松构建）：
+   - 某通道 DBC 读取/解析失败 → 该通道报文一律跳过，原因记入返回值的 `dbc_errors`，并在 `warnings` 里给人话提示；
+   - **只有**当用户实际选中的信号全部落在"失败通道或未绑 DBC 的通道"上时，才报 `EMPTY_RESULT`，且错误消息必须点名是哪些通道、原因是什么；
+   - 用户没勾选的通道，其 DBC 失败**绝不能**导致转换失败。
 
 ## 6. 验收标准（由 Hermes 主会话执行，DSH 交付后必须自查一遍）
 

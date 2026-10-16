@@ -19,6 +19,8 @@ pub const EMPTY_RESULT: &str = "EMPTY_RESULT";
 pub const DISK_FULL: &str = "DISK_FULL";
 /// 导出阶段失败（CSV/Parquet/Excel 写出错误等）。
 pub const EXPORT_FAILED: &str = "EXPORT_FAILED";
+/// 导出内部错误：合并 / 重采样 / 写盘调用栈里逃逸的 panic 被兜底收编。
+pub const EXPORT_INTERNAL: &str = "EXPORT_INTERNAL";
 /// 调用参数非法（config 缺字段、位运算参数越界等）。
 pub const BAD_CONFIG: &str = "BAD_CONFIG";
 
@@ -93,6 +95,11 @@ impl CoreError {
         Self::new(EXPORT_FAILED, message)
     }
 
+    /// `EXPORT_INTERNAL`
+    pub fn export_internal(message: impl Into<String>) -> Self {
+        Self::new(EXPORT_INTERNAL, message)
+    }
+
     /// `BAD_CONFIG`
     pub fn bad_config(message: impl Into<String>) -> Self {
         Self::new(BAD_CONFIG, message)
@@ -119,6 +126,7 @@ mod tests {
         assert_eq!(CoreError::empty_result("x").code, EMPTY_RESULT);
         assert_eq!(CoreError::disk_full("x").code, DISK_FULL);
         assert_eq!(CoreError::export_failed("x").code, EXPORT_FAILED);
+        assert_eq!(CoreError::export_internal("x").code, EXPORT_INTERNAL);
         assert_eq!(CoreError::bad_config("x").code, BAD_CONFIG);
     }
 }

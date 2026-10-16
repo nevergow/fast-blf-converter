@@ -35,6 +35,34 @@ impl FixtureSpec {
     ];
 }
 
+/// Step 7b 时间口径夹具的首帧时间戳（DEPS §8 独立验算定值）。
+pub const TIME_FMT_START: f64 = 1760623800.123456;
+
+/// Step 7b 时间口径夹具的帧数（含第 0 与第 100 帧，故共 101 帧）。
+pub const TIME_FMT_FRAMES: u32 = 101;
+
+/// Step 7b 夹具 DBC：单通道单报文 `TimeMsg`（0x300），信号 `Val`。
+pub const TIMEFMT_DBC: &str = r#"VERSION ""
+
+BO_ 768 TimeMsg: 8 Vector__XXX
+ SG_ Val : 0|8@1+ (1,0) [0|0] "" Vector__XXX
+"#;
+
+/// Step 8 同名信号夹具的 DBC 文本：`MsgA` / `MsgB` **都有信号 `Counter`**，
+/// `MsgA` 另有独有信号 `OnlyA`。用于验证宽表列名消歧。
+pub const COLLIDE_DBC: &str = r#"VERSION ""
+
+BO_ 256 MsgA: 8 Vector__XXX
+ SG_ Counter : 0|8@1+ (1,0) [0|255] "" Vector__XXX
+ SG_ OnlyA : 8|8@1+ (1,0) [0|255] "" Vector__XXX
+
+BO_ 512 MsgB: 8 Vector__XXX
+ SG_ Counter : 0|8@1+ (1,0) [0|255] "" Vector__XXX
+"#;
+
+/// Step 8 冲突夹具每张报文的帧数（两条报文各 10 帧，共 20 帧）。
+pub const COLLIDE_FRAMES: u32 = 10;
+
 /// 与三条报文对应的 DBC 文本（`Temp1` Motorola signed start=7 len=8，
 /// `Temp2` Motorola unsigned start=4 len=12）。
 pub const DEMO_DBC: &str = r#"VERSION ""
@@ -62,6 +90,8 @@ pub const README: &str = r#"# fixtures —— 合成 BLF / DBC 测试素材
 |---|---|
 | `multi_channel.blf` | 5 秒合成数据；Ch1 两报文 + Ch2 一波形，含 1 帧 CAN FD |
 | `demo.dbc` | 三条报文的 DBC 定义 |
+| `timefmt.blf` / `timefmt.dbc` | 单报文时间口径夹具（首帧 `TIME_FMT_START`，101 帧 10ms） |
+| `collide.blf` / `collide.dbc` | Step 8 同名信号夹具：`MsgA`（10ms×10，`Counter`/`OnlyA`）与 `MsgB`（50ms×10，`Counter`）都有 `Counter` |
 | `README.md` | 本文件 |
 
 ## 通道 / 报文 / 周期 / 信号
@@ -107,12 +137,68 @@ fn push_frame(
     Ok(())
 }
 
+/// 生成 `timefmt.blf`：单通道单报文（`TimeMsg`/`Val`），10ms 周期。
+///
+/// 首帧固定为 `start_timestamp`（默认定值见 [`TIME_FMT_START`]）；第二份夹具可传
+/// `TIME_FMT_START + 10.0` 用于验证「多文件全局最小时间戳」。
+pub fn write_time_format_blf(path: &Path, start_timestamp: f64) -> Result<(), Box<dyn Error>> {
+    let mut writer = BlfWriter::create(path)?;
+    for i in 0..TIME_FMT_FRAMES {
+        let mut data = vec![0u8; 8];
+        data[0] = (i & 0xFF) as u8;
+        push_frame(
+            &mut writer,
+            0,
+            0x300,
+            start_timestamp + i as f64 * 0.01,
+            data,
+            false,
+        )?;
+    }
+    writer.finish()?;
+    Ok(())
+}
+
+/// 读回文件头偏移 40 起的 8 个 LE u16（夹具自检用，顺序与 DEPS §8 一致）。
+fn read_header_u16(path: &Path) -> [u16; 8] {
+    let bytes = std::fs::read(path).expect("读取刚生成的 BLF");
+    let mut out = [0u16; 8];
+    for i in 0..8 {
+        out[i] = u16::from_le_bytes([bytes[40 + i * 2], bytes[40 + i * 2 + 1]]);
+    }
+    out
+}
+
+/// 生成 `collide.blf`：两条报文（`MsgA` 0x100 @10ms、`MsgB` 0x200 @50ms），
+/// 各 10 帧、时间戳从 0 开始；两条报文都有 `Counter`，`MsgA` 另有 `OnlyA`。
+///
+/// 注入值：`MsgA.Counter = i`、`MsgA.OnlyA = 100 + i`、`MsgB.Counter = 200 + i`，
+/// 全是可验证的整数，用于断言宽表消歧后两列各自独立。
+pub fn write_collide_blf(path: &Path) -> Result<(), Box<dyn Error>> {
+    let mut writer = BlfWriter::create(path)?;
+    for i in 0u32..COLLIDE_FRAMES {
+        let mut data = vec![0u8; 8];
+        data[0] = (i & 0xFF) as u8;
+        data[1] = ((100 + i) & 0xFF) as u8;
+        push_frame(&mut writer, 0, 0x100, i as f64 * 0.01, data, false)?;
+    }
+    for i in 0u32..COLLIDE_FRAMES {
+        let mut data = vec![0u8; 8];
+        data[0] = ((200 + i) & 0xFF) as u8;
+        push_frame(&mut writer, 0, 0x200, i as f64 * 0.05, data, false)?;
+    }
+    writer.finish()?;
+    Ok(())
+}
+
 /// 生成全部夹具到 `dir`（不存在则创建）。幂等：直接覆盖旧文件。
 pub fn write_fixtures(dir: &Path) -> Result<(), Box<dyn Error>> {
     std::fs::create_dir_all(dir)?;
 
     // 1) DBC
     std::fs::write(dir.join("demo.dbc"), DEMO_DBC)?;
+    std::fs::write(dir.join("timefmt.dbc"), TIMEFMT_DBC)?;
+    std::fs::write(dir.join("collide.dbc"), COLLIDE_DBC)?;
 
     // 2) BLF：严格按 Step 2a 的合成场景。
     let blf_path = dir.join("multi_channel.blf");
@@ -144,7 +230,20 @@ pub fn write_fixtures(dir: &Path) -> Result<(), Box<dyn Error>> {
 
     writer.finish()?;
 
-    // 3) README
+    // 3) Step 7b 时间口径夹具：单通道单报文，首帧 = TIME_FMT_START。
+    //    生成后立刻用原始字节自检文件头，证明夹具本身符合 DEPS §8 的定值。
+    let timefmt_path = dir.join("timefmt.blf");
+    write_time_format_blf(&timefmt_path, TIME_FMT_START)?;
+    assert_eq!(
+        read_header_u16(&timefmt_path),
+        [2025, 10, 4, 16, 14, 10, 0, 123],
+        "timefmt.blf 文件头 8×u16 必须等于 DEPS §8 定值 (2025, 10, 4, 16, 14, 10, 0, 123)"
+    );
+
+    // 4) Step 8 同名信号夹具：MsgA / MsgB 都有 Counter。
+    write_collide_blf(&dir.join("collide.blf"))?;
+
+    // 5) README
     std::fs::write(dir.join("README.md"), README)?;
     Ok(())
 }

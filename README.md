@@ -8,6 +8,30 @@
 2. 按周期拆表后产生海量 `null` 空值 → **按报文独立成表**（或按统一时间轴重采样对齐）；
 3. 缺乏列式/多表导出能力 → Polars 列式流水线 + 单文件多 Sheet 的 Excel 报告。
 
+## v0.2.0 更新（基于 Windows 真机试用反馈）
+
+1. **DBC 绑定改为通道级树节点**（像 CANalyzer）：在左侧通道节点上右键「📄 添加 DBC…」，
+   DBC 作为通道子节点显示解析状态（`✓ 已解析` / `✗ 解析失败`）；**不提供单通道删除**，
+   只有工具栏「🗑 全部清除 DBC」。
+2. **手动「🔍 解析信号」**：绑完 DBC 后点按钮才扫描（不再自动扫）；没加 BLF 也能**只按 DBC 列出报文**（帧数 0）。
+3. **配置预设**：把「DBC 映射 + 选中信号 + 导出策略」存成 `configs/<名称>.json`
+   （绿色包目录；目录不可写时自动回退用户目录），工具栏「💾 保存配置 / 📂 加载配置 / 🗑 删除配置」一键复原。
+   加载时某个 DBC 路径不存在 → 只在通道旁红字提示（**不弹窗**），其余照常解析。
+4. **单通道 DBC 失败不再拖垮转换**：失败通道的报文跳过并记入 `dbc_errors` + `warnings`，通道旁红字说明原因；
+   只有当所选信号**全部**来自失败通道时才报 `EMPTY_RESULT`（此前任何一个通道的 DBC 解析失败都会让整次转换失败）。
+5. **复选框三态自绘**：未选（空心灰框）/ 部分选中（蓝框 + 横条）/ 全选（实心蓝 + 白勾），
+   并与行选中高亮（`#33475B`）拉开色阶 —— 不再"隐身"，也不再分不清全选与部分选。
+   视觉基线：`docs/screenshots/check-states.png`。
+6. **进度可视化**：底部通栏粗进度条 + 实时文字
+   （`Phase 1/2 · 解码中 · 3/8 文件 · 已 1,234,567 帧 · 87 MB/s · 已用 00:42`），
+   解码期间每 ≥50ms 上报一次（此前并行解码阶段**根本不上报**，表现为"卡住不动 → 突然完成"）。
+7. **时间列 4 选 1**：相对秒（默认）/ 相对毫秒 / **绝对时间**（`2025-10-16 14:10:00.123456`，
+   按 **BLF 文件头记录的墙钟**原样输出，与 CANalyzer 对得上）/ Unix 时间戳。相对时间按微秒取整。
+8. **修复宽表同名信号崩溃**：不同报文含同名信号（真实 DBC 里 `Counter`/`CRC`/`Alive` 极常见）时，
+   宽表模式（保持原始时序 / +ffill）会触发 Polars 内部 **panic 崩溃** —— 现已按报文前缀消歧
+   （`Sig0` → `MSG_101_Sig0`），并在导出阶段加 `catch_unwind` 兜底：任何意外都变成 `EXPORT_INTERNAL` 结构化错误，
+   绝不再把 panic 抛给界面。
+
 ## 架构
 
 ```
@@ -38,14 +62,17 @@ gui/main.py (PySide6, 暗色 Fluent)  ──QThread──►  fast_blf_core (Rus
 
 | 验证项 | 结果 |
 |---|---|
-| 单元 + 集成测试 | **39 项全绿**（28 单元 + 11 集成 `tests/e2e_synthetic.rs`） |
-| 端到端验收 `tests/acceptance.py` | **27/27 通过**（含 CSV/Parquet/Excel 三格式、无空值、百万行防呆、scan 三级树） |
+| 单元 + 集成测试 | **62 项全绿**（28 单元 + 34 集成 `tests/e2e_synthetic.rs`） |
+| 端到端验收 `tests/acceptance.py` | **55/55 通过**（A4 三格式/无空值、A5 百万行防呆、**A6 坏 DBC 容错**、**A6' 空 BLF 扫描**、**A7 时间口径 4 选 1 精确比对**、**A9 宽表同名信号**） |
+| GUI 无人值守自检 | 5 条全过：`--selftest` / `--selftest-deep`（`DEEP_OK channels=2 dbc_nodes=2 messages=3`）/ `--selftest-config`（`CONFIG_OK`）/ `--selftest-progress`（`PROGRESS_OK phase1=2 phase2=2 frames_max=1212600`）/ `--dump-check-states`（`DUMP_OK`） |
+| GUI 交互路径独立探针 | **11/11**：通道级绑 DBC → 解析 → 报文名从 `ID_0x123` 变真名 → 取消勾选 → **重解析后勾选被恢复** → 全部清除 |
+| 冻结态（PyInstaller onedir，本机实跑） | `--selftest` 内核就绪 0.2.0 / `--selftest-config` **`CONFIG_OK`（预设保存·加载·DBC 缺失处理在打包后可用）** / `--selftest-deep` `DEEP_SKIP no_fixture` / `--dump-check-states` `DUMP_OK` 23079B；`theme.qss` 落在 `_internal/gui/theme.qss` |
 | 位序正确性 | Intel/Motorola 与 `cantools` **1440 组随机对拍 0 不一致**（见 `docs/DEPS.md` §7） |
+| 时间口径正确性 | 4 种口径与**独立算出的定值**逐字符相等（`docs/DEPS.md` §8）：`0/0.01/1`、`0/10/1000`、`1760623800.123456…`、`2025-10-16 14:10:00.123456…` |
 | 互操作（别的实现写的文件） | `python-can 4.6.1` 写的 **187 MB / 4,082,000 帧** BLF（含扩展帧 + CAN FD）：我们的 scan 逐通道帧数与写入方**完全一致** |
 | 性能（单文件 187MB） | scan 32.7 MB/s（5.7s / 408 万帧，单文件=单线程） |
 | 性能（8 个切片并行） | **162–172 MB/s ≈ 5.0–5.3× 单文件**（两次实测）；convert 输出墙钟 **242–246 MB/s** |
-| 冻结打包（PyInstaller onedir） | spec 实跑通过；**release 扩展下产物 172MB**（debug 扩展下为 296MB，不代表出货体积）；打包后的二进制可运行、Rust 内核就绪、主题从 `_internal/gui/theme.qss` 正常加载 |
-| 出货构建路径（`.bat` 同款命令） | `maturin build --release --features extension-module` → **21MB abi3 wheel**（`cp310-abi3`）；装该 wheel 后端到端验收仍 **27/27** |
+| 出货构建路径（`.bat` 同款命令） | `maturin build --release --features extension-module` → **21MB abi3 wheel**（`cp310-abi3`）；装该 wheel 后端到端验收全过 |
 
 复现命令：
 

@@ -35,6 +35,8 @@ zstd = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# Step 7b：BLF 文件头墙钟 → epoch，仅新增此依赖（已是 blf_asc 的传递依赖）。
+chrono = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

@@ -5,7 +5,11 @@
   A3  扩展可导入：fast_blf_core.version()
   A4  scan 出三级树；convert 三种格式各跑一次，行数与注入帧数一致
   A5  百万行防呆：excel_row_limit 调小 -> downgraded=true 且 format_used=csv
-  A6  GUI 自检由外部命令负责（本脚本不覆盖）
+  A6  容错：未选通道的坏 DBC 不拖垮转换；所选全落在坏通道 -> EMPTY_RESULT
+  A6' 空 BLF 扫描：只按 DBC 列出报文（GUI「🔍 解析信号」的后端）
+  A7  时间列口径 4 选 1：与 docs/DEPS.md §8 的独立定值精确比对
+  A9  宽表同名信号列冲突：三条路径都不得 panic，列名按报文前缀消歧
+  A8  GUI 自检由外部命令负责（本脚本不覆盖）
 
 用法：.venv/bin/python tests/acceptance.py
 退出码：0 = 全部通过；1 = 有失败项
@@ -201,6 +205,154 @@ def main() -> int:
     check("A5 防呆：磁盘上确实产出 CSV（无 xlsx）",
           bool(guard_files) and all(p.suffix == ".csv" and p.is_file() for p in guard_files),
           f"{[p.name for p in guard_files]}")
+
+    # ---------------- A6 容错：未选通道的坏 DBC 不得拖垮转换（用户真机反馈）----------------
+    broken_dbc = out_root / "broken_ch1.dbc"
+    broken_dbc.write_text("这不是 DBC 文本\nBO_ ??? 乱码 ###\n", encoding="utf-8")
+
+    cfg_l = base_config(out_root / "lenient", "csv")
+    cfg_l["dbc_by_channel"] = {1: str(broken_dbc), 2: str(dbc)}
+    cfg_l["selected"] = {"2": {"Insulation": ["Res"]}}
+    rep_l = convert_safe(cfg_l, "A6 坏 DBC（Ch1）")
+    check("A6 坏 DBC 在未选通道：转换照样成功", rep_l.get("ok") is True, f"ok={rep_l.get('ok')}")
+    dbe = rep_l.get("dbc_errors") or {}
+    check("A6 dbc_errors 点名通道 1、不含通道 2",
+          "1" in dbe and "2" not in dbe, f"dbc_errors={sorted(dbe)}")
+    check("A6 warnings 是人话且提到通道 1 与 DBC",
+          any("通道 1" in w and "DBC" in w for w in (rep_l.get("warnings") or [])),
+          f"warnings={rep_l.get('warnings')}")
+    l_tables = {t["name"]: t for t in (rep_l.get("tables") or [])}
+    check("A6 只产出 Ch2 子表（5 行）",
+          set(l_tables) == {"Ch2_Insulation"} and l_tables["Ch2_Insulation"]["rows"] == 5,
+          f"tables={sorted(l_tables)}")
+
+    cfg_e = base_config(out_root / "lenient_empty", "csv")
+    cfg_e["dbc_by_channel"] = {1: str(broken_dbc)}
+    cfg_e["selected"] = {"1": {"VehSpd": ["Spd"]}}
+    try:
+        fast_blf_core.convert(cfg_e)
+        check("A6 所选全落在坏通道：报 EMPTY_RESULT 而非静默空表", False, "没抛异常")
+    except Exception as exc:  # noqa: BLE001
+        text = f"{exc}"
+        check("A6 所选全落在坏通道：报 EMPTY_RESULT 而非静默空表",
+              "EMPTY_RESULT" in text and "1" in text and "DBC" in text, text[:110])
+
+    # ---------------- A6' 空 BLF 扫描（GUI「🔍 解析信号」按钮的后端）----------------
+    tree_empty = fast_blf_core.scan([], {2: str(dbc)})
+    ch2e = (tree_empty.get("channels") or {}).get("2") or {}
+    e_msgs = {m["name"]: m for m in (ch2e.get("messages") or [])}
+    check("A6' 空 BLF 扫描：files 为空但仍按 DBC 列出报文",
+          (tree_empty.get("files") or []) == [] and "Insulation" in e_msgs,
+          f"files={tree_empty.get('files')} messages={sorted(e_msgs)}")
+    ins = e_msgs.get("Insulation") or {}
+    check("A6' 空 BLF 扫描：frame_count=0 且 cycle_ms=None",
+          ins.get("frame_count") == 0 and ins.get("cycle_ms") is None,
+          f"frame_count={ins.get('frame_count')} cycle_ms={ins.get('cycle_ms')}")
+
+    # ---------------- A7 时间列口径 4 选 1（夹具 timefmt.blf；定值见 docs/DEPS.md §8）----------------
+    tf_blf, tf_dbc = FIXTURES / "timefmt.blf", FIXTURES / "timefmt.dbc"
+    check("A7 时间口径夹具存在", tf_blf.is_file() and tf_dbc.is_file(),
+          f"{tf_blf.name}={tf_blf.stat().st_size if tf_blf.is_file() else 'MISSING'}B")
+    if tf_blf.is_file() and tf_dbc.is_file():
+        tf_tree = fast_blf_core.scan([str(tf_blf)], {1: str(tf_dbc)})
+        tf_msgs = ((tf_tree.get("channels") or {}).get("1") or {}).get("messages") or []
+        tf_sel = {"1": {tf_msgs[0]["name"]: [s["name"] for s in tf_msgs[0]["signals"]]}} if tf_msgs else {}
+        expect = {
+            "relative_s": ["0", "0.01", "1"],
+            "relative_ms": ["0", "10", "1000"],
+            "unix_s": ["1760623800.123456", "1760623800.133456", "1760623801.123456"],
+            "absolute": ["2025-10-16 14:10:00.123456", "2025-10-16 14:10:00.133456",
+                         "2025-10-16 14:10:01.123456"],
+        }
+
+        def timefmt_config(out_dir: Path, fmt: str | None) -> dict:
+            cfg = {
+                "blf_paths": [str(tf_blf)],
+                "dbc_by_channel": {1: str(tf_dbc)},
+                "selected": tf_sel,
+                "split_by_message": True,
+                "resample_hz": None,
+                "export_format": "csv",
+                "out_dir": str(out_dir),
+                "temp_dir": str(out_dir / ".tmp_shards"),
+                "excel_row_limit": 1_000_000,
+                "memory_budget_mb": 256,
+                "ffill": False,
+            }
+            if fmt is not None:
+                cfg["time_format"] = fmt
+            return cfg
+
+        for fmt, want in expect.items():
+            rep_t = convert_safe(timefmt_config(out_root / f"timefmt_{fmt}", fmt), f"A7 {fmt}")
+            tabs = rep_t.get("tables") or []
+            if not tabs:
+                check(f"A7 {fmt}：出表", False, "无表")
+                continue
+            with Path(tabs[0]["path"]).open(newline="", encoding="utf-8") as fh:
+                data = list(csv.reader(fh))
+            header = data[0] if data else []
+            got = [data[i][0] for i in (1, 2, 101) if i < len(data)]
+            check(f"A7 {fmt}：帧0/帧1/帧100 精确命中独立定值",
+                  len(got) == 3 and all(g == w for g, w in zip(got, want)), f"got={got}")
+            check(f"A7 {fmt}：首列名为 timestamp", header[:1] == ["timestamp"], f"header={header[:3]}")
+
+        rep_def = convert_safe(timefmt_config(out_root / "timefmt_default", None), "A7 缺省口径")
+        tabs = rep_def.get("tables") or []
+        if tabs:
+            with Path(tabs[0]["path"]).open(newline="", encoding="utf-8") as fh:
+                data = list(csv.reader(fh))
+            got = [data[i][0] for i in (1, 2) if i < len(data)]
+            check("A7 缺省（不传 time_format）等价于 relative_s",
+                  got == ["0", "0.01"], f"got={got}")
+
+    # ---------------- A9 宽表同名信号列冲突（真实 DBC 常见；曾导致 Rust panic 崩溃）----------------
+    col_blf, col_dbc = FIXTURES / "collide.blf", FIXTURES / "collide.dbc"
+    check("A9 冲突夹具存在", col_blf.is_file() and col_dbc.is_file(),
+          f"{col_blf.name}={col_blf.stat().st_size if col_blf.is_file() else 'MISSING'}B")
+    if col_blf.is_file() and col_dbc.is_file():
+        col_sel = {"1": {"MsgA": ["Counter", "OnlyA"], "MsgB": ["Counter"]}}
+
+        def collide_config(out_dir: Path, split: bool, resample: float | None = None,
+                           ffill: bool = False) -> dict:
+            return {
+                "blf_paths": [str(col_blf)],
+                "dbc_by_channel": {1: str(col_dbc)},
+                "selected": col_sel,
+                "split_by_message": split,
+                "resample_hz": resample,
+                "export_format": "csv",
+                "out_dir": str(out_dir),
+                "temp_dir": str(out_dir / ".tmp_shards"),
+                "excel_row_limit": 1_000_000,
+                "memory_budget_mb": 256,
+                "ffill": ffill,
+            }
+
+        wide_cases = [("keep", None, False), ("10hz", 10.0, False), ("ffill", None, True)]
+        for label, resample, ffill in wide_cases:
+            rep_c = convert_safe(collide_config(out_root / f"collide_wide_{label}", False, resample, ffill),
+                                 f"A9 宽表[{label}]")
+            tabs = rep_c.get("tables") or []
+            if not tabs:
+                check(f"A9 宽表[{label}]：出表", False, "无表（曾经这里是 Rust panic）")
+                continue
+            with Path(tabs[0]["path"]).open(newline="", encoding="utf-8") as fh:
+                header = next(csv.reader(fh))
+            check(f"A9 宽表[{label}]：单表且不抛异常", len(tabs) == 1, f"tables={len(tabs)}")
+            check(f"A9 宽表[{label}]：timestamp 只出现一次且在第一列",
+                  header.count("timestamp") == 1 and header[:1] == ["timestamp"], f"header={header}")
+            check(f"A9 宽表[{label}]：同名信号按报文前缀消歧",
+                  {"MsgA_Counter", "MsgB_Counter", "OnlyA"} <= set(header), f"header={header}")
+
+        rep_s = convert_safe(collide_config(out_root / "collide_split", True), "A9 拆表")
+        s_tabs = rep_s.get("tables") or []
+        if s_tabs:
+            with Path(s_tabs[0]["path"]).open(newline="", encoding="utf-8") as fh:
+                s_header = next(csv.reader(fh))
+            check("A9 拆表模式：信号保留原名（表名已区分报文）",
+                  "Counter" in s_header and not any(c.startswith("Msg") for c in s_header),
+                  f"header={s_header}")
 
     # ---------------- 收尾 ----------------
     failed = [n for n, ok, _ in RESULTS if not ok]

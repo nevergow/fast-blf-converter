@@ -657,10 +657,11 @@ checksum = "c6e8948ce679d00a02a94739ea185595dca7118ed04feb991127e443bd3d761f"
 
 [[package]]
 name = "fast_blf_core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blf_asc",
  "can-dbc",
+ "chrono",
  "polars",
  "pyo3",
  "rayon",

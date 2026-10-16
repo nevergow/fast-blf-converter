@@ -14,7 +14,9 @@
 QWidget {
     background-color: #1E1E24;
     color: #E8E8F0;
-    font-family: "Microsoft YaHei UI", "Segoe UI", "PingFang SC", sans-serif;
+    /* 字体回退串：Windows 命中 YaHei UI，macOS 落到 PingFang SC，
+       避免 Qt 报 "missing font family Microsoft YaHei UI" 警告。 */
+    font-family: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
     font-size: 13px;
     outline: none;
 }
@@ -128,6 +130,19 @@ QPushButton#primaryButton:pressed {
 }
 
 QPushButton#primaryButton:disabled {
+    background-color: #2A3A46;
+    color: #7A8A96;
+    border-color: #2F3F4B;
+}
+
+/* 工具栏内的主按钮（🔍 解析信号）：收紧内边距以匹配工具栏高度 */
+QToolBar QPushButton#primaryButton {
+    padding: 6px 18px;
+    font-size: 13px;
+    min-width: 96px;
+}
+
+QToolBar QPushButton#primaryButton:disabled {
     background-color: #2A3A46;
     color: #7A8A96;
     border-color: #2F3F4B;
@@ -332,15 +347,17 @@ QTreeView::item {
     color: #E8E8F0;
 }
 
+/* 行高亮色阶（Step 6b）：比实心蓝勾（#0078D4）暗、比面板（#25252E）亮，
+   让「选中行」与「勾选框」一眼可分，勾选框不再被行高亮吞掉。 */
 QTreeWidget::item:hover,
 QTreeView::item:hover {
-    background-color: #2F2F3A;
+    background-color: #2F3A48;
 }
 
 QTreeWidget::item:selected,
 QTreeView::item:selected {
-    background-color: #0078D4;
-    color: #FFFFFF;
+    background-color: #33475B;
+    color: #E8E8F0;
 }
 
 QTreeWidget::item:selected:!active,
@@ -354,7 +371,11 @@ QTreeView::branch {
     background: transparent;
 }
 
-/* 三态复选框（通道 / 报文 / 信号 三级全部可勾选） */
+/* 三态复选框（通道 / 报文 / 信号 三级全部可勾选）
+   注意：树里的勾选框已改由 gui/check_delegate.py 的 CheckStateDelegate 自绘
+   （QPainter：空框 / 蓝框+横条 / 实心蓝+白勾）。此处原先的 `::indicator` 规则
+   会与 delegate 冲突——一是靠不存在的图片资源，二是 checked/indeterminate 都是
+   实心蓝、无法区分，于是整段删除，交由 delegate 统一绘制。
 QTreeView::indicator,
 QTreeWidget::indicator {
     width: 15px;
@@ -386,6 +407,7 @@ QTreeWidget::indicator:disabled {
     background-color: #262630;
     border-color: #33333D;
 }
+*/
 
 /* --------------------------------------------------------------- 表头 ---- */
 QHeaderView {
@@ -445,6 +467,65 @@ QProgressBar::chunk {
     margin: 1px;
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
                                 stop:0 #006CBE, stop:0.5 #0078D4, stop:1 #1A88E0);
+}
+
+/* ------------------------------------------------- Step 7c 进度区 ------- */
+/* 底部通栏进度区：控制面板与状态栏之间，始终占一行高度（不 setVisible）。 */
+QFrame#progressPanel {
+    background-color: #25252E;
+    border: 1px solid #3A3A46;
+    border-radius: 8px;
+}
+
+QLabel#progressStatus {
+    color: #E8E8F0;
+    font-size: 12px;
+    background: transparent;
+}
+
+/* 待命：灰字；成功：绿字；失败：红字（配合 main.py 的 setProperty("state")）。 */
+QLabel#progressStatus[state="idle"] {
+    color: #9A9AB0;
+}
+
+QLabel#progressStatus[state="success"] {
+    color: #4CC26B;
+    font-weight: 600;
+}
+
+QLabel#progressStatus[state="error"] {
+    color: #F05A5A;
+    font-weight: 600;
+}
+
+QLabel#progressMeta {
+    color: #9A9AB0;
+    background: transparent;
+    font-family: "Consolas", "Cascadia Mono", "Menlo", "Courier New", monospace;
+}
+
+QLabel#progressMeta[state="success"] {
+    color: #4CC26B;
+}
+
+QLabel#progressMeta[state="error"] {
+    color: #F05A5A;
+}
+
+/* 进度条：高 18–22px、圆角 9px、填充 #0078D4、槽 #2D2D38。 */
+QProgressBar#progressBar {
+    background-color: #2D2D38;
+    border: none;
+    border-radius: 9px;
+    min-height: 18px;
+    max-height: 22px;
+    height: 20px;
+}
+
+QProgressBar#progressBar::chunk {
+    border-radius: 9px;
+    margin: 0;
+    background-color: #0078D4;
 }
 
 /* --------------------------------------------------------------- 状态栏 -- */

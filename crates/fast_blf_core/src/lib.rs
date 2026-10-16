@@ -8,6 +8,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pyo3::prelude::*;
@@ -21,14 +23,18 @@ mod exporter;
 
 pub use bit_slice::{decode_physical, extract_bits, ByteOrder};
 pub use decoder::{
-    process_file, sanitize_identifier, scan_file, table_name, DecodePlan, FileScan, FileStat,
-    MessagePlan, Progress, Selection, ShardSink, SignalPlan, TableKey, TableShards,
+    process_file, read_file_timing, sanitize_identifier, scan_file, table_name, DecodePlan,
+    FileScan, FileStat, FileTiming, GlobalMin, MessagePlan, Progress, Selection, ShardRef,
+    ShardSink, SignalPlan, TableKey, TableShards, WallClock, BAD_TIME_HEADER,
 };
 pub use error::{
     CoreError, BAD_CONFIG, BLF_OPEN, BLF_PARSE, DBC_PARSE, DISK_FULL, EMPTY_RESULT, EXPORT_FAILED,
-    NO_DBC_FOR_CHANNEL,
+    EXPORT_INTERNAL, NO_DBC_FOR_CHANNEL,
 };
-pub use exporter::{export, ExportFormat, ExportOptions, ExportReport, TableResult};
+pub use exporter::{
+    catch_export_panic, export, ExportFormat, ExportOptions, ExportPanicContext, ExportReport,
+    TableResult, TimeFormat,
+};
 
 // Python 侧异常类名必须是 `CoreError`（见 INTERFACE.md §4），但 Rust 结构体已占用该名字，
 // 故 PyO3 异常类型取名 `CoreErrorPy`，注册时用字符串 "CoreError" 暴露给 Python。
@@ -41,10 +47,166 @@ impl From<CoreError> for PyErr {
     }
 }
 
+/// 相邻两次 Python 进度回调的最小间隔（INTERFACE §2）。
+pub const PROGRESS_THROTTLE: Duration = Duration::from_millis(50);
+
+/// 进度回调节流器：热路径（含 rayon 工作线程）产生的 [`Progress`] 经此统一转发给 Python。
+///
+/// * 相邻两次真正转发间隔 ≥ [`PROGRESS_THROTTLE`]，窗口内的事件直接丢弃（不排队）。
+/// * 每次转发都用 [`Python::attach`] 取 GIL；GIL 天然串行化，故允许来自工作线程。
+/// * 回调抛出的异常被吞掉并记入 `warnings`，绝不中断任务。
+/// * phase 1 的 `done/total` 由 `process_file`/`scan_file` 以「本文件」维度给出
+///   （`0/1` → `1/1`）；本类型把它映射成「已完成文件数 / 文件总数」，让 GUI 能显示 `3/8`。
+/// * 两个例外保证 GUI 一定能看到"开始"和"100%"：phase 切换时打开闸门、最后一个文件
+///   完成时无条件转发一次。
+pub struct ProgressThrottle {
+    callback: Option<Py<PyAny>>,
+    /// 上次真正转发的时间；`None` 表示尚未转发过（首个事件必放行）。
+    last_emit: Mutex<Option<Instant>>,
+    /// 上次转发所属的 phase；phase 切换时打开闸门，保证每个阶段都有首个事件。
+    last_phase: AtomicU8,
+    /// 回调异常等非致命告警，任务结束后并入 `warnings`。
+    warnings: Mutex<Vec<String>>,
+    /// 已完成的文件数（phase 1）。
+    files_done: AtomicU64,
+    /// 文件总数（phase 1）。
+    files_total: u64,
+}
+
+impl ProgressThrottle {
+    /// 新建节流器；`files_total` 为本次任务的文件总数（phase 1 的 `total`）。
+    pub fn new(callback: Option<Py<PyAny>>, files_total: u64) -> Self {
+        Self {
+            callback,
+            last_emit: Mutex::new(None),
+            last_phase: AtomicU8::new(0),
+            warnings: Mutex::new(Vec::new()),
+            files_done: AtomicU64::new(0),
+            files_total,
+        }
+    }
+
+    /// 解码/扫描热路径事件：先做文件维度映射，再按 50ms 节流。
+    ///
+    /// 返回值表示事件是否被转发（`false` = 被丢弃）。即使被丢弃，文件完成计数仍会推进，
+    /// 避免全局进度因节流而丢步；最后一个文件的完成事件无条件转发，保证 GUI 看到 100%。
+    pub fn emit_decode(&self, payload: Progress) -> bool {
+        let mapped = self.map_file_dimension(payload);
+        if mapped.phase == 1 && mapped.total > 0 && mapped.done >= mapped.total {
+            self.force(mapped);
+            return true;
+        }
+        self.emit(mapped)
+    }
+
+    /// phase 2（合并/导出）事件：只做节流，`done/total` 已是步数。
+    pub fn emit(&self, payload: Progress) -> bool {
+        if !self.open_gate(payload.phase) {
+            return false;
+        }
+        self.dispatch(&payload);
+        true
+    }
+
+    /// 取走回调异常告警（供 `convert` 汇总进返回值）。
+    pub fn take_warnings(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .warnings
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        )
+    }
+
+    /// 把「本文件完成」映射成「全局已完成文件数 / 文件总数」。
+    fn map_file_dimension(&self, mut payload: Progress) -> Progress {
+        if payload.phase != 1 {
+            return payload;
+        }
+        // process_file/scan_file 用 total=1、done=0/1 表示单个文件是否完成。
+        if payload.total > 0 && payload.done >= payload.total {
+            let done = self.files_done.fetch_add(1, Ordering::SeqCst) + 1;
+            payload.done = done;
+        } else {
+            payload.done = self.files_done.load(Ordering::SeqCst);
+        }
+        if self.files_total > 0 {
+            payload.total = self.files_total;
+        }
+        payload
+    }
+
+    /// 时间闸门：同 phase 内距上次转发不足 50ms 时返回 `false`（事件丢弃）。
+    /// phase 切换时无条件打开闸门，保证每个阶段的首个事件都能到达 GUI。
+    fn open_gate(&self, phase: u8) -> bool {
+        let mut last = self
+            .last_emit
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let previous_phase = self.last_phase.swap(phase, Ordering::SeqCst);
+        let too_soon = previous_phase == phase
+            && last
+                .map(|previous| previous.elapsed() < PROGRESS_THROTTLE)
+                .unwrap_or(false);
+        if too_soon {
+            return false;
+        }
+        *last = Some(Instant::now());
+        true
+    }
+
+    /// 无条件转发一次（用于"最后一个文件完成"这种必须到达 GUI 的事件）。
+    fn force(&self, payload: Progress) {
+        self.dispatch(&payload);
+        self.last_phase.store(payload.phase, Ordering::SeqCst);
+        *self
+            .last_emit
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(Instant::now());
+    }
+
+    /// 真正调用 Python 回调（未提供回调时静默跳过）；异常吞掉记 warnings。
+    fn dispatch(&self, payload: &Progress) {
+        let Some(callback) = self.callback.as_ref() else {
+            return;
+        };
+        let called = Python::attach(|py| -> PyResult<()> {
+            let event = PyDict::new(py);
+            event.set_item("phase", payload.phase)?;
+            event.set_item("stage", &payload.stage)?;
+            event.set_item("done", payload.done)?;
+            event.set_item("total", payload.total)?;
+            event.set_item("file", payload.file.as_deref())?;
+            event.set_item("frames_done", payload.frames_done)?;
+            event.set_item("message", &payload.message)?;
+            callback.call1(py, (event,))?;
+            Ok(())
+        });
+        if let Err(err) = called {
+            self.warnings
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(format!("进度回调异常（已忽略）：{err}"));
+        }
+    }
+}
+
 /// 返回内核版本号（来自 Cargo.toml 的 CARGO_PKG_VERSION）。
 #[pyfunction]
 fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+/// scan 输出前的中间结构：一条待列出的报文及其观测值。
+///
+/// * `plan` 命中 DBC 计划时为 `Some`（带信号列表与 DBC 名），未绑 DBC 的观测报文为 `None`；
+/// * 完全没有帧观测（`blf_paths == []` 等）时，`frame_count=0` / `cycle_ms=None` / `is_fd=false`。
+struct ScanMessage<'a> {
+    id: u32,
+    frame_count: u64,
+    cycle_ms: Option<f64>,
+    is_fd: bool,
+    plan: Option<&'a MessagePlan>,
 }
 
 /// 只读扫描：给 GUI 建三级信号树（契约见 `docs/INTERFACE.md` §1）。
@@ -53,7 +215,7 @@ fn version() -> &'static str {
 /// 解析失败都只落到对应条目的 `error` / `dbc_error`，绝不抛异常中断整批任务。
 #[pyfunction]
 #[pyo3(signature = (blf_paths, dbc_by_channel, progress_cb=None))]
-fn scan<'py>(
+pub fn scan<'py>(
     py: Python<'py>,
     blf_paths: Vec<String>,
     dbc_by_channel: HashMap<u32, String>,
@@ -71,44 +233,19 @@ fn scan<'py>(
 
     // 重活全程 detach：释放 GIL 后用 rayon 并行扫描文件。
     let paths: Vec<PathBuf> = blf_paths.iter().map(PathBuf::from).collect();
+    // 热路径回调统一走节流器：允许来自 rayon 工作线程，GIL 天然串行化。
+    let throttle = Arc::new(ProgressThrottle::new(progress_cb, paths.len() as u64));
     let scans: Vec<FileScan> = py.detach(|| {
-        // 工作线程里的 progress 是 no-op：**Python 回调绝不允许并发调用**，
-        // 真正的回调在下面收集阶段由本线程串行触发（见任务书 §2）。
-        let file_scans: Vec<FileScan> = paths
+        paths
             .par_iter()
             .map(|path| {
-                let noop = |_p: Progress| {};
-                scan_file(path, &plan, &noop)
-            })
-            .collect();
-
-        if let Some(callback) = progress_cb.as_ref() {
-            let total = file_scans.len() as u64;
-            for (idx, file_scan) in file_scans.iter().enumerate() {
-                let payload = Progress {
-                    phase: 1,
-                    stage: "scan".to_string(),
-                    done: idx as u64 + 1,
-                    total,
-                    file: Some(file_scan.path.clone()),
-                    message: format!("已扫描 {}", file_scan.path),
+                let throttle = Arc::clone(&throttle);
+                let emit = move |payload: Progress| {
+                    throttle.emit_decode(payload);
                 };
-                // 重新获取 GIL 调用 Python；回调抛出的异常必须吞掉，不得 abort 进程。
-                let _ = Python::attach(|py| -> PyResult<()> {
-                    let event = PyDict::new(py);
-                    event.set_item("phase", payload.phase)?;
-                    event.set_item("stage", &payload.stage)?;
-                    event.set_item("done", payload.done)?;
-                    event.set_item("total", payload.total)?;
-                    event.set_item("file", payload.file.as_deref())?;
-                    event.set_item("message", &payload.message)?;
-                    callback.call1(py, (event,))?;
-                    Ok(())
-                });
-            }
-        }
-
-        file_scans
+                scan_file(path, &plan, &emit)
+            })
+            .collect()
     });
 
     // ---------------- files ----------------
@@ -140,6 +277,11 @@ fn scan<'py>(
         }
     }
 
+    // 是否完全没有帧观测：`blf_paths == []`、所有文件都打不开、或 BLF 里 0 帧都算。
+    // 此时按已绑 DBC 的计划补全报文列表（frame_count=0 / cycle_ms=None / is_fd=false），
+    // 供"还没加 BLF 就先解析 DBC 看信号树"使用（INTERFACE §1）。
+    let no_observations = frame_counts.is_empty();
+
     let mut channel_ids: BTreeSet<u32> = dbc_map.keys().copied().collect();
     for &(channel, _) in frame_counts.keys() {
         channel_ids.insert(channel);
@@ -161,25 +303,57 @@ fn scan<'py>(
         let messages_list = PyList::empty(py);
         // DBC 解析失败的通道：按要求 `messages` 为空数组，错误只在 dbc_error 里。
         if !dbc_errors.contains_key(&channel) {
-            // frame_counts 是 BTreeMap，过滤后天然按 id 升序。
-            for (&(ch, id), &count) in frame_counts.iter().filter(|((ch, _), _)| *ch == channel) {
-                let message_plan = plan.lookup(ch, id);
+            // (id, frame_count, cycle_ms, is_fd, DBC 计划)。
+            //
+            // * 有帧观测时：只列观测到的 `(channel, id)`（既有语义；frame_counts 是
+            //   BTreeMap，过滤后天然按 id 升序）；
+            // * 完全没有观测时（含 `blf_paths == []`）：按 DBC 计划列出该通道的全部报文，
+            //   frame_count=0 / cycle_ms=None / is_fd=false，绝不因"观测不到帧"而丢报文。
+            let mut entries: Vec<ScanMessage<'_>> = Vec::new();
+            if no_observations {
+                let mut plan_messages: Vec<&MessagePlan> = plan
+                    .messages()
+                    .filter(|message| message.channel == channel)
+                    .collect();
+                plan_messages.sort_by_key(|message| message.frame_id);
+                for message in plan_messages {
+                    entries.push(ScanMessage {
+                        id: message.frame_id,
+                        frame_count: 0,
+                        cycle_ms: None,
+                        is_fd: false,
+                        plan: Some(message),
+                    });
+                }
+            } else {
+                for (&(ch, id), &count) in
+                    frame_counts.iter().filter(|((ch, _), _)| *ch == channel)
+                {
+                    entries.push(ScanMessage {
+                        id,
+                        frame_count: count,
+                        cycle_ms: cycles.get(&(ch, id)).and_then(median_of),
+                        is_fd: frame_is_fd.get(&(ch, id)).copied().unwrap_or(false),
+                        plan: plan.lookup(ch, id),
+                    });
+                }
+            }
+
+            for entry in entries {
+                let message_plan = entry.plan;
                 let message_dict = PyDict::new(py);
-                message_dict.set_item("id", id)?;
-                message_dict.set_item("id_hex", format!("0x{id:X}"))?;
+                message_dict.set_item("id", entry.id)?;
+                message_dict.set_item("id_hex", format!("0x{:X}", entry.id))?;
                 match message_plan {
                     Some(plan_message) => message_dict.set_item("name", &plan_message.name)?,
-                    None => message_dict.set_item("name", format!("ID_0x{id:X}"))?,
+                    None => message_dict.set_item("name", format!("ID_0x{:X}", entry.id))?,
                 }
-                match cycles.get(&(ch, id)).and_then(median_of) {
+                match entry.cycle_ms {
                     Some(cycle_ms) => message_dict.set_item("cycle_ms", cycle_ms)?,
                     None => message_dict.set_item("cycle_ms", py.None())?,
                 }
-                message_dict.set_item("frame_count", count)?;
-                message_dict.set_item(
-                    "is_fd",
-                    frame_is_fd.get(&(ch, id)).copied().unwrap_or(false),
-                )?;
+                message_dict.set_item("frame_count", entry.frame_count)?;
+                message_dict.set_item("is_fd", entry.is_fd)?;
 
                 let signals_list = PyList::empty(py);
                 if let Some(plan_message) = message_plan {
@@ -302,10 +476,62 @@ fn split_code_message(text: &str) -> (String, String) {
     }
 }
 
+/// 构造"所选内容全部落空"时的 `EMPTY_RESULT` 人话说明。
+///
+/// 只在 `DecodePlan` 为空、即用户选中的报文/信号**全部**落在失败通道或未绑 DBC 的通道上时
+/// 调用（INTERFACE §5.9）。说明里点名涉及的通道，并带上失败通道的原始原因关键字
+/// （如 `DBC`）；未绑 DBC 的通道单独列出。
+fn empty_selection_message(
+    selection: &Selection,
+    dbc_map: &BTreeMap<u32, PathBuf>,
+    dbc_errors: &BTreeMap<u32, CoreError>,
+) -> String {
+    // 选中通道：`selected` 为空表示"全选"，此时以所有已绑 DBC 的通道为准。
+    let selected_channels: BTreeSet<u32> = if selection.channels.is_empty() {
+        dbc_map
+            .keys()
+            .copied()
+            .chain(dbc_errors.keys().copied())
+            .collect()
+    } else {
+        selection.channels.keys().copied().collect()
+    };
+
+    let mut failed: Vec<String> = Vec::new();
+    let mut unbound: Vec<String> = Vec::new();
+    for channel in selected_channels {
+        if let Some(err) = dbc_errors.get(&channel) {
+            failed.push(format!("{channel}（{}）", err.message));
+        } else if !dbc_map.contains_key(&channel) {
+            unbound.push(channel.to_string());
+        }
+    }
+
+    let mut segments: Vec<String> = Vec::new();
+    if !failed.is_empty() {
+        segments.push(format!(
+            "所选信号全部来自 DBC 构建失败的通道：{}",
+            failed.join("、")
+        ));
+    }
+    if !unbound.is_empty() {
+        segments.push(format!(
+            "所选信号全部来自未绑定 DBC 的通道：{}",
+            unbound.join("、")
+        ));
+    }
+    if segments.is_empty() {
+        // plan 为空但又没有失败/未绑通道：所选报文在已解析的 DBC 里都不存在。
+        "所选报文/信号在已解析的 DBC 中均不存在，结果为空".to_string()
+    } else {
+        segments.join("；")
+    }
+}
+
 /// 全量转换（契约见 `docs/INTERFACE.md` §1）。
 #[pyfunction]
 #[pyo3(signature = (config, progress_cb=None))]
-fn convert<'py>(
+pub fn convert<'py>(
     py: Python<'py>,
     config: &Bound<'py, PyDict>,
     progress_cb: Option<Py<PyAny>>,
@@ -326,6 +552,14 @@ fn convert<'py>(
     let memory_budget_mb: u64 = config_optional(config, "memory_budget_mb", 1536)?;
     // ffill 只在「宽表 + 保持原始时序」时生效，由 exporter 判断模式后应用。
     let ffill: bool = config_optional(config, "ffill", false)?;
+    // 时间列口径：缺省 relative_s；非法值 BAD_CONFIG 并列出 4 个合法值。
+    let time_format_raw: String = config_optional(config, "time_format", "relative_s".to_string())?;
+    let time_format = TimeFormat::parse(&time_format_raw).ok_or_else(|| {
+        CoreError::bad_config(format!(
+            "config 字段 `time_format` 非法：`{time_format_raw}`（合法值：{}）",
+            TimeFormat::valid_values()
+        ))
+    })?;
 
     // ---------------- 参数转换与校验 ----------------
     let mut dbc_map: BTreeMap<u32, PathBuf> = BTreeMap::new();
@@ -363,10 +597,51 @@ fn convert<'py>(
         }
     }
 
-    let plan = DecodePlan::build(&dbc_map, &selection)?;
+    // §5.9：单通道 DBC 失败不得拖垮整体。宽松构建后，失败通道在 plan 里为空，
+    // 原因按通道回传（`dbc_errors` + `warnings`）；只有"所选内容全部落空"才 EMPTY_RESULT。
+    let (plan, dbc_errors) = DecodePlan::build_lenient(&dbc_map, &selection);
+    let dbc_error_reasons: BTreeMap<u32, String> = dbc_errors
+        .iter()
+        .map(|(&channel, err)| (channel, err.message.clone()))
+        .collect();
+    let dbc_warnings: Vec<String> = dbc_errors
+        .iter()
+        .map(|(&channel, err)| {
+            format!(
+                "通道 {channel} 的 DBC 解析失败，已跳过该通道（原因：{}）",
+                err.message
+            )
+        })
+        .collect();
+
+    if plan.is_empty() {
+        return Err(CoreError::empty_result(empty_selection_message(
+            &selection,
+            &dbc_map,
+            &dbc_errors,
+        ))
+        .into());
+    }
+
     let paths: Vec<PathBuf> = blf_paths.iter().map(PathBuf::from).collect();
     let total_files = paths.len() as u64;
     let mem_budget = (memory_budget_mb as usize).saturating_mul(1024 * 1024);
+
+    // 每文件的头部墙钟：`absolute` 需要它原样格式化；失败文件也照读（wall=None）。
+    let file_timings: Vec<FileTiming> = paths.iter().map(|path| read_file_timing(path)).collect();
+    if time_format == TimeFormat::Absolute {
+        if let Some(missing) = file_timings.iter().find(|timing| timing.wall.is_none()) {
+            return Err(CoreError::new(
+                BAD_TIME_HEADER,
+                format!(
+                    "absolute 时间口径需要 BLF 文件头墙钟，但 {} 的文件头无效",
+                    missing.path.display()
+                ),
+            )
+            .into());
+        }
+    }
+
     let opts = ExportOptions {
         split_by_message,
         resample_hz,
@@ -374,6 +649,10 @@ fn convert<'py>(
         out_dir: PathBuf::from(out_dir),
         excel_row_limit,
         ffill,
+        time_format,
+        // 解码期由 ShardSink 原子统计，导出前回填。
+        global_min: 0.0,
+        file_timings,
     };
     let temp = PathBuf::from(temp_dir);
 
@@ -381,59 +660,30 @@ fn convert<'py>(
     let outcome: Result<ConvertOutcome, CoreError> = py.detach(|| {
         let sink = ShardSink::new(temp.clone())?;
 
-        // 进度回调节流器：首个事件放行（初始时间回退 50ms）。
-        let last_emit = std::sync::Mutex::new(
-            Instant::now()
-                .checked_sub(Duration::from_millis(50))
-                .unwrap_or_else(Instant::now),
-        );
-        let warnings: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-        let emit = |payload: Progress| {
-            let Some(callback) = progress_cb.as_ref() else {
-                return;
-            };
-            {
-                let mut last = last_emit.lock().unwrap_or_else(|err| err.into_inner());
-                if last.elapsed() < Duration::from_millis(50) {
-                    return;
-                }
-                *last = Instant::now();
-            }
-            // 回调抛异常必须吞掉、记 warnings，绝不让进程崩。
-            let called = Python::attach(|py| -> PyResult<()> {
-                let event = PyDict::new(py);
-                event.set_item("phase", payload.phase)?;
-                event.set_item("stage", &payload.stage)?;
-                event.set_item("done", payload.done)?;
-                event.set_item("total", payload.total)?;
-                event.set_item("file", payload.file.as_deref())?;
-                event.set_item("message", &payload.message)?;
-                callback.call1(py, (event,))?;
-                Ok(())
-            });
-            if let Err(err) = called {
-                warnings
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .push(format!("进度回调异常（已忽略）：{err}"));
-            }
-        };
+        // 进度回调节流器：解码/导出期间由工作线程直接调用（GIL 串行化 + 50ms 节流）。
+        let throttle = Arc::new(ProgressThrottle::new(progress_cb, total_files));
+        let warnings: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-        // Phase 1：rayon 并行解码；工作线程内回调一律 no-op（Python 回调绝不并发）。
-        let noop = |_payload: Progress| {};
+        // Phase 1：rayon 并行解码；工作线程在解码循环内部直接发进度（不再 no-op）。
         let results: Vec<Result<FileStat, CoreError>> = paths
             .par_iter()
-            .map(|path| process_file(path, &plan, &sink, mem_budget, &noop))
+            .map(|path| {
+                let throttle = Arc::clone(&throttle);
+                let emit = move |payload: Progress| {
+                    throttle.emit_decode(payload);
+                };
+                process_file(path, &plan, &sink, mem_budget, &emit)
+            })
             .collect();
 
-        // 收集阶段主线程串行回调（done/total 按文件数）。
+        // 收集错误/告警（进度已在热路径发出，这里不再补发）。
         let mut file_errors: Vec<FileError> = Vec::new();
         for (idx, result) in results.iter().enumerate() {
             let file = paths
                 .get(idx)
                 .map(|path| path.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let message = match result {
+            match result {
                 Ok(stat) => {
                     if let Some(err_text) = &stat.error {
                         let (code, detail) = split_code_message(err_text);
@@ -452,7 +702,6 @@ fn convert<'py>(
                                 stat.path, stat.decode_errors
                             ));
                     }
-                    format!("已解码 {}", stat.path)
                 }
                 Err(err) => {
                     file_errors.push(FileError {
@@ -460,22 +709,19 @@ fn convert<'py>(
                         code: err.code.clone(),
                         message: err.message.clone(),
                     });
-                    format!("解码失败 {file}：{}", err.message)
                 }
-            };
-            emit(Progress {
-                phase: 1,
-                stage: "decode".to_string(),
-                done: idx as u64 + 1,
-                total: total_files,
-                file: Some(file),
-                message,
-            });
+            }
         }
 
         // Phase 2：合并与导出（export 内部用 stage = merge/export 回调）。
         let tables = sink.tables_snapshot();
-        let export_result = export(&tables, &opts, &emit);
+        let export_emit = |payload: Progress| {
+            throttle.emit(payload);
+        };
+        // 全局限在解码期原子统计完成，这里回填后交给 exporter，绝不在导出期重算。
+        let mut export_opts = opts.clone();
+        export_opts.global_min = sink.global_min();
+        let export_result = export(&tables, &export_opts, &export_emit);
 
         // 无论导出成功与否，只删自己写出的 *.parquet 分片，绝不 remove_dir_all。
         for shard in sink.shard_paths() {
@@ -483,10 +729,11 @@ fn convert<'py>(
         }
 
         let report = export_result?;
-        let warnings = warnings
+        let mut warnings = warnings
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone();
+        warnings.extend(throttle.take_warnings());
         Ok(ConvertOutcome {
             report,
             errors: file_errors,
@@ -528,7 +775,15 @@ fn convert<'py>(
     }
     out.set_item("tables", tables_list)?;
 
+    // 按通道回传 DBC 构建失败原因（通道号字符串 → 人话原因），供 GUI 在解析阶段直接显示。
+    let dbc_errors_dict = PyDict::new(py);
+    for (channel, reason) in &dbc_error_reasons {
+        dbc_errors_dict.set_item(channel.to_string(), reason)?;
+    }
+    out.set_item("dbc_errors", dbc_errors_dict)?;
+
     let mut warnings = report.warnings;
+    warnings.extend(dbc_warnings);
     warnings.extend(outcome.warnings);
     out.set_item("warnings", warnings)?;
 

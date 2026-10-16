@@ -23,6 +23,9 @@ __pycache__/
 *.csv
 !docs/**/*.csv
 
+# 用户配置预设（configs/*.json 是本机/随包的运行时数据，不进仓库）
+/configs/
+
 # 生成的基准/大素材（体积大，用脚本重新生成即可）
 fixtures/bench_*.blf
 

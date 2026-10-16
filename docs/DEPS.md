@@ -214,3 +214,37 @@ for k in 0..bit_len {
 
 Intel 分支的约定不变：start 是 LSB 位位置、LSB0 连续、第 i 位权值 2^i（同样经 1440 次对拍确认）。
 
+## 8. BLF 文件头布局与时间口径（实测自 python-can 源码，权威）
+
+python-can 的定义：`FILE_HEADER_STRUCT = struct.Struct("<4sLBBBBBBBBQQLL8H8H")`，size **72**，文件头整体补零到 **144** 字节。
+
+| 偏移 | 类型 | 含义 |
+|---|---|---|
+| 0 | `4s` | magic `"LOGG"` |
+| 4 | `u32` | headerSize（通常 144） |
+| 8..15 | 8×`u8` | applicationId / 版本等 |
+| 16..31 | 2×`u64` | fileSize、uncompressedFileSize |
+| 32..39 | 2×`u32` | objectCount、未知 |
+| **40** | **8×`u16`** | **measurementStartTime（SYSTEMTIME）** |
+| 56 | 8×`u16` | lastObjectTime（SYSTEMTIME） |
+
+SYSTEMTIME 的 8 个 u16 顺序（由 `timestamp_to_systemtime()` 的返回顺序确认）：
+`(year, month, isoweekday()%7, day, hour, minute, second, milliseconds)`
+
+**时间口径要点（关键，容易错）**：
+- 文件头里存的是**录制机的墙钟时间**（没有时区信息）。
+- `blf_asc` 与 python-can 都把它**当作 UTC** 换算成 epoch（`systemtime_to_timestamp`），因此 `Message.timestamp` 是"绝对 epoch 秒"。
+- 想要**与 CANalyzer 对得上**的绝对时间，必须**直接读偏移 40 处的 8×u16 原样格式化**，不能走 `Message.timestamp` 再转本地时间（那会差一个时区偏移）。
+
+**独立验算好的定值**（用作单元测试期望，禁止改）：
+设夹具首帧时间戳 `X = 1760623800.123456`（epoch 秒），周期 10ms：
+
+| 帧 | relative_s | unix_s | absolute（墙钟原样） |
+|---|---|---|---|
+| 第 0 帧 | `0.0` | `1760623800.123456` | `2025-10-16 14:10:00.123456` |
+| 第 1 帧 (+10ms) | `0.01` | `1760623800.133456` | `2025-10-16 14:10:00.133456` |
+| 第 100 帧 (+1s) | `1.0` | `1760623801.123456` | `2025-10-16 14:10:01.123456` |
+
+对应头部 8×u16 应为：`(2025, 10, 4, 16, 14, 10, 0, 123)`（day_of_week=4=周四）。
+
+
