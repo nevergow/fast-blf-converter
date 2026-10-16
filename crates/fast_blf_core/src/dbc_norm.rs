@@ -13,6 +13,18 @@
 //! * 按**语句**（不是按行）整段剔除 can-dbc 不支持的段，剔除处保留换行以维持行号；
 //! * 每一步都产出 `notes`，由调用方并入 `warnings`，**绝不静默改数据**。
 //!
+//! ## Step 12 修正：cp1252 vs GB18030 判别（孤立高位字节 ≠ 中文）
+//!
+//! Step 9 的「UTF-8 失败即 GB18030」在真机上会**解析成功但语义错误**：Vector 在非 UTF-8 语言
+//! 环境下把 `°C` 写成单字节 `0xB0` + ASCII `C`，GB18030 会把 `0xB0` 当首字节、把 `C` 当尾字节
+//! 吃掉（`"°C"` → `"癈"`），单位被破坏。Step 12 改为按**高位字节（≥0x80）的连续性**判别：
+//!
+//! * `max_run >= 2`（存在连续多字节序列）→ GB18030（中文注释/枚举值必然是成串多字节）；
+//! * 所有高位字节都孤立（`max_run == 1`）→ Windows-1252（cp1252，真实文件里几乎总是
+//!   `°` / `µ` / `±` / `²` 这类拉丁符号）。
+//!
+//! 两种回退都写**可区分**的 note（GUI 悬停显示），见 [`GB18030_NOTE`] / [`WINDOWS_1252_NOTE_PREFIX`]。
+//!
 //! ## Step 10 修正：误伤 `NS_ :` 段导致静默丢数据
 //!
 //! Step 9 把 `NS_ :` 段里逐行列出的元关键字也当成待剔除语句的起点；而剔除规则是「吃到下一个
@@ -31,12 +43,83 @@
 
 use std::collections::BTreeMap;
 
-use encoding_rs::GB18030;
+use encoding_rs::{GB18030, WINDOWS_1252};
 
 /// 不变量自检失败时的留痕文案（剔除会破坏报文/信号定义时返回原文）。
 ///
 /// 独立导出为常量，便于测试直接断言，避免「文案漂移但测试不同步」。
 pub const NORM_SKIPPED_NOTE: &str = "规范化被跳过：剔除会破坏报文定义";
+
+/// GB18030 回退解码的 note。中文编码的高位字节必然连续成串（`max_run >= 2`）。
+const GB18030_NOTE: &str = "原文件不是 UTF-8，已按 GB18030 解码（检测到连续多字节序列，判定为中文编码）";
+
+/// Windows-1252（cp1252）回退解码 note 的前缀；完整文案见 [`windows_1252_note`]。
+const WINDOWS_1252_NOTE_PREFIX: &str = "原文件不是 UTF-8，已按 Windows-1252 解码（检测到";
+
+/// 高位字节（≥0x80）的连续性统计。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct HighByteStats {
+    /// 最长连续高位字节游程长度；全 ASCII 时为 0。
+    max_run: usize,
+    /// 长度为 1 的孤立高位字节游程数量（用于 cp1252 note 的 N）。
+    isolated_runs: usize,
+}
+
+/// 扫描整段字节，统计连续高位字节的最长游程与孤立游程数。
+///
+/// 非 UTF-8 字节流才会用到本函数；纯 ASCII 返回 `max_run == 0`。
+fn high_byte_stats(bytes: &[u8]) -> HighByteStats {
+    let mut stats = HighByteStats::default();
+    let mut run = 0usize;
+    for &byte in bytes {
+        if byte >= 0x80 {
+            run += 1;
+            continue;
+        }
+        if run > 0 {
+            stats.max_run = stats.max_run.max(run);
+            if run == 1 {
+                stats.isolated_runs += 1;
+            }
+            run = 0;
+        }
+    }
+    if run > 0 {
+        stats.max_run = stats.max_run.max(run);
+        if run == 1 {
+            stats.isolated_runs += 1;
+        }
+    }
+    stats
+}
+
+/// 非 UTF-8 字节流的回退编码选择。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncodingFallback {
+    /// 只含孤立高位字节 → Windows-1252（cp1252）。
+    Windows1252,
+    /// 含 `>=2` 连续高位字节 → GB18030。
+    Gb18030,
+}
+
+/// 按高位字节连续性判定回退编码；`None` 表示无需回退（纯 ASCII / 严格 UTF-8 已可解）。
+///
+/// 规则（Step 12）：`max_run == 0` → `None`；`max_run >= 2` → GB18030；否则（全孤立）→ cp1252。
+fn choose_encoding_fallback(bytes: &[u8]) -> Option<EncodingFallback> {
+    let stats = high_byte_stats(bytes);
+    if stats.max_run == 0 {
+        None
+    } else if stats.max_run >= 2 {
+        Some(EncodingFallback::Gb18030)
+    } else {
+        Some(EncodingFallback::Windows1252)
+    }
+}
+
+/// 生成 cp1252 回退 note（带孤立高位字节处数 N）。
+fn windows_1252_note(isolated_runs: usize) -> String {
+    format!("{WINDOWS_1252_NOTE_PREFIX} {isolated_runs} 处孤立高位字节，判定为 °C/µ 等符号）")
+}
 
 /// 需要整段剔除的语句起始关键字（**证据驱动**）。
 ///
@@ -292,9 +375,10 @@ fn ignored_statements_note(counts: &BTreeMap<&'static str, usize>, total: usize)
 ///
 /// 处理顺序：
 /// 1. **去 UTF-8 BOM**（`EF BB BF`）；命中记 note `已去除 UTF-8 BOM`。
-/// 2. **编码**：先按 UTF-8 严格解码；失败则用 GB18030（GBK 超集）解码，命中记 note
-///    `原文件不是 UTF-8，已按 GB18030 解码（中文注释/枚举值保持可读）`；
-///    GB18030 仍无法无损解码 → `Err(原因)`（调用方包成 `DBC_PARSE`）。
+/// 2. **编码**：先按 UTF-8 严格解码；失败则按高位字节连续性判别回退编码（Step 12）：
+///    * `max_run >= 2` → GB18030，记 note [`GB18030_NOTE`]；
+///    * 全部孤立（`max_run == 1`）→ Windows-1252（cp1252），记 note [`windows_1252_note`]；
+///    * 所选编码仍无法无损解码 → `Err(原因)`（调用方包成 `DBC_PARSE`）。
 /// 3. **按语句剔除** can-dbc 不支持的元数据段；剔除后做不变量自检，一旦 `BO_`/`SG_`
 ///    行数减少就**放弃剔除、返回原文**并记 note [`NORM_SKIPPED_NOTE`]。
 ///
@@ -311,22 +395,42 @@ pub fn normalize_dbc_bytes(raw: &[u8], file_label: &str) -> Result<NormOutcome, 
         raw
     };
 
-    // 2) 编码：严格 UTF-8 优先；失败退 GB18030（不做 BOM 嗅探，避免误判为 UTF-16）。
+    // 2) 编码：严格 UTF-8 优先；失败按高位字节连续性判别 cp1252 / GB18030（不做 BOM 嗅探，
+    //    避免误判为 UTF-16）。
     let text: String = match std::str::from_utf8(bytes) {
         Ok(valid) => valid.to_string(),
-        Err(_) => match GB18030.decode_without_bom_handling_and_without_replacement(bytes) {
-            Some(decoded) => {
-                notes.push(
-                    "原文件不是 UTF-8，已按 GB18030 解码（中文注释/枚举值保持可读）".to_string(),
-                );
-                decoded.into_owned()
+        Err(_) => {
+            let stats = high_byte_stats(bytes);
+            // 严格 UTF-8 失败意味着存在高位字节；`None` 在此仅为防御性回退。
+            match choose_encoding_fallback(bytes) {
+                Some(EncodingFallback::Gb18030) => {
+                    match GB18030.decode_without_bom_handling_and_without_replacement(bytes) {
+                        Some(decoded) => {
+                            notes.push(GB18030_NOTE.to_string());
+                            decoded.into_owned()
+                        }
+                        None => {
+                            return Err(format!(
+                                "DBC「{file_label}」无法按 UTF-8 或 GB18030 解码（存在无法映射的字节序列）"
+                            ));
+                        }
+                    }
+                }
+                Some(EncodingFallback::Windows1252) | None => {
+                    match WINDOWS_1252.decode_without_bom_handling_and_without_replacement(bytes) {
+                        Some(decoded) => {
+                            notes.push(windows_1252_note(stats.isolated_runs));
+                            decoded.into_owned()
+                        }
+                        None => {
+                            return Err(format!(
+                                "DBC「{file_label}」无法按 UTF-8 或 Windows-1252 解码（存在无法映射的字节序列）"
+                            ));
+                        }
+                    }
+                }
             }
-            None => {
-                return Err(format!(
-                    "DBC「{file_label}」无法按 UTF-8 或 GB18030 解码（存在无法映射的字节序列）"
-                ));
-            }
-        },
+        }
     };
 
     // 3) 按语句剔除 can-dbc 不支持的段，并做「报文/信号定义不得减少」不变量自检。
@@ -369,6 +473,44 @@ mod tests {
         // 0xFF 在 GB18030 里不是合法字节（首字节范围 0x81..=0xFE）。
         let err = normalize_dbc_bytes(&[0xFF, 0xFF, 0xFF], "bad.dbc").expect_err("必须报错");
         assert!(err.contains("bad.dbc"), "错误应带文件名：{err}");
+    }
+
+    /// Step 12：按高位字节连续性判别编码的边界用例。
+    #[test]
+    fn dbcnorm_run_detection_boundary() {
+        // 全 ASCII：没有高位字节 → 不需要任何回退。
+        let ascii = b"VERSION \"\"\nBU_: ECU1\n";
+        assert_eq!(choose_encoding_fallback(ascii), None, "纯 ASCII 不应回退");
+        assert_eq!(high_byte_stats(ascii).max_run, 0);
+        assert_eq!(high_byte_stats(ascii).isolated_runs, 0);
+
+        // 单个孤立高位字节（0xB0 夹在 ASCII 之间）→ cp1252。
+        let isolated = [b'"', 0xB0, b'C', b'"'];
+        assert_eq!(
+            choose_encoding_fallback(&isolated),
+            Some(EncodingFallback::Windows1252)
+        );
+        let stats = high_byte_stats(&isolated);
+        assert_eq!(stats.max_run, 1);
+        assert_eq!(stats.isolated_runs, 1);
+
+        // 两个连续高位字节（GBK 中文首尾字节）→ GB18030。
+        let cjk = [0xB3, 0xB5];
+        assert_eq!(
+            choose_encoding_fallback(&cjk),
+            Some(EncodingFallback::Gb18030)
+        );
+        assert_eq!(high_byte_stats(&cjk).max_run, 2);
+
+        // 孤立与连续混在：max_run >= 2 优先 → GB18030。
+        let mixed = [0xB0, b'C', 0xB3, 0xB5];
+        assert_eq!(
+            choose_encoding_fallback(&mixed),
+            Some(EncodingFallback::Gb18030)
+        );
+        let stats = high_byte_stats(&mixed);
+        assert_eq!(stats.max_run, 2);
+        assert_eq!(stats.isolated_runs, 1);
     }
 
     #[test]

@@ -2596,6 +2596,90 @@ fn dbcnorm_gbk_and_bom_still_work() {
 }
 
 // ---------------------------------------------------------------------------
+// Step 12：DBC 编码回退判别（孤立高位字节 → cp1252，连续多字节 → GB18030）
+// ---------------------------------------------------------------------------
+
+/// 真机现场复现用的 DBC 字节：单位串 `"°C"` 按 **cp1252** 写出（`°` = 单字节 `0xB0`）。
+///
+/// 用户真机文件 `CAN_Matrix_MAL_P35_Hybrid_V3.2.0_Hybrid.dbc` 里就是这样 2 个孤立 `0xB0`；
+/// 按 GB18030 解会把后随的 ASCII `C` 当尾字节吃掉（`"°C"` → `"癈"`）。
+fn cp1252_degree_dbc_bytes() -> Vec<u8> {
+    let mut raw: Vec<u8> = Vec::new();
+    raw.extend_from_slice(b"VERSION \"\"\n\n");
+    raw.extend_from_slice(b"BU_: HV_Battery_NIO\n\n");
+    raw.extend_from_slice(b"BO_ 100 TEngineCoolant: 8 HV_Battery_NIO\n");
+    raw.extend_from_slice(
+        b" SG_ PID05_TEngineCoolant : 48|8@1+ (0.75,-48) [-48.00|143.25] \"",
+    );
+    raw.push(0xB0); // cp1252 的 `°`
+    raw.extend_from_slice(b"C\" HV_Battery_NIO\n");
+    raw
+}
+
+/// Step 12 用例 1（核心）：孤立高位字节 `0xB0` 必须按 Windows-1252 解出 `°C`，
+/// 绝不能按 GB18030 把后随的 `C` 吞掉。
+#[test]
+fn dbcnorm_isolated_degree_sign_uses_cp1252() {
+    let raw = cp1252_degree_dbc_bytes();
+
+    let outcome = normalize_dbc_bytes(&raw, "hybrid.dbc").expect("含 cp1252 ° 的 DBC 应可规范化");
+    let note = outcome.notes.join("\n");
+    assert!(
+        note.contains("Windows-1252"),
+        "note 应说明 Windows-1252：{note}"
+    );
+    assert!(
+        !note.contains("GB18030"),
+        "孤立高位字节不得判定为 GB18030：{note}"
+    );
+
+    // 单位没有被吞掉：`°C` 完整，且没有替换符 / GB18030 误码。
+    assert!(
+        outcome.text.contains("\"°C\""),
+        "单位应精确为 °C：{}",
+        outcome.text
+    );
+    assert!(!outcome.text.contains('\u{FFFD}'), "不应出现 U+FFFD 替换符");
+    assert!(!outcome.text.contains('癈'), "0xB0 不得被当成 GB18030 首字节吞掉 C");
+
+    // 报文/信号数量正确，整行没被吃掉。
+    let dbc = can_dbc::Dbc::try_from(outcome.text.as_str()).expect("规范化后必须能解析");
+    assert_eq!(dbc.messages.len(), 1, "报文数必须为 1");
+    assert_eq!(dbc.messages[0].signals.len(), 1, "信号数必须为 1");
+    let signal = &dbc.messages[0].signals[0];
+    assert_eq!(signal.name, "PID05_TEngineCoolant");
+    assert_eq!(signal.unit, "°C", "单位字符串必须精确等于 °C");
+}
+
+/// Step 12 用例 2：GBK 连续多字节（中文 `CM_` 注释 + 中文 `VAL_`）仍按 GB18030 解码。
+#[test]
+fn dbcnorm_cjk_run_still_uses_gb18030() {
+    let raw = gbk_dbc_bytes();
+
+    let outcome = normalize_dbc_bytes(&raw, "gbk.dbc").expect("GBK DBC 应可规范化");
+    let note = outcome.notes.join("\n");
+    assert!(note.contains("GB18030"), "note 应说明 GB18030：{note}");
+    assert!(
+        !note.contains("Windows-1252"),
+        "连续多字节不得判定为 cp1252：{note}"
+    );
+    assert!(
+        outcome.text.contains("车速信号"),
+        "中文注释应保留：{}",
+        outcome.text
+    );
+    assert!(
+        outcome.text.contains("停止") && outcome.text.contains("行驶"),
+        "中文 VAL_ 应保留：{}",
+        outcome.text
+    );
+
+    let dbc = can_dbc::Dbc::try_from(outcome.text.as_str()).expect("规范化后必须能解析");
+    assert_eq!(dbc.messages.len(), 1, "报文数必须为 1");
+    assert_eq!(dbc.messages[0].signals.len(), 1, "信号数必须为 1");
+}
+
+// ---------------------------------------------------------------------------
 // Step 11：scan 每个通道回传 `dbc_note`（解析成功但被规范化过时的一行说明）
 // ---------------------------------------------------------------------------
 
