@@ -21,6 +21,7 @@ mod dbc_norm;
 mod decoder;
 mod error;
 mod exporter;
+mod series;
 
 pub use bit_slice::{decode_physical, extract_bits, ByteOrder};
 pub use dbc_norm::{normalize_dbc_bytes, NormOutcome};
@@ -504,7 +505,7 @@ fn split_code_message(text: &str) -> (String, String) {
 /// 只在 `DecodePlan` 为空、即用户选中的报文/信号**全部**落在失败通道或未绑 DBC 的通道上时
 /// 调用（INTERFACE §5.9）。说明里点名涉及的通道，并带上失败通道的原始原因关键字
 /// （如 `DBC`）；未绑 DBC 的通道单独列出。
-fn empty_selection_message(
+pub(crate) fn empty_selection_message(
     selection: &Selection,
     dbc_map: &BTreeMap<u32, PathBuf>,
     dbc_errors: &BTreeMap<u32, CoreError>,
@@ -892,11 +893,122 @@ pub fn convert<'py>(
     Ok(out)
 }
 
+/// 画图数据接口（契约见 `docs/INTERFACE.md` §1.3）：Rust 侧完成「解码 + 分桶抽稀 + 统计」，
+/// 只把每信号 ≤ `buckets` 个点的结果交给 Python；绝不把百万级采样点搬进 Python。
+///
+/// config 字段：`blf_paths` / `dbc_by_channel` / `selected` / `time_format` / `buckets` /
+/// `temp_dir`（可不用）。`buckets` 越界抛 `BAD_CONFIG`（§4 的稳定错误码）；`blf_paths` 为空返回空 series 且
+/// `ok=true`。返回值的字段名逐字对应 §1.3。
+#[pyfunction]
+pub fn series_for_plot<'py>(
+    py: Python<'py>,
+    config: &Bound<'py, PyDict>,
+) -> PyResult<Bound<'py, PyDict>> {
+    // ---------------- 手工提取 config（与 convert 同一套 helper）----------------
+    let blf_paths: Vec<String> = config_required(config, "blf_paths")?;
+    let dbc_raw: HashMap<u32, String> = config_required(config, "dbc_by_channel")?;
+    let selected_raw: HashMap<String, HashMap<String, Vec<String>>> =
+        config_required(config, "selected")?;
+    let time_format_raw: String = config_optional(config, "time_format", "relative_s".to_string())?;
+    let time_format = TimeFormat::parse(&time_format_raw).ok_or_else(|| {
+        CoreError::bad_config(format!(
+            "config 字段 `time_format` 非法：`{time_format_raw}`（合法值：{}）",
+            TimeFormat::valid_values()
+        ))
+    })?;
+    let buckets: usize = config_optional(config, "buckets", series::DEFAULT_BUCKETS)?;
+    // `temp_dir` 允许给出但本接口不用（抽稀全在内存，O(buckets×信号数)）；显式读取以兼容
+    // convert 的同一份 config。
+    let _temp_dir: Option<String> = config_optional(config, "temp_dir", None)?;
+
+    let mut dbc_map: BTreeMap<u32, PathBuf> = BTreeMap::new();
+    for (channel, path) in dbc_raw {
+        dbc_map.insert(channel, PathBuf::from(path));
+    }
+
+    let mut selection = Selection::default();
+    for (channel_text, messages) in selected_raw {
+        let channel: u32 = channel_text.parse().map_err(|_| {
+            CoreError::bad_config(format!("`selected` 的通道号 `{channel_text}` 不是合法整数"))
+        })?;
+        selection.channels.insert(channel, messages);
+    }
+
+    let request = series::SeriesRequest {
+        blf_paths: blf_paths.iter().map(PathBuf::from).collect(),
+        dbc_by_channel: dbc_map,
+        selected: selection,
+        time_format,
+        buckets,
+    };
+
+    // 重活（两阶段扫描 + 解码入桶）全程 detach：释放 GIL。
+    let out = py.detach(|| series::series_for_plot(&request))?;
+
+    // ---------------- 组装返回值（严格按 §1.3）----------------
+    let result = PyDict::new(py);
+    result.set_item("ok", out.ok)?;
+    result.set_item("t_min", out.t_min)?;
+    result.set_item("t_max", out.t_max)?;
+    result.set_item("t_min_str", out.t_min_str.as_deref())?;
+    result.set_item("t_max_str", out.t_max_str.as_deref())?;
+
+    let axis_list = PyList::empty(py);
+    for tick in &out.t_axis {
+        let item = PyDict::new(py);
+        item.set_item("t", tick.t)?;
+        item.set_item("label", &tick.label)?;
+        axis_list.append(item)?;
+    }
+    result.set_item("t_axis", axis_list)?;
+    result.set_item("buckets", out.buckets)?;
+
+    let series_list = PyList::empty(py);
+    for s in &out.series {
+        let item = PyDict::new(py);
+        item.set_item("channel", s.channel)?;
+        item.set_item("message", &s.message)?;
+        item.set_item("signal", &s.signal)?;
+        item.set_item("unit", s.unit.as_deref())?;
+        item.set_item("count", s.count)?;
+        item.set_item("t", PyList::new(py, s.t.iter().copied())?)?;
+        item.set_item("min", PyList::new(py, s.min.iter().copied())?)?;
+        item.set_item("max", PyList::new(py, s.max.iter().copied())?)?;
+        item.set_item("mean", PyList::new(py, s.mean.iter().copied())?)?;
+        item.set_item("vmin", s.vmin)?;
+        item.set_item("vmax", s.vmax)?;
+        item.set_item("first", s.first)?;
+        item.set_item("last", s.last)?;
+        series_list.append(item)?;
+    }
+    result.set_item("series", series_list)?;
+
+    let dbc_errors_dict = PyDict::new(py);
+    for (channel, reason) in &out.dbc_errors {
+        dbc_errors_dict.set_item(channel.to_string(), reason)?;
+    }
+    result.set_item("dbc_errors", dbc_errors_dict)?;
+    result.set_item("warnings", out.warnings.clone())?;
+
+    let errors_list = PyList::empty(py);
+    for item in &out.errors {
+        let error = PyDict::new(py);
+        error.set_item("file", &item.file)?;
+        error.set_item("code", &item.code)?;
+        error.set_item("message", &item.message)?;
+        errors_list.append(error)?;
+    }
+    result.set_item("errors", errors_list)?;
+
+    Ok(result)
+}
+
 #[pymodule]
 fn fast_blf_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(scan, m)?)?;
     m.add_function(wrap_pyfunction!(convert, m)?)?;
+    m.add_function(wrap_pyfunction!(series_for_plot, m)?)?;
     m.add("CoreError", m.py().get_type::<CoreErrorPy>())?;
     Ok(())
 }

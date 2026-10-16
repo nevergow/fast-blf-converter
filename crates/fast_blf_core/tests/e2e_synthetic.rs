@@ -3238,4 +3238,471 @@ fn scan_dbc_note_present_for_ignored_statements() {
     .expect("Python 侧断言失败");
 }
 
+// ---------------------------------------------------------------------------
+// Step 15：series_for_plot（min/max 分桶抽稀 + 全量统计）
+// ---------------------------------------------------------------------------
+
+/// 仓库根 `fixtures/` 目录（`CARGO_MANIFEST_DIR` = crates/fast_blf_core）。
+fn repo_fixtures_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures")
+}
+
+/// 组装 `series_for_plot` 的 config（字段与 `docs/INTERFACE.md` §1.3 一致）。
+fn series_config<'py>(
+    py: Python<'py>,
+    blf: &Path,
+    dbc_by_channel: &[(u32, PathBuf)],
+    time_format: &str,
+    buckets: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    let config = PyDict::new(py);
+    config.set_item("blf_paths", vec![blf.to_string_lossy().to_string()])?;
+    let dbc_py: HashMap<u32, String> = dbc_by_channel
+        .iter()
+        .map(|(channel, path)| (*channel, path.to_string_lossy().to_string()))
+        .collect();
+    config.set_item("dbc_by_channel", dbc_py)?;
+    // 空 selected = 全部选中。
+    config.set_item("selected", HashMap::<String, HashMap<String, Vec<String>>>::new())?;
+    config.set_item("time_format", time_format)?;
+    config.set_item("buckets", buckets)?;
+    config.set_item("temp_dir", py.None())?;
+    Ok(config)
+}
+
+/// 从 `series_for_plot` 返回值里取每条曲线的关键字段。
+#[derive(Debug)]
+struct SeriesRow {
+    message: String,
+    signal: String,
+    count: u64,
+    vmin: f64,
+    vmax: f64,
+    first: f64,
+    last: f64,
+    t_len: usize,
+}
+
+fn series_rows(out: &Bound<'_, PyDict>) -> PyResult<Vec<SeriesRow>> {
+    let list = out
+        .get_item("series")?
+        .expect("返回值必须含 series")
+        .cast_into::<PyList>()?;
+    let mut rows = Vec::new();
+    for item in list.iter() {
+        let dict = item.cast_into::<PyDict>()?;
+        let t = dict
+            .get_item("t")?
+            .expect("series 元素必须含 t")
+            .cast_into::<PyList>()?;
+        rows.push(SeriesRow {
+            message: dict.get_item("message")?.unwrap().extract()?,
+            signal: dict.get_item("signal")?.unwrap().extract()?,
+            count: dict.get_item("count")?.unwrap().extract()?,
+            vmin: dict.get_item("vmin")?.unwrap().extract()?,
+            vmax: dict.get_item("vmax")?.unwrap().extract()?,
+            first: dict.get_item("first")?.unwrap().extract()?,
+            last: dict.get_item("last")?.unwrap().extract()?,
+            t_len: t.len(),
+        });
+    }
+    Ok(rows)
+}
+
+/// 逐帧解码后手算每条信号的 `(count, vmin, vmax)`（独立于 series_for_plot）。
+fn hand_decode_stats(
+    blf: &Path,
+    dbc_by_channel: &[(u32, PathBuf)],
+) -> BTreeMap<(u32, String, String), (u64, f64, f64)> {
+    let dbc_map: BTreeMap<u32, PathBuf> = dbc_by_channel.iter().cloned().collect();
+    let plan = DecodePlan::build(&dbc_map, &Selection::default()).expect("构建手算计划");
+    let mut out: BTreeMap<(u32, String, String), (u64, f64, f64)> = BTreeMap::new();
+    let mut reader = blf_asc::BlfReader::open(blf).expect("打开 BLF 手算");
+    for msg in reader.by_ref() {
+        let channel = msg.channel as u32 + 1;
+        let frame_id = msg.arbitration_id.0 | if msg.is_extended_id { 1 << 31 } else { 0 };
+        let Some(message) = plan.lookup(channel, frame_id) else {
+            continue;
+        };
+        for signal in &message.signals {
+            let value = signal.decode(msg.data.as_slice()).expect("手算解码信号");
+            let entry = out
+                .entry((channel, message.name.clone(), signal.name.clone()))
+                .or_insert((0, f64::INFINITY, f64::NEG_INFINITY));
+            entry.0 += 1;
+            if value < entry.1 {
+                entry.1 = value;
+            }
+            if value > entry.2 {
+                entry.2 = value;
+            }
+        }
+    }
+    out
+}
+
+/// Step 15 集成 1：`multi_channel.blf` + `demo.dbc`。
+///
+/// * `series` 必须含 `VehSpd/Spd`、`BattTemp/Temp1`、`Insulation/Res`；
+/// * 每条信号的 `count` 必须等于 `scan` 报的该报文 `frame_count`；
+/// * `vmin`/`vmax` 必须等于逐帧解码手算的结果（1e-9 容差）。
+#[test]
+fn step15_series_multi_channel_matches_scan_and_hand_decode() {
+    let fixtures = repo_fixtures_dir();
+    let blf = fixtures.join("multi_channel.blf");
+    let dbc = fixtures.join("demo.dbc");
+    assert!(
+        blf.exists() && dbc.exists(),
+        "缺少 fixtures（multi_channel.blf / demo.dbc）：{}",
+        fixtures.display()
+    );
+    let bindings = [(1u32, dbc.clone()), (2u32, dbc.clone())];
+
+    // scan 的 frame_count（复用 scan_file 的真实实现）。
+    let dbc_map: BTreeMap<u32, PathBuf> = bindings.iter().cloned().collect();
+    let plan = DecodePlan::build(&dbc_map, &Selection::default()).expect("构建计划");
+    let scanned = fast_blf_core::scan_file(&blf, &plan, &|_p| {});
+    assert!(scanned.ok, "scan 应成功：{:?}", scanned.error);
+
+    let hand = hand_decode_stats(&blf, &bindings);
+
+    with_python(|py| -> PyResult<()> {
+        let config = series_config(py, &blf, &bindings, "relative_s", 2000)?;
+        let out = fast_blf_core::series_for_plot(py, &config)?;
+        assert!(out.get_item("ok")?.unwrap().extract::<bool>()?);
+
+        let rows = series_rows(&out)?;
+        // demo.dbc 的 5 条信号（VehSpd: Spd/SpdValid、BattTemp: Temp1/Temp2、Insulation: Res）
+        // 在 multi_channel.blf 里都有采样，不能被静默丢掉。
+        assert_eq!(rows.len(), 5, "应有 5 条有采样的信号：{rows:?}",);
+        let find = |message: &str, signal: &str| {
+            rows.iter()
+                .find(|r| r.message == message && r.signal == signal)
+                .unwrap_or_else(|| panic!("series 应含 {message}/{signal}"))
+        };
+
+        for (message, signal) in [
+            ("VehSpd", "Spd"),
+            ("BattTemp", "Temp1"),
+            ("Insulation", "Res"),
+        ] {
+            let row = find(message, signal);
+            let &(hand_count, hand_vmin, hand_vmax) = hand
+                .get(&(
+                    row_channel(message),
+                    message.to_string(),
+                    signal.to_string(),
+                ))
+                .unwrap_or_else(|| panic!("手算应含 {message}/{signal}"));
+            assert_eq!(
+                row.count, hand_count,
+                "{message}/{signal} 的 count 必须等于手算原始点数"
+            );
+
+            // scan 的 frame_count 是报文维度：同报文每帧对该信号贡献一个采样点。
+            let scanned_count = scanned
+                .frame_counts
+                .get(&(row_channel(message), frame_id_of(message)))
+                .copied()
+                .unwrap_or(0);
+            assert_eq!(
+                row.count, scanned_count,
+                "{message}/{signal} 的 count 必须等于 scan 的 frame_count"
+            );
+            assert!(
+                (row.vmin - hand_vmin).abs() <= 1e-9,
+                "{message}/{signal} vmin={} 手算={hand_vmin}",
+                row.vmin
+            );
+            assert!(
+                (row.vmax - hand_vmax).abs() <= 1e-9,
+                "{message}/{signal} vmax={} 手算={hand_vmax}",
+                row.vmax
+            );
+            // count 来自全量原始数据，而不是桶数。
+            assert!(row.t_len <= 2000, "返回点数必须 ≤ buckets");
+            assert!(
+                row.t_len as u64 <= row.count,
+                "非空桶数不可能超过原始采样点数"
+            );
+        }
+
+        // 定值抽查：Spd 第 i 帧原始值 = i，物理值 = i × 0.01。
+        let spd = find("VehSpd", "Spd");
+        assert_eq!(spd.count, 500);
+        assert!((spd.vmin - 0.0).abs() <= 1e-9);
+        assert!((spd.vmax - 4.99).abs() <= 1e-9);
+        assert!((spd.first - 0.0).abs() <= 1e-9);
+        assert!((spd.last - 4.99).abs() <= 1e-9);
+        let temp1 = find("BattTemp", "Temp1");
+        assert_eq!(temp1.count, 50);
+        assert!((temp1.vmin - (-10.0)).abs() <= 1e-9);
+        assert!((temp1.vmax - (-10.0)).abs() <= 1e-9);
+        assert!((temp1.first - (-10.0)).abs() <= 1e-9);
+        assert!((temp1.last - (-10.0)).abs() <= 1e-9);
+        let res = find("Insulation", "Res");
+        assert_eq!(res.count, 5);
+        assert!((res.vmin - 0.0).abs() <= 1e-9);
+        assert!((res.vmax - 4.0).abs() <= 1e-9);
+        assert!((res.first - 0.0).abs() <= 1e-9);
+        assert!((res.last - 4.0).abs() <= 1e-9);
+        // 恒为 0 的信号也必须保留（count 仍然来自全量原始数据）。
+        let spd_valid = find("VehSpd", "SpdValid");
+        assert_eq!(spd_valid.count, 500);
+        assert!((spd_valid.vmin - 0.0).abs() <= 1e-9);
+        assert!((spd_valid.vmax - 0.0).abs() <= 1e-9);
+        let temp2 = find("BattTemp", "Temp2");
+        assert_eq!(temp2.count, 50);
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// 已知 `demo.dbc` 报文名 → 通道号。
+fn row_channel(message: &str) -> u32 {
+    match message {
+        "VehSpd" | "BattTemp" => 1,
+        "Insulation" => 2,
+        other => panic!("未知报文 {other}"),
+    }
+}
+
+fn frame_id_of(message: &str) -> u32 {
+    match message {
+        "VehSpd" => 0x123,
+        "BattTemp" => 0x1A2,
+        "Insulation" => 0x200,
+        other => panic!("未知报文 {other}"),
+    }
+}
+
+/// Step 15 集成 2：`timefmt.blf` + `timefmt.dbc`，`time_format=absolute`。
+///
+/// 说明：任务书写的是 `fixtures/demo.dbc`，但 `demo.dbc` 里没有 `timefmt.blf` 的报文
+/// `TimeMsg(0x300)`，用它永远解不出数据、也就没有 `t[0]`；正确的绑定是 `fixtures/timefmt.dbc`。
+#[test]
+fn step15_series_timefmt_absolute() {
+    let fixtures = repo_fixtures_dir();
+    let blf = fixtures.join("timefmt.blf");
+    let dbc = fixtures.join("timefmt.dbc");
+    assert!(
+        blf.exists() && dbc.exists(),
+        "缺少 fixtures（timefmt.blf / timefmt.dbc）：{}",
+        fixtures.display()
+    );
+    let bindings = [(1u32, dbc.clone())];
+
+    with_python(|py| -> PyResult<()> {
+        let config = series_config(py, &blf, &bindings, "absolute", 2000)?;
+        let out = fast_blf_core::series_for_plot(py, &config)?;
+
+        let t_min: f64 = out.get_item("t_min")?.unwrap().extract()?;
+        let t_max: f64 = out.get_item("t_max")?.unwrap().extract()?;
+        assert!((t_min - 0.0).abs() < 1e-12, "absolute 的 t_min 应为 0");
+        assert!((t_max - 1.0).abs() < 1e-9, "t_max={t_max}");
+
+        let t_min_str: String = out
+            .get_item("t_min_str")?
+            .expect("absolute 必给 t_min_str")
+            .extract()?;
+        assert_eq!(t_min_str, "2025-10-16 14:10:00.123456");
+        let t_max_str: String = out
+            .get_item("t_max_str")?
+            .expect("absolute 必给 t_max_str")
+            .extract()?;
+        assert_eq!(t_max_str, "2025-10-16 14:10:01.123456");
+
+        let rows = series_rows(&out)?;
+        assert_eq!(rows.len(), 1, "timefmt 只有一条信号");
+        let row = &rows[0];
+        assert_eq!(row.count, 101);
+
+        // 契约 §1.3：t = 桶中心 = t_min + (idx + 0.5) * 桶宽；桶0 中心 = 0.5 * 1.0/2000。
+        // （任务书集成测试写的是 `t[0] == 0.0`，与 §1.3 的"桶中心"公式相互矛盾：
+        //   t_min 为 0 时桶0 中心必然是半个桶宽。这里按冻结契约的桶中心公式断言，
+        //   同时断言 t_min == 0.0 作为"横轴从最早时间开始"的口径。）
+        let list = out
+            .get_item("series")?
+            .unwrap()
+            .cast_into::<PyList>()?;
+        let first = list.get_item(0)?.cast_into::<PyDict>()?;
+        let t = first
+            .get_item("t")?
+            .unwrap()
+            .cast_into::<PyList>()?;
+        let t0: f64 = t.get_item(0)?.extract()?;
+        assert!(
+            (t0 - 0.00025).abs() < 1e-12,
+            "桶0 中心应为 0.5 * (1.0/2000) = 0.00025，实际 {t0}"
+        );
+
+        let axis = out
+            .get_item("t_axis")?
+            .expect("absolute 必给 t_axis")
+            .cast_into::<PyList>()?;
+        assert!(
+            (8..=12).contains(&axis.len()),
+            "t_axis 刻度数应在 8..12，实际 {}",
+            axis.len()
+        );
+        let mut labels = Vec::new();
+        let mut ticks = Vec::new();
+        for item in axis.iter() {
+            let d = item.cast_into::<PyDict>()?;
+            ticks.push(d.get_item("t")?.unwrap().extract::<f64>()?);
+            labels.push(d.get_item("label")?.unwrap().extract::<String>()?);
+        }
+        // 等间隔：首 0、末 t_max，相邻间隔一致。
+        assert!((ticks[0] - 0.0).abs() < 1e-12);
+        assert!((ticks[ticks.len() - 1] - 1.0).abs() < 1e-9);
+        let step = ticks[1] - ticks[0];
+        for pair in ticks.windows(2) {
+            assert!((pair[1] - pair[0] - step).abs() < 1e-9, "刻度必须等间隔");
+        }
+        // label 可复现：跨度 1s < 2s → 微秒级，逐刻度 = 首帧墙钟 + t。
+        assert_eq!(labels[0], "2025-10-16 14:10:00.123456");
+        assert_eq!(
+            labels[labels.len() - 1],
+            "2025-10-16 14:10:01.123456"
+        );
+        assert_eq!(labels[1], "2025-10-16 14:10:00.234567");
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// 粗粒度当前进程 RSS（KB）。macOS/Linux 的 `ps` 都支持 `-o rss=`；失败返回 `None`。
+fn current_rss_kb() -> Option<u64> {
+    let pid = std::process::id().to_string();
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+/// 从 fixtures 的 `*.expected.json` 读基准总帧数（避免为计时再扫一遍文件）。
+fn expected_total_frames(fixtures: &Path, blf: &Path) -> Option<u64> {
+    let stem = blf.file_stem()?.to_string_lossy().to_string();
+    let text = std::fs::read_to_string(fixtures.join(format!("{stem}.expected.json"))).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value.get("total_frames")?.as_u64()
+}
+
+/// Step 15 性能自证（`--ignored` 手动运行，避免 debug 下拖慢常规 `cargo test`）。
+///
+/// 命令：
+/// `cargo test --release -p fast_blf_core --test e2e_synthetic -- --ignored --nocapture step15_series_bench_huge_perf`
+///
+/// 验收线：187MB `bench_huge.blf` 上 `series_for_plot(buckets=2000)` ≤ 15 秒，
+/// 且返回点数 ≤ `2000 × 信号数`、远小于原始采样点数。
+#[test]
+#[ignore = "性能自证：需 release + 大文件，手动用 --ignored --nocapture 运行"]
+fn step15_series_bench_huge_perf() {
+    let fixtures = repo_fixtures_dir();
+    let huge = fixtures.join("bench_huge.blf");
+    let large = fixtures.join("bench_large.blf");
+    let blf = if huge.exists() { huge } else { large };
+    let dbc = fixtures.join("bench.dbc");
+    assert!(blf.exists(), "缺少 bench_huge.blf / bench_large.blf");
+    assert!(dbc.exists(), "缺少 bench.dbc");
+    let size_bytes = std::fs::metadata(&blf).map(|m| m.len()).unwrap_or(0);
+    let expected_frames = expected_total_frames(&fixtures, &blf);
+
+    // 22 条报文分散在 Ch1/Ch2/Ch3，全部绑同一份 bench.dbc。
+    let bindings = [
+        (1u32, dbc.clone()),
+        (2u32, dbc.clone()),
+        (3u32, dbc.clone()),
+    ];
+
+    with_python(|py| -> PyResult<()> {
+        let config = series_config(py, &blf, &bindings, "relative_s", 2000)?;
+        let rss_before = current_rss_kb();
+        let started = std::time::Instant::now();
+        let out = fast_blf_core::series_for_plot(py, &config)?;
+        let elapsed = started.elapsed();
+        let rss_after = current_rss_kb();
+
+        let rows = series_rows(&out)?;
+        let total_points: usize = rows.iter().map(|r| r.t_len).sum();
+        let raw_points: u64 = rows.iter().map(|r| r.count).sum();
+        let max_points = 2000usize.saturating_mul(rows.len());
+
+        // 计时之后再做一次轻量扫描，得到权威的"实际总帧数"（不计入 series_for_plot 耗时）。
+        let dbc_map: BTreeMap<u32, PathBuf> = bindings.iter().cloned().collect();
+        let plan = DecodePlan::build(&dbc_map, &Selection::default()).expect("构建计划");
+        let planned_signals: usize = plan.messages().map(|m| m.signals.len()).sum();
+        let scanned = fast_blf_core::scan_file(&blf, &plan, &|_p| {});
+        let actual_frames: u64 = scanned.frame_counts.values().sum();
+        let warning_count = out
+            .get_item("warnings")?
+            .expect("返回值必须含 warnings")
+            .cast_into::<PyList>()?
+            .len();
+
+        println!("=== Step 15 series_for_plot 性能自证 ===");
+        println!("文件              : {} ({} 字节)", blf.display(), size_bytes);
+        println!(
+            "总帧数(实际 scan) : {actual_frames}（expected.json={}）",
+            expected_frames
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "未找到".to_string())
+        );
+        println!(
+            "信号数            : {} 有采样 / {} DBC 定义",
+            rows.len(),
+            planned_signals
+        );
+        println!("warnings 条数     : {warning_count}");
+        println!("总耗时            : {:.3} s", elapsed.as_secs_f64());
+        match (rss_before, rss_after) {
+            (Some(before), Some(after)) => {
+                println!("峰值内存(粗粒度)  : before={before} KB / after={after} KB");
+            }
+            _ => {
+                // 本机沙箱禁止 `ps`（Operation not permitted），无法读 RSS；给理论上界。
+                // 解码期累加器按**全部计划信号**分配：信号数 × buckets × 32B（4 个 f64/u64）。
+                let accum_bytes = planned_signals * 2000 * 32;
+                println!(
+                    "峰值内存          : 无法测量（沙箱禁用 `ps`）；解码期累加器理论上界 = {planned_signals}×2000×32B ≈ {:.1} MB",
+                    accum_bytes as f64 / (1024.0 * 1024.0)
+                );
+            }
+        }
+        println!("原始采样点数(信号和): {raw_points}");
+        println!(
+            "返回给 Python 的总点数: {total_points} (上限 2000×{}={max_points})",
+            rows.len()
+        );
+        println!(
+            "抽稀比            : {:.6}% (返回/原始)",
+            if raw_points == 0 {
+                0.0
+            } else {
+                100.0 * total_points as f64 / raw_points as f64
+            }
+        );
+
+        assert!(
+            total_points <= max_points,
+            "返回点数 {total_points} 必须 ≤ 2000 × 信号数 {max_points}"
+        );
+        assert!(
+            (total_points as u64) < raw_points,
+            "返回点数必须远小于原始采样点数"
+        );
+        assert!(
+            elapsed.as_secs_f64() <= 15.0,
+            "187MB 文件 series_for_plot 必须 ≤ 15s，实际 {:.3}s",
+            elapsed.as_secs_f64()
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
 

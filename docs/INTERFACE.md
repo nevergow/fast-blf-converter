@@ -105,7 +105,7 @@ config 字段（在 `convert` 的 config 之上）：
 | `dbc_by_channel` | `dict[int, str]` | 同 `convert` |
 | `selected` | `dict[str, dict[str, list[str]]]` | 同 `convert`（只处理选中的信号） |
 | `time_format` | `str` | 时间轴口径，与导出口径**完全一致**的取值（`relative_s`/`relative_ms`/`absolute`/`unix_s`）。**但返回的 `t` 永远是 float 秒**：`relative_s`→相对秒、`relative_ms`→**秒**（不要返回毫秒，避免两处口径打架）、`unix_s`→epoch 秒、`absolute`→**相对秒**（0 = 全局最早时间戳），同时必须给出 `t_min_str`/`t_max_str`（`YYYY-MM-DD HH:MM:SS.ffffff`，BLF 头墙钟，不换时区）与刻度标签数组（见下） |
-| `buckets` | `int` | 抽稀桶数（屏幕像素宽度量级）。默认 `2000`，允许 `100..20000`，越界报 `CONFIG_INVALID` |
+| `buckets` | `int` | 抽稀桶数（屏幕像素宽度量级）。默认 `2000`，允许 `100..20000`，越界报 `BAD_CONFIG`（错误码以 §4 的稳定清单为准：本文件曾误写为 `CONFIG_INVALID`，已更正） |
 | `temp_dir` | `str` | 临时目录（复用 convert 语义） |
 
 返回值：
