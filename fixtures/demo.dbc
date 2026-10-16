@@ -1,0 +1,12 @@
+VERSION ""
+
+BO_ 291 VehSpd: 8 Vector__XXX
+ SG_ Spd : 0|16@1+ (0.01,0) [0|0] "km/h" Vector__XXX
+ SG_ SpdValid : 16|1@1+ (1,0) [0|0] "" Vector__XXX
+
+BO_ 418 BattTemp: 8 Vector__XXX
+ SG_ Temp1 : 7|8@0- (1,0) [0|0] "degC" Vector__XXX
+ SG_ Temp2 : 4|12@0+ (1,0) [0|0] "" Vector__XXX
+
+BO_ 512 Insulation: 8 Vector__XXX
+ SG_ Res : 0|32@1+ (1,0) [0|0] "Ohm" Vector__XXX

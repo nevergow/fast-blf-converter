@@ -1,0 +1,11 @@
+# 本机开发配置（macOS）。Windows 打包不走这里（build_windows_portable.bat 自带环境）。
+#
+# 为什么需要这几行：
+#   本项目的 pyo3 链接 anaconda 的 Python（/opt/anaconda3）。`cargo test` 生成的测试二进制
+#   会链接 libpython3.12.dylib，而它的 @rpath 里没有 anaconda 的 lib 目录，
+#   于是 dyld 报 "Library not loaded: @rpath/libpython3.12.dylib" 并 SIGABRT。
+#   conda 激活的登录 shell 之所以能跑通，是因为 conda 设了 DYLD_FALLBACK_LIBRARY_PATH。
+#   这里用 cargo 的 [env] 显式补上，保证任何非交互 shell 里 `cargo test` 都能直接跑。
+[env]
+DYLD_FALLBACK_LIBRARY_PATH = "/opt/anaconda3/lib"
+PYO3_PYTHON = "/opt/anaconda3/bin/python3"

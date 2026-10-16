@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
+
+[project]
+name = "fast-blf-converter"
+description = "Fast BLF Converter — BLF 高速多通道批量解码与分析导出器"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["PySide6>=6.6"]
+dynamic = ["version"]
+
+[tool.maturin]
+manifest-path = "crates/fast_blf_core/Cargo.toml"
+module-name = "fast_blf_core"
+features = ["extension-module"]
+strip = true

@@ -1,0 +1,18 @@
+[workspace]
+members = ["crates/fast_blf_core"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Neil"]
+
+# panic 必须保持 unwind：PyO3 依赖 unwinding 把 Rust panic 转成 Python 异常。
+# 若改成 abort，任何一次 panic 都会直接杀掉整个 GUI 进程。
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+panic = "unwind"
+strip = "debuginfo"
