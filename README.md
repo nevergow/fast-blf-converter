@@ -87,6 +87,32 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python gui/main.py --selftest
 
 ## Windows 绿色版打包
 
+### 方式 A（推荐）：让 GitHub 帮你编（不需要装任何工具链）
+
+仓库里的 `.github/workflows/build-windows.yml` 在 **真 Windows 机器**上构建，产出可直接用的绿色 zip：
+
+```bash
+# 手动触发（也可在 GitHub 网页 Actions 页点 "Run workflow"）
+gh workflow run build-windows.yml --ref main
+
+# 等构建完成后下载产物
+gh run list --workflow=build-windows.yml --limit 1
+gh run download <run-id> -n FastBLFConverter-portable-windows -D ./ci-out
+```
+
+产物：`FastBLFConverter-portable.zip`（约 **72 MB** 压缩 / 207 MB 解压），解压后在任意目录双击 `FastBLFConverter.exe` 即可。
+
+- 工作流只在**手动触发**或**打 `v*` tag** 时运行 —— 不在每次 push 时跑，避免消耗 Actions 分钟。
+- 构建含**真实验收**：装 wheel 后跑 `import fast_blf_core`，打包后直接跑 `FastBLFConverter.exe --selftest`，
+  并断言输出里出现内核版本号 + `_internal/gui/theme.qss` 存在，任一不满足即红灯。
+- **私有仓库的 artifact 需要登录 GitHub 才能下载**；办公电脑若不能登录，就在能登录的机器上下好再带过去。
+
+> 已知小瑕疵：PowerShell `Compress-Archive` 写中文条目名（`使用说明.txt`）时不设 UTF-8 标志，
+> 非 Windows 解压工具（macOS `unzip` 等）会显示乱码并可能中断。Windows 资源管理器 / 7-Zip 正常。
+> 若要在非 Windows 环境解压，可用 Python：`python -c "import zipfile;zipfile.ZipFile('...zip').extractall()"`。
+
+### 方式 B：在 Windows 本机构建
+
 ```
 build_windows_portable.bat
 ```
