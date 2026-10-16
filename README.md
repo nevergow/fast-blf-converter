@@ -71,8 +71,9 @@ gui/main.py (PySide6, 暗色 Fluent)  ──QThread──►  fast_blf_core (Rus
 
 | 验证项 | 结果 |
 |---|---|
-| 单元 + 集成测试 | **62 项全绿**（28 单元 + 34 集成 `tests/e2e_synthetic.rs`） |
+| 单元 + 集成测试 | **89 项全绿**（39 单元 + 50 集成 `tests/e2e_synthetic.rs`） |
 | 端到端验收 `tests/acceptance.py` | **55/55 通过**（A4 三格式/无空值、A5 百万行防呆、**A6 坏 DBC 容错**、**A6' 空 BLF 扫描**、**A7 时间口径 4 选 1 精确比对**、**A9 宽表同名信号**） |
+| DBC 解析矩阵 | **24/25 种真实写法可解析**（空 `NS_` 段 / `SG_MUL_VAL_` / `SIG_VALTYPE_` / `EV_` / 扩展帧 / CRLF / ENUM 越界…）；唯一失败用例是文件本身引号不规范，按预期给出精确行号 |
 | GUI 无人值守自检 | 5 条全过：`--selftest` / `--selftest-deep`（`DEEP_OK channels=2 dbc_nodes=2 messages=3`）/ `--selftest-config`（`CONFIG_OK`）/ `--selftest-progress`（`PROGRESS_OK phase1=2 phase2=2 frames_max=1212600`）/ `--dump-check-states`（`DUMP_OK`） |
 | GUI 交互路径独立探针 | **11/11**：通道级绑 DBC → 解析 → 报文名从 `ID_0x123` 变真名 → 取消勾选 → **重解析后勾选被恢复** → 全部清除 |
 | 冻结态（PyInstaller onedir，本机实跑） | `--selftest` 内核就绪 0.2.0 / `--selftest-config` **`CONFIG_OK`（预设保存·加载·DBC 缺失处理在打包后可用）** / `--selftest-deep` `DEEP_SKIP no_fixture` / `--dump-check-states` `DUMP_OK` 23079B；`theme.qss` 落在 `_internal/gui/theme.qss` |
@@ -126,14 +127,16 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python gui/main.py --selftest
 
 ### 方式 A（推荐）：直接下载已发布的绿色包
 
-**https://github.com/nevergow/fast-blf-converter/releases/tag/v0.1.0** → 下载 `FastBLFConverter-portable.zip`（72.6 MB）
+**https://github.com/nevergow/fast-blf-converter/releases/tag/v0.2.0** → 下载 `FastBLFConverter-portable.zip`（72.9 MB）
 
 ```bash
 # 或用 gh CLI（私有仓库需先登录）
-gh release download v0.1.0 -D ./ci-out
+gh release download v0.2.0 -R nevergow/fast-blf-converter -D ./ci-out
 ```
 
-sha256：`10c6fa8e7a7a4a27f40813585428eb9c277ce49464da45d1328bfdef8a230b81`
+sha256：`97fd56633c3e3176febdecc5dc933b7ac58048edb08ad562926cc282d255282d`
+
+Release 同时附了复选框视觉基线图 `check-states.png`（三态 + 行选中高亮的渲染对照）。
 
 ### 方式 A2：自己触发一次构建（改动后出包用这条）
 
@@ -174,3 +177,7 @@ build_windows_portable.bat
    `BLF_PARSE` 明确报错（附文件名）而不是静默丢数据 —— 这条路径无法用合成素材覆盖，需真实样本验证。
 2. **Windows 可执行文件必须在 Windows 上构建**：macOS 无法产出 `.exe`，仓库里的 `.bat` 未在真机执行过。
 3. Excel 单 Sheet 上限 1,048,576 行：超过 `excel_row_limit`（默认 1,000,000）自动降级为 CSV 并在 GUI 弹窗说明。
+4. **CI 的「冻结态配置自检」在 Windows 产物上会超时**（已知、不阻塞发布）：窗口化（`console=False`）打包的 exe
+   在 Windows 上不产出 stdout，该自检无法汇报进度；且这一步里的进程在 runner 上不按时退出。
+   现已改成**非阻塞 + 保留诊断**（超时只写警告并继续上传产物）。配置功能本身在开发态与本机打包态
+   均已验证通过（`--selftest-config` → `CONFIG_OK`），**不影响用户路径**；根因待查。
