@@ -35,7 +35,12 @@ a = Analysis(
     binaries=[],
     # 把 theme.qss 放进产物的 gui/ 子目录：与开发态 ``gui/theme.qss`` 相对路径一致，
     # gui/main.py 里的 resolve_theme_path() 无需分支即可同时命中两种形态。
-    datas=[(str(ROOT / "gui" / "theme.qss"), "gui")],
+    # gui/assets/ 一并收进去（v0.3 的离线 HTML 报告要内嵌里面的 echarts.min.js）：
+    # 冻结态缺失该文件时报告会失败，所以必须在打包期就带上。
+    datas=[
+        (str(ROOT / "gui" / "theme.qss"), "gui"),
+        (str(ROOT / "gui" / "assets"), "gui/assets"),
+    ],
     # 内核是延迟导入（运行时 try/except import），静态分析抓不到，必须显式声明。
     hiddenimports=[
         "fast_blf_core",
