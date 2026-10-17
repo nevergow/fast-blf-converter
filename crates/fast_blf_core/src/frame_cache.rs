@@ -73,7 +73,7 @@ pub struct CachedMessageMeta {
     pub is_fd: bool,
 }
 
-/// `meta.json`：版本、文件清单、DBC 哈希、报文集合、时间范围、生成时间、总字节。
+/// `meta.json`：版本、文件清单、DBC 哈希、已存在段清单、时间范围、生成时间、总字节。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheMeta {
     pub format_version: String,
@@ -81,7 +81,7 @@ pub struct CacheMeta {
     /// DBC 内容指纹（sha256 十六进制）；与 key 里的同一份指纹一致。
     #[serde(default)]
     pub dbc_hash: String,
-    /// 报文集合 `(channel, frame_id)`（排序、去重）。
+    /// 已存在段 `(channel, frame_id)` 的派生清单（排序、去重）；不参与 key 计算。
     #[serde(default)]
     pub message_set: Vec<(u32, u32)>,
     /// Unix 毫秒；LRU 按它从旧到新删。
@@ -149,7 +149,13 @@ pub struct CacheOptions<'a> {
 pub struct CacheOpen {
     pub dir: PathBuf,
     pub meta: CacheMeta,
+    /// 本次 `selected` 需要的段是否全部已存在（true 时不读 BLF、不建段）。
     pub cache_hit: bool,
+    /// 本次打开因目录超预算而 LRU 删除的其它 key 字节数。
+    pub evicted_bytes: u64,
+    /// 本次 `selected` 需要、但当前 key 目录里尚不存在的报文 `(channel, frame_id)`。
+    /// 调用方必须把它们转后台预取，**不得**在 `open` 里同步建段。
+    pub missing: Vec<(u32, u32)>,
 }
 
 /// 校验 `cache_budget_mb`；越界按 §4 的稳定错误码 `BAD_CONFIG` 返回
@@ -165,6 +171,12 @@ pub fn validate_budget(budget_mb: u64) -> Result<(), CoreError> {
 }
 
 /// 打开（命中）或建立帧缓存。
+///
+/// 语义（契约 §1.4）：
+/// * key 只由数据源（BLF 路径/size/mtime + DBC 内容）决定，与本次 `selected` 无关；
+/// * `selected` 需要的段全部已存在 → 立即命中（不读 BLF）；
+/// * 只缺一部分 → **立即返回**，缺失段由调用方转后台预取；
+/// * 当前 key 目录完全不存在（首次构建）→ 同步扫描、估算预算并建本次需要的段。
 pub fn open_cache(
     options: &CacheOptions<'_>,
     messages: &[&MessagePlan],
@@ -181,23 +193,59 @@ pub fn open_cache(
         )
     })?;
 
-    let key = compute_cache_key(options.blf_paths, options.dbc_by_channel, messages)?;
+    let key = compute_cache_key(options.blf_paths, options.dbc_by_channel)?;
     let dir = options.cache_dir.join(&key);
     let required: BTreeSet<(u32, u32)> = messages
         .iter()
         .map(|message| (message.channel, message.frame_id))
         .collect();
 
-    if let Some(meta) = load_matching_meta(&dir, &key, &required) {
-        enforce_lru(options.cache_dir, options.budget_mb, &key);
-        return Ok(CacheOpen {
-            dir,
-            meta,
-            cache_hit: true,
-        });
+    if let Some((mut meta, pruned)) = load_existing_meta(&dir, &key) {
+        let existing: BTreeSet<(u32, u32)> = meta
+            .messages
+            .iter()
+            .map(|message| (message.channel, message.frame_id))
+            .collect();
+        let missing: Vec<(u32, u32)> = required.difference(&existing).copied().collect();
+        if pruned {
+            meta.cache_bytes = directory_bytes(&dir);
+            write_meta(&dir, &meta)?;
+        }
+        if missing.is_empty() {
+            let (evicted, deleted) = enforce_lru(options.cache_dir, options.budget_mb, &key);
+            if evicted > 0 {
+                meta.warnings
+                    .push(lru_warning(evicted, &deleted, options.budget_mb));
+                write_meta(&dir, &meta)?;
+            }
+            return Ok(CacheOpen {
+                dir,
+                meta,
+                cache_hit: true,
+                evicted_bytes: evicted,
+                missing: Vec::new(),
+            });
+        }
+        // 已经付过磁盘代价的段继续可用；缺失段交给后台预取，open 不等待。
+        if !meta.messages.is_empty() {
+            let (evicted, deleted) = enforce_lru(options.cache_dir, options.budget_mb, &key);
+            if evicted > 0 {
+                meta.warnings
+                    .push(lru_warning(evicted, &deleted, options.budget_mb));
+                write_meta(&dir, &meta)?;
+            }
+            return Ok(CacheOpen {
+                dir,
+                meta,
+                cache_hit: false,
+                evicted_bytes: evicted,
+                missing,
+            });
+        }
+        // meta 存在但没有任何有效段（例如上次建段中断）：按首次构建处理。
     }
 
-    // 先扫描：得到帧数（预算估算）与文件级首次 FD 标志。
+    // 首次构建：扫描 → 估算 → 落盘本次 selected 需要的段。
     let scan = scan_inputs(
         options.blf_paths,
         options.dbc_by_channel,
@@ -227,34 +275,42 @@ pub fn open_cache(
         false,
         None,
     )?;
-    // 初始建缓存：meta 只描述本次 selected 的报文；已预取的额外段保留在磁盘上但不列出。
     meta.created_at = now_millis();
     meta.key = key.clone();
     meta.dbc_hash = dbc_fingerprint(options.dbc_by_channel);
     meta.message_set = required.iter().copied().collect();
     meta.files = scan.files.clone();
     meta.warnings.extend(scan.warnings.clone());
+    meta.cache_bytes = 0;
     write_meta(&dir, &meta)?;
+
+    let (evicted, deleted) = enforce_lru(options.cache_dir, options.budget_mb, &key);
+    if evicted > 0 {
+        meta.warnings
+            .push(lru_warning(evicted, &deleted, options.budget_mb));
+    }
     meta.cache_bytes = directory_bytes(&dir);
     write_meta(&dir, &meta)?;
 
-    enforce_lru(options.cache_dir, options.budget_mb, &key);
     Ok(CacheOpen {
         dir,
         meta,
         cache_hit: false,
+        evicted_bytes: evicted,
+        missing: Vec::new(),
     })
 }
 
 /// 增量预取：只把 `messages` 中尚未缓存的报文写入同一个 key 目录。
 ///
-/// 返回更新后的 meta。调用方需保证 `key` 是当前会话的 key。
+/// 返回 `(更新后的 meta, 本次 LRU 删除的其它 key 字节数)`。
+/// 调用方需保证 `key` 是当前会话的 key。
 pub fn prefetch_cache(
     options: &CacheOptions<'_>,
     key: &str,
     messages: &[&MessagePlan],
     progress: &dyn Fn(Progress),
-) -> Result<CacheMeta, CoreError> {
+) -> Result<(CacheMeta, u64), CoreError> {
     validate_budget(options.budget_mb)?;
     let dir = options.cache_dir.join(key);
     let mut meta = read_meta(&dir)?;
@@ -271,7 +327,14 @@ pub fn prefetch_cache(
         .filter(|message| !meta.has_message(message.channel, message.frame_id))
         .collect();
     if missing.is_empty() {
-        return Ok(meta);
+        let (evicted, deleted) = enforce_lru(options.cache_dir, options.budget_mb, key);
+        if evicted > 0 {
+            meta.warnings
+                .push(lru_warning(evicted, &deleted, options.budget_mb));
+            meta.cache_bytes = directory_bytes(&dir);
+            write_meta(&dir, &meta)?;
+        }
+        return Ok((meta, evicted));
     }
 
     let required: BTreeSet<(u32, u32)> = missing
@@ -286,12 +349,9 @@ pub fn prefetch_cache(
         progress,
     )?;
     let (need_bytes, strides) = estimate_bytes(&missing, &scan);
-    let existing = directory_bytes(&dir);
-    if existing.saturating_add(need_bytes) > options.budget_mb.saturating_mul(MIB) {
-        return Err(budget_error(
-            existing.saturating_add(need_bytes),
-            options.budget_mb,
-        ));
+    // 估算闸门只看“本次新增需要”的字节；已存在的段不再计入。
+    if need_bytes > options.budget_mb.saturating_mul(MIB) {
+        return Err(budget_error(need_bytes, options.budget_mb));
     }
 
     let additions = build_segments(
@@ -312,6 +372,7 @@ pub fn prefetch_cache(
         .iter()
         .map(|message| (message.channel, message.frame_id))
         .collect();
+    meta.warnings.extend(additions.warnings);
     meta.warnings.extend(scan.warnings);
     if scan.raw_min.is_finite() {
         meta.t_min = meta.t_min.min(scan.raw_min);
@@ -329,11 +390,14 @@ pub fn prefetch_cache(
             };
         }
     }
-    write_meta(&dir, &meta)?;
+    let (evicted, deleted) = enforce_lru(options.cache_dir, options.budget_mb, key);
+    if evicted > 0 {
+        meta.warnings
+            .push(lru_warning(evicted, &deleted, options.budget_mb));
+    }
     meta.cache_bytes = directory_bytes(&dir);
     write_meta(&dir, &meta)?;
-    enforce_lru(options.cache_dir, options.budget_mb, key);
-    Ok(meta)
+    Ok((meta, evicted))
 }
 
 /// 读 `meta.json`。
@@ -367,19 +431,26 @@ pub fn dbc_fingerprint(dbc_by_channel: &BTreeMap<u32, PathBuf>) -> String {
     hex(&hasher.finish())
 }
 
-/// 缓存 key：sha256(绝对路径+size+mtime ‖ DBC 内容哈希 ‖ 报文集合 ‖ 格式版本)。
+/// 缓存 key：sha256(格式版本 ‖ 按路径排序的 [绝对路径, size, mtime] ‖ DBC 内容哈希)。
+///
+/// **不含 `selected` / 报文集合**：同一批数据源无论用户勾了哪些信号，key 都相同；
+/// 报文段在同一个 key 目录内按需累积。
 pub fn compute_cache_key(
     blf_paths: &[PathBuf],
     dbc_by_channel: &BTreeMap<u32, PathBuf>,
-    messages: &[&MessagePlan],
 ) -> Result<String, CoreError> {
+    let mut sources: Vec<SourceFileMeta> = Vec::with_capacity(blf_paths.len());
+    for path in blf_paths {
+        let (_, meta) = source_identity(path)?;
+        sources.push(meta);
+    }
+    sources.sort_by(|left, right| left.path.cmp(&right.path));
+
     let mut hasher = Sha256::new();
     hasher.update(CACHE_FORMAT_VERSION.as_bytes());
     hasher.update(&[0]);
-
-    for path in blf_paths {
-        let (absolute, meta) = source_identity(path)?;
-        hasher.update(absolute.as_os_str().to_string_lossy().as_bytes());
+    for meta in &sources {
+        hasher.update(meta.path.as_bytes());
         hasher.update(&[0]);
         hasher.update(&meta.size.to_le_bytes());
         hasher.update(&meta.mtime_secs.to_le_bytes());
@@ -387,31 +458,7 @@ pub fn compute_cache_key(
         hasher.update(&[0xff]);
     }
     hasher.update(b"DBC");
-    for (channel, path) in dbc_by_channel {
-        hasher.update(&channel.to_le_bytes());
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                hasher.update(&(bytes.len() as u64).to_le_bytes());
-                hasher.update(&bytes);
-            }
-            Err(err) => {
-                hasher.update(b"<missing>");
-                hasher.update(err.to_string().as_bytes());
-            }
-        }
-        hasher.update(&[0xff]);
-    }
-    hasher.update(b"MSGS");
-    let mut set: Vec<(u32, u32)> = messages
-        .iter()
-        .map(|message| (message.channel, message.frame_id))
-        .collect();
-    set.sort_unstable();
-    set.dedup();
-    for (channel, frame_id) in set {
-        hasher.update(&channel.to_le_bytes());
-        hasher.update(&frame_id.to_le_bytes());
-    }
+    hasher.update(dbc_fingerprint(dbc_by_channel).as_bytes());
     Ok(hex(&hasher.finish()))
 }
 
@@ -910,37 +957,62 @@ fn sort_segment(path: &Path, stride: usize, frames: u64) -> Result<(), CoreError
 // 命中、预算与 LRU
 // ---------------------------------------------------------------------------
 
-fn load_matching_meta(dir: &Path, key: &str, required: &BTreeSet<(u32, u32)>) -> Option<CacheMeta> {
-    let meta = read_meta(dir).ok()?;
+/// 读取当前 key 的 meta；与 key/格式版本不匹配时视为没有缓存。
+///
+/// 会剔除磁盘上已丢失或长度与 `frames * stride` 不一致的段描述（部分损坏不拖垮整份缓存）。
+/// 返回 `(meta, 是否有段被剔除)`。
+fn load_existing_meta(dir: &Path, key: &str) -> Option<(CacheMeta, bool)> {
+    let mut meta = read_meta(dir).ok()?;
     if meta.key != key || meta.format_version != CACHE_FORMAT_VERSION {
         return None;
     }
-    for (channel, frame_id) in required {
-        let message = meta.message(*channel, *frame_id)?;
-        let expected = message.frames.saturating_mul(message.stride as u64);
-        let actual = std::fs::metadata(message.path(dir)).ok()?.len();
-        if actual != expected {
-            return None;
-        }
+    let before = meta.messages.len();
+    meta.messages
+        .retain(|message| segment_is_valid(dir, message));
+    let pruned = meta.messages.len() != before;
+    if pruned {
+        meta.messages
+            .sort_by_key(|message| (message.channel, message.frame_id));
+        meta.message_set = meta
+            .messages
+            .iter()
+            .map(|message| (message.channel, message.frame_id))
+            .collect();
     }
-    // 缓存里已有的每个段都必须完整，否则宁可重建。
-    for message in &meta.messages {
-        let expected = message.frames.saturating_mul(message.stride as u64);
-        let actual = std::fs::metadata(message.path(dir)).ok()?.len();
-        if actual != expected {
-            return None;
-        }
-    }
-    Some(meta)
+    Some((meta, pruned))
 }
 
-fn enforce_lru(cache_dir: &Path, budget_mb: u64, current_key: &str) {
+fn segment_is_valid(dir: &Path, message: &CachedMessageMeta) -> bool {
+    if message.stride as usize != CLASSIC_STRIDE && message.stride as usize != FD_STRIDE {
+        return false;
+    }
+    let Ok(metadata) = std::fs::metadata(message.path(dir)) else {
+        return false;
+    };
+    metadata.is_file() && metadata.len() == message.frames.saturating_mul(message.stride as u64)
+}
+
+fn lru_warning(evicted: u64, deleted: &[String], budget_mb: u64) -> String {
+    if deleted.is_empty() {
+        format!("缓存目录超过 {budget_mb} MiB 上限，LRU 已删除 {evicted} 字节的其它 key")
+    } else {
+        format!(
+            "缓存目录超过 {budget_mb} MiB 上限，LRU 已删除 {} 字节的其它 key（{}）",
+            evicted,
+            deleted.join("、")
+        )
+    }
+}
+
+/// 目录上限：总字节超预算时按 `created_at` 从旧到新删**其它** key，绝不删当前 key。
+/// 返回 `(删除的字节数, 被删除的 key 列表)`。
+fn enforce_lru(cache_dir: &Path, budget_mb: u64, current_key: &str) -> (u64, Vec<String>) {
     let budget = budget_mb.saturating_mul(MIB);
     let Ok(entries) = std::fs::read_dir(cache_dir) else {
-        return;
+        return (0, Vec::new());
     };
     let mut total: u64 = 0;
-    let mut removable: Vec<(u64, PathBuf, u64)> = Vec::new();
+    let mut removable: Vec<(u64, PathBuf, u64, String)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -953,14 +1025,16 @@ fn enforce_lru(cache_dir: &Path, budget_mb: u64, current_key: &str) {
             continue;
         }
         if let Ok(meta) = read_meta(&path) {
-            removable.push((meta.created_at, path, bytes));
+            removable.push((meta.created_at, path, bytes, name));
         }
     }
     if total <= budget {
-        return;
+        return (0, Vec::new());
     }
-    removable.sort_by_key(|(created_at, _, _)| *created_at);
-    for (_, path, bytes) in removable {
+    removable.sort_by_key(|(created_at, _, _, _)| *created_at);
+    let mut evicted = 0u64;
+    let mut deleted = Vec::new();
+    for (_, path, bytes, name) in removable {
         if total <= budget {
             break;
         }
@@ -969,8 +1043,11 @@ fn enforce_lru(cache_dir: &Path, budget_mb: u64, current_key: &str) {
         let different_key = path.file_name().and_then(|name| name.to_str()) != Some(current_key);
         if direct_child && different_key && std::fs::remove_dir_all(&path).is_ok() {
             total = total.saturating_sub(bytes);
+            evicted = evicted.saturating_add(bytes);
+            deleted.push(name);
         }
     }
+    (evicted, deleted)
 }
 
 fn directory_bytes(dir: &Path) -> u64 {
@@ -1434,7 +1511,9 @@ mod tests {
             std::fs::write(key_dir.join("ch1_id1.bin"), [0u8; 8]).expect("写入数据");
             write_meta(&key_dir, &fake_meta(name, created_at)).expect("写 meta");
         }
-        enforce_lru(dir.path(), 0, "current");
+        let (evicted, deleted) = enforce_lru(dir.path(), 0, "current");
+        assert!(evicted > 0, "必须回报删除字节数");
+        assert_eq!(deleted.len(), 2, "应删除两个旧 key：{deleted:?}");
         assert!(!dir.path().join("old").exists(), "最旧的 key 应被删");
         assert!(!dir.path().join("middle").exists(), "次旧的 key 应被删");
         assert!(

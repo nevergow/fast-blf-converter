@@ -142,6 +142,8 @@ struct SessionState {
     meta: CacheMeta,
     dir: PathBuf,
     cache_hit: bool,
+    /// 本会话（open + 后台预取）因目录上限 LRU 删除的其它 key 字节数。
+    evicted_bytes: u64,
     active: BTreeSet<String>,
     pyramids: HashMap<String, Arc<PyramidEntry>>,
     time_format: TimeFormat,
@@ -532,6 +534,8 @@ pub fn open_session(
         .and_then(|name| name.to_str())
         .unwrap_or_default()
         .to_string();
+    let missing = opened.missing.clone();
+    let evicted_bytes = opened.evicted_bytes;
 
     let mut warnings: Vec<String> = dbc_errors
         .iter()
@@ -559,6 +563,7 @@ pub fn open_session(
         meta: opened.meta,
         dir: opened.dir,
         cache_hit: opened.cache_hit,
+        evicted_bytes,
         active: BTreeSet::new(),
         pyramids: HashMap::new(),
         time_format: config.time_format,
@@ -568,19 +573,30 @@ pub fn open_session(
         closed: false,
     };
 
-    Ok(PlotSession {
-        inner: Arc::new(SessionInner {
-            state: Mutex::new(state),
-            cache_dir: config.cache_dir,
-            key,
-            blf_paths: config.blf_paths,
-            dbc_by_channel: config.dbc_by_channel,
-            budget_mb: config.cache_budget_mb,
-            catalog,
-            catalog_by_key,
-            messages,
-        }),
-    })
+    let inner = Arc::new(SessionInner {
+        state: Mutex::new(state),
+        cache_dir: config.cache_dir,
+        key,
+        blf_paths: config.blf_paths,
+        dbc_by_channel: config.dbc_by_channel,
+        budget_mb: config.cache_budget_mb,
+        catalog,
+        catalog_by_key,
+        messages,
+    });
+
+    // 部分命中：open 已立即返回；缺失段转后台预取（不阻塞调用方）。
+    if !missing.is_empty() {
+        {
+            let mut state = inner.lock_state();
+            for message_key in missing {
+                state.prefetch_queue.insert(message_key);
+            }
+        }
+        start_prefetch(Arc::clone(&inner));
+    }
+
+    Ok(PlotSession { inner })
 }
 
 // ---------------------------------------------------------------------------
@@ -638,6 +654,7 @@ impl PlotSession {
         )?;
         out.set_item("cache_bytes", state.meta.cache_bytes)?;
         out.set_item("cache_hit", state.cache_hit)?;
+        out.set_item("evicted_bytes", state.evicted_bytes)?;
 
         let signals = PyList::empty(py);
         for signal in &self.inner.catalog {
@@ -650,6 +667,8 @@ impl PlotSession {
                 "cached",
                 state.meta.has_message(signal.channel, signal.frame_id),
             )?;
+            // 全链路唯一标识，与 stats/add_signals/remove_signals 入参一致。
+            item.set_item("key", &signal.key)?;
             signals.append(item)?;
         }
         out.set_item("signals", signals)?;
@@ -1333,10 +1352,17 @@ fn prefetch_worker(inner: Arc<SessionInner>) {
         let result = frame_cache::prefetch_cache(&options, &inner.key, &refs, &progress);
 
         match result {
-            Ok(meta) => {
+            Ok((meta, evicted)) => {
                 let jobs: Vec<((u32, u32), Vec<String>)> = {
                     let mut state = inner.lock_state();
+                    // 预取阶段新增的告警（含 LRU 删除说明）并入会话级 warnings。
+                    for warning in &meta.warnings {
+                        if !state.warnings.contains(warning) {
+                            state.warnings.push(warning.clone());
+                        }
+                    }
                     state.meta = meta;
+                    state.evicted_bytes = state.evicted_bytes.saturating_add(evicted);
                     let mut jobs = Vec::new();
                     for message_key in &batch {
                         let wanted: Vec<String> = state

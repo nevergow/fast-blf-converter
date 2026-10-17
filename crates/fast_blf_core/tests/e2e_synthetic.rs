@@ -3764,23 +3764,86 @@ fn step17_config<'py>(
     budget_mb: u64,
     time_format: &str,
 ) -> PyResult<Bound<'py, PyDict>> {
+    let pairs: Vec<(&str, &str)> = selected.into_iter().collect();
+    step17_config_multi(py, blf, dbc, &pairs, cache_dir, budget_mb, time_format)
+}
+
+/// 同 [`step17_config`]，但支持一次选多个 `(message, signal)`（均绑定 Ch1）。
+fn step17_config_multi<'py>(
+    py: Python<'py>,
+    blf: &Path,
+    dbc: &Path,
+    selected: &[(&str, &str)],
+    cache_dir: &Path,
+    budget_mb: u64,
+    time_format: &str,
+) -> PyResult<Bound<'py, PyDict>> {
     let config = PyDict::new(py);
     config.set_item("blf_paths", vec![blf.to_string_lossy().to_string()])?;
     let mut dbc_map = HashMap::new();
     dbc_map.insert(1u32, dbc.to_string_lossy().to_string());
     config.set_item("dbc_by_channel", dbc_map)?;
-    let selected_map: HashMap<String, HashMap<String, Vec<String>>> = match selected {
-        Some((message, signal)) => {
-            let mut per_channel = HashMap::new();
-            per_channel.insert(message.to_string(), vec![signal.to_string()]);
-            let mut all = HashMap::new();
-            all.insert("1".to_string(), per_channel);
-            all
-        }
-        None => HashMap::new(),
-    };
+    let mut per_channel: HashMap<String, Vec<String>> = HashMap::new();
+    for (message, signal) in selected {
+        per_channel
+            .entry((*message).to_string())
+            .or_default()
+            .push((*signal).to_string());
+    }
+    let mut selected_map: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+    if !per_channel.is_empty() {
+        selected_map.insert("1".to_string(), per_channel);
+    }
     config.set_item("selected", selected_map)?;
     config.set_item("time_format", time_format)?;
+    config.set_item("temp_dir", cache_dir.to_string_lossy().to_string())?;
+    config.set_item("cache_dir", cache_dir.to_string_lossy().to_string())?;
+    config.set_item("cache_budget_mb", budget_mb)?;
+    Ok(config)
+}
+
+/// 等后台预取结束；返回等待毫秒数。
+fn step17_wait_prefetch(py: Python<'_>, session: &fast_blf_core::PlotSession) -> PyResult<u64> {
+    let mut waited_ms = 0u64;
+    loop {
+        let status = session.prefetch_status(py)?;
+        let busy: bool = status.get_item("busy")?.unwrap().extract()?;
+        if !busy {
+            return Ok(waited_ms);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        waited_ms += 10;
+        assert!(waited_ms < 60_000, "后台预取超时");
+    }
+}
+
+/// bench_huge 的 config：Ch1 上挑选若干 `MSG_*` 报文（每条取 `Sig0`）。
+fn step17_bench_config<'py>(
+    py: Python<'py>,
+    blf: &Path,
+    dbc: &Path,
+    messages: &[&str],
+    cache_dir: &Path,
+    budget_mb: u64,
+) -> PyResult<Bound<'py, PyDict>> {
+    let config = PyDict::new(py);
+    config.set_item("blf_paths", vec![blf.to_string_lossy().to_string()])?;
+    let mut dbc_map = HashMap::new();
+    for channel in [1u32, 2, 3] {
+        dbc_map.insert(channel, dbc.to_string_lossy().to_string());
+    }
+    config.set_item("dbc_by_channel", dbc_map)?;
+    let mut per_channel: HashMap<String, Vec<String>> = HashMap::new();
+    for message in messages {
+        per_channel
+            .entry((*message).to_string())
+            .or_default()
+            .push("Sig0".to_string());
+    }
+    let mut selected_map: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+    selected_map.insert("1".to_string(), per_channel);
+    config.set_item("selected", selected_map)?;
+    config.set_item("time_format", "relative_s")?;
     config.set_item("temp_dir", cache_dir.to_string_lossy().to_string())?;
     config.set_item("cache_dir", cache_dir.to_string_lossy().to_string())?;
     config.set_item("cache_budget_mb", budget_mb)?;
@@ -4624,6 +4687,462 @@ fn step17_export_html_is_self_contained() {
         assert!(!text.contains("https://"), "HTML 不得引用 CDN");
         assert_eq!(text.len() as u64, bytes);
         println!("STEP17_EXPORT_HTML ok bytes={bytes}");
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+// ---------------------------------------------------------------------------
+// Step 17b：缓存键与 selected 解耦、open 异步语义、LRU、info().key
+// ---------------------------------------------------------------------------
+
+/// 自检 1（G3 核心回归）：先把 MsgB 预取进同一个 key，再以 {MsgA, MsgB} 重开，
+/// 必须 cache_hit=true 且 ≤300ms。
+#[test]
+fn step17b_g3_reopen_with_expanded_selection_hits_cache() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc) = write_step17_fixture(dir.path());
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        let config_a = step17_config_multi(
+            py,
+            &blf,
+            &dbc,
+            &[("MsgA", "A")],
+            &cache_dir,
+            200,
+            "relative_s",
+        )?;
+        let first = fast_blf_core::open_plot_session(py, &config_a, None)?;
+        let first_info = first.info(py)?;
+        assert!(
+            !first_info
+                .get_item("cache_hit")?
+                .unwrap()
+                .extract::<bool>()?,
+            "首次构建不能是 cache_hit"
+        );
+        first.add_signals(py, PyList::new(py, ["ch1/MsgA/A"])?.as_any())?;
+
+        let b = first.add_signals(py, PyList::new(py, ["ch1/MsgB/B"])?.as_any())?;
+        let pending: u64 = b.get_item("pending")?.unwrap().extract()?;
+        assert!(pending > 0, "未缓存的 MsgB 必须进入后台预取");
+        let waited = step17_wait_prefetch(py, &first)?;
+        first.close();
+
+        let config_ab = step17_config_multi(
+            py,
+            &blf,
+            &dbc,
+            &[("MsgA", "A"), ("MsgB", "B")],
+            &cache_dir,
+            200,
+            "relative_s",
+        )?;
+        let started = std::time::Instant::now();
+        let second = fast_blf_core::open_plot_session(py, &config_ab, None)?;
+        let elapsed = started.elapsed();
+        let info = second.info(py)?;
+        let cache_hit: bool = info.get_item("cache_hit")?.unwrap().extract()?;
+        assert!(cache_hit, "扩展 selected 后必须命中同一个 key");
+        assert!(
+            elapsed.as_millis() <= 300,
+            "缓存命中 open 必须 ≤300ms，实际 {elapsed:?}"
+        );
+        let key_dir = step17_cache_key_dir(&cache_dir);
+        let key_name = key_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        println!(
+            "STEP17B_G3 cache_hit={cache_hit} open={:.3}ms prefetch_wait={waited}ms key={}",
+            elapsed.as_secs_f64() * 1000.0,
+            &key_name[..12.min(key_name.len())]
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// 自检 2：不同 selected 组合 → 同一个 key；BLF mtime 变化 → key 变化。
+#[test]
+fn step17b_cache_key_ignores_selection_and_tracks_mtime() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc) = write_step17_fixture(dir.path());
+    let cache_dir = dir.path().join("cache");
+    let mut dbc_map = BTreeMap::new();
+    dbc_map.insert(1u32, dbc.clone());
+    let paths = vec![blf.clone()];
+    let key_a =
+        fast_blf_core::frame_cache::compute_cache_key(&paths, &dbc_map).expect("计算第一次 key");
+    let key_b =
+        fast_blf_core::frame_cache::compute_cache_key(&paths, &dbc_map).expect("计算第二次 key");
+    assert_eq!(key_a, key_b, "相同数据源的 key 必须完全一致");
+
+    with_python(|py| -> PyResult<()> {
+        // 两次 open 使用不同的 selected；因为 key 不含报文集合，磁盘上只能有一个 key 目录。
+        for (message, signal) in [("MsgA", "A"), ("MsgB", "B")] {
+            let config = step17_config_multi(
+                py,
+                &blf,
+                &dbc,
+                &[(message, signal)],
+                &cache_dir,
+                200,
+                "relative_s",
+            )?;
+            let session = fast_blf_core::open_plot_session(py, &config, None)?;
+            step17_wait_prefetch(py, &session)?;
+            session.close();
+        }
+        let key_dir = step17_cache_key_dir(&cache_dir);
+        let dir_key = key_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        assert_eq!(dir_key, key_a, "目录名必须等于数据源 key");
+        println!(
+            "STEP17B_KEY_SELECTION key_a={} key_b={} same=true",
+            &key_a[..12],
+            &key_b[..12]
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+
+    // 只改 mtime（内容与大小不变），key 必须变化。
+    let handle = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&blf)
+        .expect("以写方式打开 BLF 以改 mtime");
+    handle
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(7))
+        .expect("修改 BLF mtime");
+    drop(handle);
+    let key_c = fast_blf_core::frame_cache::compute_cache_key(&paths, &dbc_map)
+        .expect("计算 mtime 变化后的 key");
+    assert_ne!(key_a, key_c, "mtime 变化后 key 必须变化");
+    println!(
+        "STEP17B_KEY_MTIME key_before={} key_after={} changed=true",
+        &key_a[..12],
+        &key_c[..12]
+    );
+}
+
+/// 自检 3：selected 含未缓存报文时 open 立即返回；已缓存信号立刻可 view。
+#[test]
+fn step17b_open_returns_immediately_and_prefetches_missing() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc) = write_step17_fixture(dir.path());
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        let config_a =
+            step17_config_multi(py, &blf, &dbc, &[("MsgA", "A")], &cache_dir, 200, "relative_s")?;
+        let first = fast_blf_core::open_plot_session(py, &config_a, None)?;
+        first.close();
+
+        let config_ab = step17_config_multi(
+            py,
+            &blf,
+            &dbc,
+            &[("MsgA", "A"), ("MsgB", "B")],
+            &cache_dir,
+            200,
+            "relative_s",
+        )?;
+        let started = std::time::Instant::now();
+        let second = fast_blf_core::open_plot_session(py, &config_ab, None)?;
+        let elapsed = started.elapsed();
+        let info = second.info(py)?;
+        assert!(
+            !info.get_item("cache_hit")?.unwrap().extract::<bool>()?,
+            "缺 MsgB 时不能报 cache_hit"
+        );
+        assert!(
+            elapsed.as_millis() < 500,
+            "open 必须立即返回（<500ms），实际 {elapsed:?}"
+        );
+        let status = second.prefetch_status(py)?;
+        let busy: bool = status.get_item("busy")?.unwrap().extract()?;
+        let message: String = status.get_item("message")?.unwrap().extract()?;
+        assert!(
+            busy || message.contains("完成"),
+            "open 返回时预取必须 busy 或已完成：busy={busy} message={message}"
+        );
+
+        // 已缓存的 MsgA 立即 add + view，不等待后台 MsgB。
+        second.add_signals(py, PyList::new(py, ["ch1/MsgA/A"])?.as_any())?;
+        let view = step17_view(&second.view(py, 0.0, 59.999, 500)?)?;
+        let a = view.series.get("ch1/MsgA/A").expect("已缓存的 A 必须立即可 view");
+        assert!(!a.0.is_empty(), "A 的包络不能为空");
+
+        let waited = step17_wait_prefetch(py, &second)?;
+        second.add_signals(py, PyList::new(py, ["ch1/MsgB/B"])?.as_any())?;
+        let view = step17_view(&second.view(py, 0.0, 59.999, 500)?)?;
+        let b = view.series.get("ch1/MsgB/B").expect("预取完成后 B 必须可 view");
+        assert!(!b.0.is_empty(), "B 的包络不能为空");
+        println!(
+            "STEP17B_ASYNC open={:.3}ms busy_at_open={busy} prefetch_wait={waited}ms a_points={} b_points={}",
+            elapsed.as_secs_f64() * 1000.0,
+            a.0.len(),
+            b.0.len()
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// 自检 4：估算闸门只看新增字节；已存在段不计入。
+/// 用 bench_huge（每条 MSG 200k 帧 × 17B ≈ 3.4MB）：预算 32MiB，
+/// 10 条新需要 ≈34MB → 拒绝；已有 1 条后再加 9 条（新增 ≈30.6MB）→ 允许。
+#[test]
+#[ignore = "需要 fixtures/bench_huge.blf；用 --ignored --nocapture 单独运行"]
+fn step17b_budget_gate_counts_only_new_bytes() {
+    let fixtures = repo_fixtures_dir();
+    let huge = fixtures.join("bench_huge.blf");
+    let dbc = fixtures.join("bench.dbc");
+    if !huge.exists() || !dbc.exists() {
+        println!("STEP17B_BUDGET_SKIP 缺少 bench_huge.blf / bench.dbc");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("临时目录");
+    let names: Vec<String> = (0x100..0x10a).map(|id| format!("MSG_{id:03X}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    with_python(|py| -> PyResult<()> {
+        // 4a）首次构建：10 条新报文 > 32MiB → CACHE_BUDGET_EXCEEDED。
+        let rejected_dir = dir.path().join("cache_reject");
+        let config = step17_bench_config(py, &huge, &dbc, &refs, &rejected_dir, 32)?;
+        let err = match fast_blf_core::open_plot_session(py, &config, None) {
+            Ok(session) => {
+                session.close();
+                panic!("10 条 MSG 需要约 34MB，32MiB 预算必须拒绝")
+            }
+            Err(err) => err,
+        };
+        let text = err.to_string();
+        assert!(text.contains("CACHE_BUDGET_EXCEEDED"), "{text}");
+        assert!(text.contains("需要 "), "{text}");
+        assert!(text.contains("上限 32 MiB"), "{text}");
+        assert!(text.contains("①提高上限(cache_budget_mb)"), "{text}");
+        assert!(text.contains("②减少所选报文"), "{text}");
+        assert!(text.contains("③不建缓存继续但较慢"), "{text}");
+        println!("STEP17B_BUDGET_REJECT {text}");
+
+        // 4b）先只缓存 1 条（≈3.4MB），再 open 10 条：新增 ≈30.6MB ≤ 32MiB，不得报错。
+        let existing_dir = dir.path().join("cache_existing");
+        let config_one = step17_bench_config(py, &huge, &dbc, &refs[..1], &existing_dir, 32)?;
+        let first = fast_blf_core::open_plot_session(py, &config_one, None)?;
+        first.close();
+
+        let config_all = step17_bench_config(py, &huge, &dbc, &refs, &existing_dir, 32)?;
+        let started = std::time::Instant::now();
+        let second = fast_blf_core::open_plot_session(py, &config_all, None)?;
+        let elapsed = started.elapsed();
+        let info = second.info(py)?;
+        assert!(
+            !info.get_item("cache_hit")?.unwrap().extract::<bool>()?,
+            "缺 9 条时不能报 cache_hit"
+        );
+        assert!(elapsed.as_millis() < 500, "open 必须立即返回：{elapsed:?}");
+        let waited = step17_wait_prefetch(py, &second)?;
+        let info = second.info(py)?;
+        let warnings: Vec<String> = info
+            .get_item("warnings")?
+            .unwrap()
+            .extract::<Vec<String>>()?;
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.contains("CACHE_BUDGET_EXCEEDED")),
+            "已存在段被错误计入估算：{warnings:?}"
+        );
+        let signals = info
+            .get_item("signals")?
+            .unwrap()
+            .cast_into::<PyList>()?;
+        let mut cached_109 = false;
+        for item in signals.iter() {
+            let dict = item.cast_into::<PyDict>()?;
+            let channel: u32 = dict.get_item("channel")?.unwrap().extract()?;
+            let message: String = dict.get_item("message")?.unwrap().extract()?;
+            let cached: bool = dict.get_item("cached")?.unwrap().extract()?;
+            if channel == 1 && message == "MSG_109" {
+                cached_109 = cached;
+            }
+        }
+        assert!(cached_109, "新增的 MSG_109 必须预取完成");
+        let cache_bytes: u64 = info.get_item("cache_bytes")?.unwrap().extract()?;
+        println!(
+            "STEP17B_BUDGET_EXISTING open={:.3}ms prefetch_wait={waited}ms cache_bytes={} ({:.2} MiB)",
+            elapsed.as_secs_f64() * 1000.0,
+            cache_bytes,
+            cache_bytes as f64 / (1024.0 * 1024.0)
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// 自检 5：目录超预算 → 删除旧 key、保留当前 key，并回报 evicted_bytes。
+#[test]
+fn step17b_lru_evicts_old_key_and_reports_evicted_bytes() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc) = write_step17_fixture(dir.path());
+    let cache_dir = dir.path().join("cache");
+    let old_dir = cache_dir.join("old_key");
+    std::fs::create_dir_all(&old_dir).expect("创建旧 key 目录");
+    let old_bytes = 40u64 * 1024 * 1024;
+    let data = std::fs::File::create(old_dir.join("ch1_id1.bin")).expect("创建旧 key 数据");
+    data.set_len(old_bytes).expect("扩展旧 key 数据");
+    drop(data);
+    let old_meta = serde_json::json!({
+        "format_version": fast_blf_core::CACHE_FORMAT_VERSION,
+        "key": "old_key",
+        "created_at": 1u64,
+        "cache_bytes": old_bytes,
+        "t_min": 0.0,
+        "t_max": 1.0,
+        "abs_min_micros": null,
+        "abs_max_micros": null,
+        "files": [],
+        "messages": [],
+        "warnings": [],
+    });
+    std::fs::write(
+        old_dir.join("meta.json"),
+        serde_json::to_vec_pretty(&old_meta).expect("序列化旧 meta"),
+    )
+    .expect("写旧 meta");
+
+    with_python(|py| -> PyResult<()> {
+        let config = step17_config_multi(py, &blf, &dbc, &[], &cache_dir, 32, "relative_s")?;
+        let session = fast_blf_core::open_plot_session(py, &config, None)?;
+        let info = session.info(py)?;
+        let evicted: u64 = info.get_item("evicted_bytes")?.unwrap().extract()?;
+        assert!(!old_dir.exists(), "超预算时旧 key 必须被 LRU 删除");
+        assert!(
+            evicted >= old_bytes,
+            "evicted_bytes 必须回报删除量：{evicted}"
+        );
+        let current_dir = step17_cache_key_dir(&cache_dir);
+        assert!(current_dir.exists(), "当前正在用的 key 绝不能删");
+        let cache_hit: bool = info.get_item("cache_hit")?.unwrap().extract()?;
+        assert!(!cache_hit, "首次构建当前 key 不是 cache_hit");
+        println!(
+            "STEP17B_LRU deleted=old_key evicted_bytes={evicted} kept={} cache_hit={cache_hit}",
+            current_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// 自检 6：`info().signals[*].key` 存在，且可直接作为 `stats()` 入参。
+#[test]
+fn step17b_info_signal_key_is_usable_by_stats() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc) = write_step17_fixture(dir.path());
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        let config = step17_config_multi(
+            py,
+            &blf,
+            &dbc,
+            &[("MsgA", "A")],
+            &cache_dir,
+            200,
+            "relative_s",
+        )?;
+        let session = fast_blf_core::open_plot_session(py, &config, None)?;
+        let info = session.info(py)?;
+        let signals = info.get_item("signals")?.unwrap().cast_into::<PyList>()?;
+        let mut found = None;
+        for item in signals.iter() {
+            let dict = item.cast_into::<PyDict>()?;
+            let message: String = dict.get_item("message")?.unwrap().extract()?;
+            let signal: String = dict.get_item("signal")?.unwrap().extract()?;
+            let key: String = dict
+                .get_item("key")?
+                .expect("info().signals[] 必须含 key")
+                .extract()?;
+            assert_eq!(key, format!("ch1/{message}/{signal}"));
+            if message == "MsgA" && signal == "A" {
+                found = Some(key);
+            }
+        }
+        let key = found.expect("info 必须列出 MsgA/A");
+        let stats = session.stats(py, PyList::new(py, [key.as_str()])?.as_any())?;
+        let dict = stats.get_item(0)?.cast_into::<PyDict>()?;
+        let count: u64 = dict.get_item("count")?.unwrap().extract()?;
+        assert_eq!(count, STEP17_FRAMES as u64);
+        println!("STEP17B_INFO_KEY key={key} stats_count={count}");
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// 自检 1b：用真实夹具复刻 G3 场景（VehSpd → 预取 BattTemp → 重开两者）。
+#[test]
+fn step17b_g3_vehspd_batttemp_reopen_hits_cache() {
+    let fixtures = repo_fixtures_dir();
+    let blf = fixtures.join("multi_channel.blf");
+    let dbc = fixtures.join("demo.dbc");
+    if !blf.exists() || !dbc.exists() {
+        println!("STEP17B_G3_REAL_SKIP 缺少 multi_channel.blf / demo.dbc");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("临时目录");
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        let config_spd = step17_config_multi(
+            py,
+            &blf,
+            &dbc,
+            &[("VehSpd", "Spd")],
+            &cache_dir,
+            200,
+            "relative_s",
+        )?;
+        let first = fast_blf_core::open_plot_session(py, &config_spd, None)?;
+        first.add_signals(py, PyList::new(py, ["ch1/VehSpd/Spd"])?.as_any())?;
+        let added = first.add_signals(py, PyList::new(py, ["ch1/BattTemp/Temp1"])?.as_any())?;
+        let pending: u64 = added.get_item("pending")?.unwrap().extract()?;
+        assert!(pending > 0);
+        step17_wait_prefetch(py, &first)?;
+        first.close();
+
+        let config_both = step17_config_multi(
+            py,
+            &blf,
+            &dbc,
+            &[("VehSpd", "Spd"), ("BattTemp", "Temp1")],
+            &cache_dir,
+            200,
+            "relative_s",
+        )?;
+        let started = std::time::Instant::now();
+        let second = fast_blf_core::open_plot_session(py, &config_both, None)?;
+        let elapsed = started.elapsed();
+        let info = second.info(py)?;
+        let cache_hit: bool = info.get_item("cache_hit")?.unwrap().extract()?;
+        assert!(cache_hit, "VehSpd+BattTemp 重开必须命中缓存");
+        assert!(elapsed.as_millis() <= 300, "重开必须 ≤300ms：{elapsed:?}");
+        second.add_signals(
+            py,
+            PyList::new(py, ["ch1/VehSpd/Spd", "ch1/BattTemp/Temp1"])?.as_any(),
+        )?;
+        let view = step17_view(&second.view(py, 0.0, 4.999, 500)?)?;
+        assert!(view.series.contains_key("ch1/VehSpd/Spd"));
+        assert!(view.series.contains_key("ch1/BattTemp/Temp1"));
+        println!(
+            "STEP17B_G3_REAL cache_hit={cache_hit} open={:.3}ms series={}",
+            elapsed.as_secs_f64() * 1000.0,
+            view.series.len()
+        );
         Ok(())
     })
     .expect("Python 侧断言失败");
