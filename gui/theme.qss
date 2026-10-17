@@ -876,7 +876,8 @@ QWidget#signalPanel {
     border-radius: 6px;
 }
 
-QCheckBox#plotSelectAll {
+QCheckBox#plotSelectAll,
+QCheckBox#treeSelectAll {
     color: #E8E8F0;
     font-weight: 600;
     padding: 3px 2px;

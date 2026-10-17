@@ -38,21 +38,22 @@ from PySide6.QtGui import (
     QAction, QColor, QFont, QFontDatabase, QPixmap, QStandardItem, QStandardItemModel,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout,
-    QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
-    QProgressBar, QPushButton, QSizePolicy, QSpinBox, QSplitter, QStatusBar, QToolBar, QTreeView,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
+    QFileDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
+    QLineEdit, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QSizePolicy,
+    QSpinBox, QSplitter, QStatusBar, QToolBar, QTreeView, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 try:  # 以脚本方式运行（python gui/main.py）时 gui/ 已在 sys.path 首位
     from check_delegate import CheckStateDelegate
     import presets as preset_store
-    from plot_view import PreviewWindow
+    from plot_view import PreviewWindow, TriStateCheckBox
     import report_html as report_builder
 except ImportError:  # 作为包导入（gui.main）时
     from gui.check_delegate import CheckStateDelegate
     from gui import presets as preset_store
-    from gui.plot_view import PreviewWindow
+    from gui.plot_view import PreviewWindow, TriStateCheckBox
     from gui import report_html as report_builder
 
 # --------------------------------------------------------------- 内核延迟导入 --
@@ -109,6 +110,15 @@ FILL_GAP_TOOLTIP = (
 PROGRESS_IDLE_TEXT = "待命"
 PROGRESS_IDLE_META = "—"
 PHASE_STAGE_LABELS = {"scan": "扫描中", "decode": "解码中", "merge": "合并中", "export": "导出中"}
+#: Step 19 A1：单条进度条的加权份额。阶段 1 占 0..70%，阶段 2 占 70..100%。
+#: 两个常量集中在这里，以后要调整阶段权重只改这一处（selftest 也按它推导）。
+_PHASE1_SHARE = 0.70
+_PHASE2_SHARE = 1.0 - _PHASE1_SHARE
+#: 非终态进度条永远不超过该值，100 只由「成功终态」写入（A2）。
+_PROGRESS_RUNNING_MAX = 99
+#: 不确定态（busy）乒乓动画的上限：绝不能提前扫到 100（否则会被误读成"已完成"）。
+_BUSY_SWEEP_MAX = 95
+_PHASE_HEADINGS = {1: "阶段 1/2 · 解码", 2: "阶段 2/2 · 合并导出"}
 #: 绝对时间输出的正则（用于 ``--selftest-progress`` 校验）。
 ABSOLUTE_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6}$")
 NODE_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -446,6 +456,94 @@ class Worker(QThread):
             raise
 
 
+# ------------------------------------------------------- 缓存设置对话框（C2）
+class CacheSettingsDialog(QDialog):
+    """帧缓存设置：上限 32..8192 MiB + 自定义缓存目录（空 = 系统临时目录）。
+
+    校验失败**不弹错误框**：在对话框内就地显示红字，保持输入焦点不动。
+    """
+
+    def __init__(self, budget: int, cache_dir: str | None,
+                 parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("帧缓存设置")
+        self.setModal(True)
+        self.setMinimumWidth(520)
+        self._values: tuple[int, str | None] = (
+            int(budget), str(cache_dir) if cache_dir else None)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 14, 16, 12)
+        outer.setSpacing(10)
+        form = QFormLayout()
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(10)
+        self.spin_cache = QSpinBox(self)
+        tune(self.spin_cache, range=(preset_store.CACHE_BUDGET_MIN_MB,
+                                     preset_store.CACHE_BUDGET_MAX_MB),
+             value=int(budget), suffix=" MiB")
+        self.spin_cache.setToolTip(
+            f"帧缓存磁盘上限，允许 {preset_store.CACHE_BUDGET_MIN_MB}.."
+            f"{preset_store.CACHE_BUDGET_MAX_MB} MiB（默认 "
+            f"{preset_store.DEFAULT_CACHE_BUDGET_MB} MiB）")
+        form.addRow("帧缓存上限 (MiB)：", self.spin_cache)
+        dir_row = QHBoxLayout()
+        dir_row.setSpacing(8)
+        self.edit_cache_dir = QLineEdit(self)
+        self.edit_cache_dir.setPlaceholderText("留空 = 系统临时目录")
+        self.edit_cache_dir.setText(str(cache_dir) if cache_dir else "")
+        self.edit_cache_dir.setToolTip("帧缓存落盘目录；留空时使用系统临时目录")
+        dir_row.addWidget(self.edit_cache_dir, 1)
+        self.btn_pick_dir = QPushButton("选择…", self)
+        self.btn_pick_dir.clicked.connect(self._pick_dir)
+        dir_row.addWidget(self.btn_pick_dir, 0)
+        form.addRow("缓存目录：", dir_row)
+        outer.addLayout(form)
+        hint = QLabel("设置保存后立即生效：下一次打开预览即使用新的上限 / 目录。")
+        tune(hint, objectName="hintLabel", wordWrap=True)
+        outer.addWidget(hint)
+        self.lbl_error = QLabel("")
+        self.lbl_error.setWordWrap(True)
+        self.lbl_error.setStyleSheet("color: #F05A5A;")
+        self.lbl_error.setVisible(False)
+        outer.addWidget(self.lbl_error)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        self.btn_cancel = QPushButton("取消", self)
+        self.btn_cancel.clicked.connect(self.reject)
+        buttons.addWidget(self.btn_cancel)
+        self.btn_save = QPushButton("保存", self)
+        self.btn_save.setObjectName("primaryButton")
+        self.btn_save.clicked.connect(self.accept)
+        buttons.addWidget(self.btn_save)
+        outer.addLayout(buttons)
+
+    def _pick_dir(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(
+            self, "选择帧缓存目录", self.edit_cache_dir.text().strip() or str(Path.home()))
+        if chosen:
+            self.edit_cache_dir.setText(chosen)
+
+    def accept(self) -> None:  # noqa: D401 - QDialog 命名
+        """保存前校验范围；非法值就地红字，不关闭对话框。"""
+        budget = int(self.spin_cache.value())
+        if not (preset_store.CACHE_BUDGET_MIN_MB <= budget
+                <= preset_store.CACHE_BUDGET_MAX_MB):
+            self.lbl_error.setText(
+                f"帧缓存上限必须在 {preset_store.CACHE_BUDGET_MIN_MB}.."
+                f"{preset_store.CACHE_BUDGET_MAX_MB} MiB 之间，当前为 {budget} MiB。")
+            self.lbl_error.setVisible(True)
+            self.spin_cache.setFocus()
+            return
+        self._values = (budget, self.edit_cache_dir.text().strip() or None)
+        self.lbl_error.clear()
+        self.lbl_error.setVisible(False)
+        super().accept()
+
+    def values(self) -> tuple[int, str | None]:
+        """返回 ``(cache_budget_mb, cache_dir|None)``（仅在 accept 后有效）。"""
+        return self._values
+
+
 # ----------------------------------------------------------------- 主窗口 ----
 class MainWindow(QMainWindow):
     """工具栏 + QSplitter 左右分栏 + 底部控制面板 + 状态栏。"""
@@ -468,8 +566,12 @@ class MainWindow(QMainWindow):
         self._plot_action: str | None = None
         self._plot_out_path: str | None = None
         self._plot_time_format: str | None = None
-        #: Step 18：预览会话的缓存预算 / 预览设置（模式、颜色、线型、可见性）。
-        self.preview_cache_budget_mb: int = 200
+        #: Step 18/19：预览会话的缓存预算 / 缓存目录（来自 settings.json）/ 预览视图设置。
+        self._cache_settings = preset_store.read_settings()
+        self.preview_cache_budget_mb: int = int(
+            self._cache_settings.get("cache_budget_mb",
+                                     preset_store.DEFAULT_CACHE_BUDGET_MB))
+        self.preview_cache_dir: str | None = self._cache_settings.get("cache_dir")
         self._preview_view_settings: dict = {}
         self._preview_settings_from_preset: bool = False
         self._last_preview_config: dict | None = None
@@ -507,6 +609,7 @@ class MainWindow(QMainWindow):
         # 这里显式补齐，保证"先绑 DBC 再统一解析"时通道节点永不因重建而消失）。
         self.channel_slots = set(range(1, len(CHANNEL_CHOICES) + 1))
         self._sync_resample_hint()
+        self._sync_select_all_checkbox()
         self._refresh_action_state()
         self._progress_idle()
         if not KERNEL_READY:
@@ -576,11 +679,24 @@ class MainWindow(QMainWindow):
         self.act_delete_config = QAction("🗑 删除配置", self)
         tune(self.act_delete_config, statusTip="删除已保存的配置（需二次确认）")
         bar.addAction(self.act_delete_config)
+        # Step 19 C2：缓存设置入口（工具栏；不新增菜单层级，保持入口一眼可见）。
+        self.act_settings = QAction("⚙ 设置", self)
+        tune(self.act_settings, statusTip="帧缓存上限与缓存目录（默认 200 MiB / 系统临时目录）")
+        self._refresh_settings_tooltip()
+        bar.addAction(self.act_settings)
         bar.addSeparator()
         self.dbc_label = QLabel("DBC 绑定：无")
         tune(self.dbc_label, objectName="hintLabel")
         self.dbc_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         bar.addWidget(self.dbc_label)
+
+    def _refresh_settings_tooltip(self) -> None:
+        """把当前缓存设置写进「⚙ 设置」的 tooltip（C4：改完一眼能核对）。"""
+        cache_dir = self.preview_cache_dir or "系统临时目录（默认）"
+        self.act_settings.setToolTip(
+            f"帧缓存上限：{self.preview_cache_budget_mb} MiB（允许 "
+            f"{preset_store.CACHE_BUDGET_MIN_MB}..{preset_store.CACHE_BUDGET_MAX_MB}）\n"
+            f"缓存目录：{cache_dir}\n保存位置：{preset_store.settings_path()}")
 
     def _build_central(self) -> None:
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
@@ -620,15 +736,21 @@ class MainWindow(QMainWindow):
         title = QLabel("信号筛选（通道 → DBC → 报文 → 信号；在通道节点上右键添加 DBC，"
                        "只有勾选的节点才会参与转换）")
         tune(title, objectName="hintLabel")
-        layout.addWidget(title)
+        # Step 19 D1/D3：标题行只保留一个三态复选框（删除原先的「全选当前过滤项 /
+        # 一键清空」两个按钮）。语义与预览面板完全一致：部分/未选 → 全选；全选 → 全不选。
+        title_row = QHBoxLayout()
+        title_row.setSpacing(8)
+        title_row.addWidget(title, 1)
+        self.chk_select_all = TriStateCheckBox("全选（0/0）", panel)
+        self.chk_select_all.setObjectName("treeSelectAll")
+        self.chk_select_all.setToolTip(
+            "点「部分选 / 未选」→ 全选当前可见（未被搜索过滤）的行；点「全选」→ 全不选")
+        title_row.addWidget(self.chk_select_all, 0)
+        layout.addLayout(title_row)
         self.search_edit = QLineEdit(panel)
         tune(self.search_edit, placeholderText="🔍 搜索 DBC / 报文名 / 信号名（大小写不敏感的模糊匹配）", clearButtonEnabled=True)
-        self.btn_check_visible = QPushButton("全选当前过滤项")
-        self.btn_uncheck_all = QPushButton("一键清空")
         row = QHBoxLayout()
         row.addWidget(self.search_edit, 1)
-        row.addWidget(self.btn_check_visible)
-        row.addWidget(self.btn_uncheck_all)
         layout.addLayout(row)
         self.signal_model = QStandardItemModel(0, 1, self)
         self.signal_model.setHeaderData(0, Qt.Orientation.Horizontal, "通道 / DBC / 报文 / 信号")
@@ -692,9 +814,11 @@ class MainWindow(QMainWindow):
         gap_row = QHBoxLayout()
         gap_row.setSpacing(14)
         gap_row.addWidget(QLabel("最大保持时长："))
-        self.spin_fill_gap = QSpinBox(panel)
-        tune(self.spin_fill_gap, range=(0, 60_000), value=0, suffix=" ms",
-             toolTip=FILL_GAP_TOOLTIP)
+        # Step 19 B1/B3：用 QDoubleSpinBox 保存 ``ffill_max_gap_ms`` 的 float 小数位，
+        # 避免预设 round-trip 把 12.5 ms 截成 13 ms。
+        self.spin_fill_gap = QDoubleSpinBox(panel)
+        tune(self.spin_fill_gap, range=(0.0, 60_000.0), value=0.0, decimals=1,
+             singleStep=10.0, suffix=" ms", toolTip=FILL_GAP_TOOLTIP)
         gap_row.addWidget(self.spin_fill_gap)
         gap_row.addStretch(1)
         outer.addLayout(gap_row)
@@ -759,12 +883,12 @@ class MainWindow(QMainWindow):
         self.act_save_config.triggered.connect(self.save_config_dialog)
         self.act_load_config.triggered.connect(self.load_config_dialog)
         self.act_delete_config.triggered.connect(self.delete_config_dialog)
+        self.act_settings.triggered.connect(self.open_settings_dialog)
         self.file_tree.files_dropped.connect(self.add_blf_paths)
         self.btn_remove_selected.clicked.connect(self.remove_selected_files)
         self.btn_clear_files.clicked.connect(self.clear_files)
         self.search_edit.textChanged.connect(self._on_search_changed)
-        self.btn_check_visible.clicked.connect(self.check_visible_items)
-        self.btn_uncheck_all.clicked.connect(self.uncheck_all_items)
+        self.chk_select_all.clicked.connect(self._on_select_all_clicked)
         self.signal_model.itemChanged.connect(self._on_item_changed)
         self.signal_view.customContextMenuRequested.connect(self._on_signal_context_menu)
         self.chk_split.toggled.connect(lambda _c: self._sync_resample_hint())
@@ -1036,24 +1160,27 @@ class MainWindow(QMainWindow):
 
     # --------------------------------------------------------- 配置预设 ----
     def current_export_policy(self) -> dict:
-        """当前导出策略（拆表 / 重采样 / 格式），与配置里的 ``export`` 同构。
+        """当前导出策略（6 个字段），与配置里的 ``export`` 完全同构（B3）。
 
-        注意：配置预设（``gui/presets.py``，本步冻结）只持久化这三个字段，
-        因此这里也**只回读这三个字段**，保证 `--selftest-config` 的 round-trip 语义不变。
+        ``schema == 2`` 起保存：拆表 / 重采样 / 导出格式 / 时间列格式 /
+        填充方式 / 最大保持时长。加载时由 :meth:`apply_export_policy` 逐项写回控件。
         """
         return {
             "split_by_message": bool(self.chk_split.isChecked()),
             "resample_hz": RESAMPLE_CHOICES[max(0, self.combo_resample.currentIndex())][1],
             "export_format": FORMAT_CHOICES[max(0, self.combo_format.currentIndex())][1],
+            "time_format": self._current_time_format(),
+            "fill_policy": self._fill_policy(),
+            "ffill_max_gap_ms": self._fill_gap_ms(),
         }
 
     def _fill_gap_ms(self) -> float | None:
         """最大保持时长（毫秒）；0 = 不限 → ``None``。"""
-        value = self.spin_fill_gap.value()
-        return None if value <= 0 else float(value)
+        value = float(self.spin_fill_gap.value())
+        return None if value <= 0 else value
 
     def apply_export_policy(self, export: dict | None) -> None:
-        """把配置里的导出策略写回控件（缺字段用默认值兜底）。"""
+        """把配置里的导出策略写回控件（6 个字段逐个同步；缺字段用默认值兜底）。"""
         export = export if isinstance(export, dict) else {}
         self.chk_split.setChecked(bool(export.get("split_by_message", True)))
         hz = export.get("resample_hz")
@@ -1062,8 +1189,12 @@ class MainWindow(QMainWindow):
         fmt = export.get("export_format")
         self.combo_format.setCurrentIndex(next(
             (i for i, (_label, value) in enumerate(FORMAT_CHOICES) if value == fmt), 0))
+        time_format = export.get("time_format")
+        self.combo_time_format.setCurrentIndex(next(
+            (i for i, (_label, value) in enumerate(TIME_FORMAT_CHOICES)
+             if value == time_format), 0))
         self._sync_resample_hint()
-        # Step 14：若调用方直接给了填充字段就用它（预设不含这两项 → 回落路径默认）。
+        # 若调用方直接给了填充字段就用它（旧配置不含这两项 → 回落路径默认）。
         policy = export.get("fill_policy")
         if policy in FILL_INDEX:
             self._fill_touched = True
@@ -1071,8 +1202,8 @@ class MainWindow(QMainWindow):
         else:
             self._fill_touched = False
         gap = export.get("ffill_max_gap_ms")
-        self.spin_fill_gap.setValue(int(round(gap)) if isinstance(gap, (int, float)) and gap > 0
-                                     else 0)
+        self.spin_fill_gap.setValue(float(gap) if isinstance(gap, (int, float))
+                                    and not isinstance(gap, bool) and gap > 0 else 0.0)
         self._sync_fill_hint()
 
     def apply_dbc_map(self, dbc_by_channel: dict | None) -> set[int]:
@@ -1118,6 +1249,43 @@ class MainWindow(QMainWindow):
             return {}
         value = data.get(PREVIEW_PRESET_KEY) if isinstance(data, dict) else None
         return value if isinstance(value, dict) else {}
+
+    # --------------------------------------------------------- 缓存设置 ----
+    def open_settings_dialog(self) -> None:
+        """「⚙ 设置」：编辑帧缓存上限 / 缓存目录（C2/C4）。"""
+        dialog = CacheSettingsDialog(self.preview_cache_budget_mb,
+                                     self.preview_cache_dir, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        budget, cache_dir = dialog.values()
+        if not self._apply_cache_settings(budget, cache_dir):
+            return
+        self.lbl_status.setText(f"缓存上限已设为 {self.preview_cache_budget_mb} MiB")
+
+    def _apply_cache_settings(self, budget: int, cache_dir: str | None,
+                              *, persist: bool = True) -> bool:
+        """更新内存中的缓存设置（可选持久化），并刷新状态栏 / tooltip。
+
+        校验失败返回 ``False``；调用方负责红字提示（本方法绝不弹窗）。
+        """
+        budget = int(budget)
+        if not (preset_store.CACHE_BUDGET_MIN_MB <= budget
+                <= preset_store.CACHE_BUDGET_MAX_MB):
+            return False
+        cache_dir = str(Path(cache_dir).expanduser()) if cache_dir else None
+        self.preview_cache_budget_mb = budget
+        self.preview_cache_dir = cache_dir
+        self._cache_settings = {"cache_budget_mb": budget, "cache_dir": cache_dir}
+        self._refresh_settings_tooltip()
+        if persist:
+            try:
+                preset_store.save_settings(self._cache_settings)
+            except preset_store.PresetError as exc:
+                self.statusBar().showMessage(
+                    f"缓存上限已设为 {budget} MiB（但设置写入失败：{exc}）")
+                return True
+        self.statusBar().showMessage(f"缓存上限已设为 {budget} MiB")
+        return True
 
     def save_preset(self, name: str) -> Path:
         """把当前 DBC 映射 + 选中信号 + 导出策略保存为命名配置，返回落盘路径。"""
@@ -1257,6 +1425,7 @@ class MainWindow(QMainWindow):
         finally:
             self._checks_guard = False
         self._cascade_checks()
+        self._sync_select_all_checkbox()
         self.last_restore = {"restored": restored, "missed": missed}
         return restored, missed
 
@@ -1296,7 +1465,7 @@ class MainWindow(QMainWindow):
             self._begin_determinate("解析中…")
         else:
             # 无 BLF（只按 DBC 列信号）时 total 恒为 0，才允许不确定态。
-            self._begin_busy("Phase 1/2 · 扫描中…")
+            self._begin_busy("阶段 1/2 · 扫描中…")
         self.lbl_status.setText("正在解析信号…")
         self.statusBar().showMessage("正在解析信号…")
         self.scan_worker = Worker("scan", blf_paths=[e.path for e in self.entries],
@@ -1592,12 +1761,16 @@ class MainWindow(QMainWindow):
         finally:
             self._checks_guard = previous
         self.signal_view.expandToDepth(0)
+        # Step 19 D2：树重建后重算标题行的三态复选框（全选 / 部分 / 全不选）。
+        self._sync_select_all_checkbox()
 
     def _on_search_changed(self, text: str) -> None:
         self.signal_proxy.set_keyword(text)
         self.signal_view.expandAll() if text else self.signal_view.collapseAll()
         if not text:
             self.signal_view.expandToDepth(0)
+        # 过滤后「当前可见」集合变了，复选框的 x/y 计数必须同步（D2）。
+        self._sync_select_all_checkbox()
 
     def _on_item_changed(self, item: QStandardItem) -> None:
         """勾选联动：向下广播，再向上重算父节点三态。"""
@@ -1614,8 +1787,112 @@ class MainWindow(QMainWindow):
                 parent = parent.parent()
         finally:
             self._checks_guard = False
+        # Step 19 D2：树勾选变化 → 重算标题行三态（blockSignals，绝不递归）。
+        self._sync_select_all_checkbox()
         # Step 16：勾选数变化会直接影响「📈 预览」/「📤 导出 HTML」是否可用。
         self._refresh_action_state()
+
+    def _iter_visible_items(self, parent=QModelIndex()):
+        """按代理模型递归产出「当前未被搜索过滤」的树节点（D2 的可见行）。"""
+        for row in range(self.signal_proxy.rowCount(parent)):
+            index = self.signal_proxy.index(row, 0, parent)
+            item = self.signal_model.itemFromIndex(self.signal_proxy.mapToSource(index))
+            if item is None:
+                continue
+            yield item
+            yield from self._iter_visible_items(index)
+
+    @staticmethod
+    def _collect_signal_items(item: QStandardItem):
+        """递归产出节点下全部信号叶子（跨过不可勾选的 DBC 容器）。"""
+        for row in range(item.rowCount()):
+            child = item.child(row)
+            if child.data(NODE_ROLE) == NODE_SIGNAL:
+                yield child
+            else:
+                yield from MainWindow._collect_signal_items(child)
+
+    def _visible_signal_items(self) -> list[QStandardItem]:
+        """当前可见（未被搜索过滤）范围内的信号叶子，按对象去重。
+
+        只要一个通道/报文行仍可见，它下面的信号就视为可被这个复选框统一操作
+        （报文行勾选本来就会向下广播到全部信号，包括被过滤隐藏的同级信号）。
+        """
+        seen: set[int] = set()
+        result: list[QStandardItem] = []
+        for item in self._iter_visible_items():
+            kind = item.data(NODE_ROLE)
+            if kind == NODE_SIGNAL:
+                candidates = [item]
+            elif kind in (NODE_CHANNEL, NODE_DBC, NODE_MESSAGE):
+                candidates = list(self._collect_signal_items(item))
+            else:
+                candidates = []
+            for signal in candidates:
+                key = id(signal)
+                if key not in seen:
+                    seen.add(key)
+                    result.append(signal)
+        return result
+
+    def _visible_signal_states(self) -> tuple[int, int]:
+        """返回当前可见信号叶子的 ``(已勾选数, 总数)``（用于「全选（3/96）」文案）。"""
+        signals = self._visible_signal_items()
+        checked = sum(1 for item in signals
+                      if item.checkState() == Qt.CheckState.Checked)
+        return checked, len(signals)
+
+    def _sync_select_all_checkbox(self) -> None:
+        """把树里可见信号的勾选态映射到标题行三态复选框（不触发 clicked）。"""
+        checkbox = getattr(self, "chk_select_all", None)
+        if checkbox is None:
+            return
+        checked, total = self._visible_signal_states()
+        if total and checked == total:
+            state = Qt.CheckState.Checked
+        elif checked == 0:
+            state = Qt.CheckState.Unchecked
+        else:
+            state = Qt.CheckState.PartiallyChecked
+        checkbox.blockSignals(True)
+        try:
+            checkbox.setTristate(True)
+            checkbox.setCheckState(state)
+            checkbox.setText(f"全选（{checked}/{total}）")
+        finally:
+            checkbox.blockSignals(False)
+
+    def _set_visible_checked(self, checked: bool) -> None:
+        """把当前可见行的勾选态广播为全选 / 全不选，然后重算父节点三态。"""
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        self._checks_guard = True
+        try:
+            for item in self._iter_visible_items():
+                if not self._is_checkable(item):
+                    continue
+                item.setCheckState(state)
+                # 可见的通道/报文行代表其整棵子树：被搜索过滤隐藏的同级信号也一起
+                # 广播（否则「全选」在按报文名过滤时只改了父行）。
+                for row in range(item.rowCount()):
+                    self._apply_state_down(item.child(row), state)
+        finally:
+            self._checks_guard = False
+        self._cascade_checks()
+        self._sync_select_all_checkbox()
+        self._refresh_action_state()
+
+    def _on_select_all_clicked(self, checked: bool) -> None:
+        """三态复选框点击：部分/未选 → 全选；全选 → 全不选（与预览面板一致）。"""
+        if self._checks_guard:
+            return
+        self._set_visible_checked(bool(checked))
+        checked_count, total = self._visible_signal_states()
+        if checked:
+            self.statusBar().showMessage(
+                f"已全选当前可见信号（{checked_count}/{total}）")
+        else:
+            self.statusBar().showMessage(
+                f"已全不选当前可见信号（当前仍选中 {checked_count}/{total}）")
 
     def _apply_state_down(self, item: QStandardItem, state: Qt.CheckState) -> None:
         """向下广播勾选；DBC 等不可勾选容器只递归、不写状态。"""
@@ -1718,19 +1995,13 @@ class MainWindow(QMainWindow):
         style.unpolish(self.spin_fill_gap); style.polish(self.spin_fill_gap)
 
     def check_visible_items(self) -> None:
-        """把当前过滤结果中可见的通道/报文/信号全部勾选。"""
-        self._checks_guard = True
-        try:
-            count = sum(self._check_subtree(self.signal_model.itemFromIndex(
-                self.signal_proxy.mapToSource(self.signal_proxy.index(row, 0))))
-                for row in range(self.signal_proxy.rowCount()))
-        finally:
-            self._checks_guard = False
-        self._cascade_checks()
-        self.statusBar().showMessage(f"已勾选 {count} 个节点（含未展开层级）")
-        self._refresh_action_state()
+        """把当前过滤结果中可见的通道/报文/信号全部勾选（复选框与自检共用）。"""
+        self._set_visible_checked(True)
+        count, total = self._visible_signal_states()
+        self.statusBar().showMessage(f"已勾选当前可见信号（{count}/{total}）")
 
     def _check_subtree(self, item: QStandardItem | None) -> int:
+        """兼容旧调用：勾选一个子树并返回可勾选节点数（新代码走可见集合）。"""
         if item is None:
             return 0
         count = 0
@@ -1740,17 +2011,20 @@ class MainWindow(QMainWindow):
         return count + sum(self._check_subtree(item.child(row)) for row in range(item.rowCount()))
 
     def uncheck_all_items(self) -> None:
+        """全不选**整棵树**（不只是当前可见行；配置加载清场用）。"""
         self._checks_guard = True
         try:
             for row in range(self.signal_model.rowCount()):
                 self._apply_state_down(self.signal_model.item(row), Qt.CheckState.Unchecked)
         finally:
             self._checks_guard = False
+        self._cascade_checks()
+        self._sync_select_all_checkbox()
         self.statusBar().showMessage("已清空全部勾选（此时启动转换将不会导出任何信号）")
         self._refresh_action_state()
 
     def _cascade_checks(self) -> None:
-        """兜底：重算所有父节点勾选态（“全选当前过滤项”之后调用）。"""
+        """兜底：重算所有父节点勾选态（全选 / 全不选 / 配置恢复之后调用）。"""
         previous = self._checks_guard
         self._checks_guard = True
         try:
@@ -1994,15 +2268,30 @@ class MainWindow(QMainWindow):
         return max(0.0, min(0.99, frames / expected))
 
     def _progress_percent(self, phase: int, done: int, total: int, frames: int) -> int | None:
-        """``total > 0`` 时返回 0–100，``total == 0``（尚无进度）返回 ``None``。"""
+        """单条进度条的加权映射（Step 19 A1）。
+
+        * 阶段 1（解码）：``(done + within) / total`` 映射到 ``0..70``；
+          ``within`` 是当前文件的帧内估算（拿不到时为 0）。
+        * 阶段 2（合并导出）：``done / total`` 映射到 ``70..100``。
+
+        返回值上限固定为 :data:`_PROGRESS_RUNNING_MAX`（99）：100 只允许由
+        :meth:`_finish_progress_ok` 在成功终态写入。``total == 0`` 返回 ``None``
+        （尚无确定进度，走 busy 动画）。
+        """
         if total <= 0:
             return None
         if phase == 1:
             within = self._current_file_fraction(frames) or 0.0
             fraction = (done + within) / total
+            # 文件完成事件有时 done == total，within 仍可能 >0；先夹到 0..1，
+            # 否则阶段 1 会越过 70 的份额侵占阶段 2 的区间。
+            fraction = max(0.0, min(1.0, fraction))
+            raw = _PHASE1_SHARE * fraction
         else:
-            fraction = done / total
-        return max(0, min(100, int(round(fraction * 100))))
+            fraction = max(0.0, min(1.0, done / total))
+            raw = _PHASE1_SHARE + _PHASE2_SHARE * fraction
+        raw = max(0.0, min(float(_PROGRESS_RUNNING_MAX), raw * 100.0))
+        return int(round(raw))
 
     def _bytes_progress_text(self) -> str | None:
         """``412 MB / 1.2 GB``；含文件内估算或无法精确归属时前面加 ``≈``。"""
@@ -2070,8 +2359,11 @@ class MainWindow(QMainWindow):
             elapsed = (time.monotonic() - pv["started"]) if pv["started"] else 0.0
             parts: list[str] = []
             if pv["phase"]:
-                parts.append(f"Phase {int(pv['phase'])}/2")
-            parts.append(PHASE_STAGE_LABELS.get(str(pv["stage"] or ""), "处理中"))
+                # A3：阶段名一眼可读；阶段 1 负责解码、阶段 2 负责合并导出。
+                parts.append(_PHASE_HEADINGS.get(int(pv["phase"]),
+                                                 f"阶段 {int(pv['phase'])}/2"))
+            else:
+                parts.append(PHASE_STAGE_LABELS.get(str(pv["stage"] or ""), "处理中"))
             if pv["total"] > 0:
                 parts.append(f"{pv['done']}/{pv['total']} 文件")
             if pv["file"]:
@@ -2095,7 +2387,8 @@ class MainWindow(QMainWindow):
                                            else percent_text)
         if percent is not None and not pv["busy"]:
             self.progress_bar.setRange(0, 100)
-            self.progress_bar.setValue(int(percent))
+            # A2：setValue(max(当前值, 新值)) —— 任何路径都不得让进度条回退。
+            self.progress_bar.setValue(max(self.progress_bar.value(), int(percent)))
 
     def _on_progress_tick(self) -> None:
         """200ms 心跳：busy 时让进度条来回扫动（保证"已经在动"），并刷新「已用」。"""
@@ -2104,20 +2397,18 @@ class MainWindow(QMainWindow):
             return
         if pv["busy"] or pv["value"] is None:
             self._busy_pos += self._busy_step
-            if self._busy_pos >= 100:
-                self._busy_pos = 100
+            if self._busy_pos >= _BUSY_SWEEP_MAX:
+                self._busy_pos = _BUSY_SWEEP_MAX
                 self._busy_step = -abs(self._busy_step)
             elif self._busy_pos <= 0:
                 self._busy_pos = 0
                 self._busy_step = abs(self._busy_step)
             self.progress_bar.setRange(0, 100)
-            self.progress_bar.setValue(self._busy_pos)
+            self.progress_bar.setValue(max(self.progress_bar.value(), self._busy_pos))
         self._render_progress()
 
     def _on_convert_progress(self, payload: dict) -> None:
-        """进度回调（已转发回主线程）：记录原样 payload → 刷新进度区与文件状态。"""
-        if self.progress_hook is not None:
-            self.progress_hook(dict(payload))
+        """进度回调（已转发回主线程）：刷新进度区与文件状态 → 原样记录 payload。"""
         now = time.monotonic()
         phase = int(payload.get("phase", 1) or 1)
         stage = str(payload.get("stage") or "")
@@ -2153,11 +2444,16 @@ class MainWindow(QMainWindow):
         pv["busy"] = total <= 0
         pv["value"] = self._progress_percent(phase, done, total, frames)
         self._render_progress()
+        # --selftest-progress-monotonic 通过 progress_hook 读到的必须是**已渲染后**的
+        # 进度条数值（A2），因此回调放在 _render_progress 之后。
+        if self.progress_hook is not None:
+            self.progress_hook(dict(payload))
         label = str(payload.get("message")
                     or PHASE_FALLBACK.get(stage, "处理中"))
         if total > 0 and "(" not in label:
             label = f"{label} ({done}/{total})"
-        self.lbl_status.setText(f"Phase {phase}/2: {label}")
+        heading = _PHASE_HEADINGS.get(phase) or f"阶段 {phase}/2"
+        self.lbl_status.setText(f"{heading}：{label}")
         if file_path:
             self._set_file_status(str(file_path), STATUS_PARSING)
         if phase == 2 or stage in ("merge", "export"):
@@ -2343,8 +2639,13 @@ class MainWindow(QMainWindow):
         return list(dict.fromkeys(keys))
 
     def _preview_session_config(self, selection: dict, time_format: str) -> dict:
-        """``open_plot_session`` 的 config（§1.4）。缓存目录稳定，便于跨进程命中。"""
-        cache_dir = Path(tempfile.gettempdir()) / "fblf_preview_cache"
+        """``open_plot_session`` 的 config（§1.4）。
+
+        Step 19 C3：``cache_budget_mb`` / ``cache_dir`` 一律来自 ``settings.json``
+        （``cache_dir`` 为空时用稳定的系统临时目录），打开预览时**不读硬编码常量**。
+        """
+        cache_dir = (Path(self.preview_cache_dir).expanduser() if self.preview_cache_dir
+                     else Path(tempfile.gettempdir()) / "fblf_preview_cache")
         return {
             "blf_paths": [entry.path for entry in self.entries],
             "dbc_by_channel": self._merged_dbc_map(),
@@ -2669,8 +2970,12 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------- F1 三个动作 ----
     def _on_preview_budget_retry(self, budget: int) -> None:
-        """F1-1：提高上限并重试（预算来自预览窗口里的设置对话框）。"""
-        self.preview_cache_budget_mb = int(budget)
+        """F1-1：提高上限并重试（预算来自预览窗口里的设置对话框，并持久化）。"""
+        if not self._apply_cache_settings(int(budget), self.preview_cache_dir):
+            self.statusBar().showMessage(
+                f"缓存上限 {budget} MiB 不在 "
+                f"{preset_store.CACHE_BUDGET_MIN_MB}..{preset_store.CACHE_BUDGET_MAX_MB} 范围内")
+            return
         self._close_preview_window()
         if not self._plot_selection:
             self.statusBar().showMessage("预览上下文已丢失，请重新点「📈 预览」")
@@ -3091,23 +3396,33 @@ def run_selftest_config() -> int:
         window = MainWindow()
         print("[config] 1/6 MainWindow 构建完成", flush=True)
         selected = {"1": {"SelfMsg": ["SelfVal"]}}
-        export = {"split_by_message": False, "resample_hz": 10.0, "export_format": "parquet"}
+        # B1/B4：6 个字段全部显式给值，保存后逐字段核对 JSON。
+        export = {
+            "split_by_message": False,
+            "resample_hz": 10.0,
+            "export_format": "parquet",
+            "time_format": "absolute",
+            "fill_policy": "linear",
+            "ffill_max_gap_ms": 50.0,
+        }
         # 1) 构造配置并保存，逐字段核对 JSON。
         saved = preset_store.save_preset("BMS项目A", {1: dbc, 2: dbc}, selected, export)
         assert saved.is_file(), "保存后文件不存在"
         print("[config] 2/6 预设已保存并落盘", flush=True)
         raw = json.loads(saved.read_text(encoding="utf-8"))
-        assert raw.get("schema") == 1, f"schema={raw.get('schema')!r}"
+        assert raw.get("schema") == preset_store.SCHEMA == 2, \
+            f"schema={raw.get('schema')!r}"
         assert raw.get("name") == "BMS项目A", f"name={raw.get('name')!r}"
         assert raw.get("dbc_by_channel") == {"1": dbc, "2": dbc}, "dbc_by_channel 不一致"
         assert raw.get("selected") == selected, f"selected={raw.get('selected')!r}"
         assert raw.get("export") == export, f"export={raw.get('export')!r}"
-        # 2) 清空 UI 状态 → 走加载流程 → 断言 DBC / 勾选 / 导出策略都被恢复。
+        assert set(raw.get("export") or {}) == set(preset_store.DEFAULT_EXPORT), \
+            f"export 字段不全：{sorted((raw.get('export') or {}))!r}"
+        # 2) 清空 UI 状态 → 走加载流程 → 断言 DBC / 勾选 / 6 个导出字段都被恢复。
         window.dbc_by_channel.clear()
         window._remove_dbc_nodes()
         window.uncheck_all_items()
-        window.apply_export_policy({"split_by_message": True, "resample_hz": None,
-                                    "export_format": "csv"})
+        window.apply_export_policy(dict(preset_store.DEFAULT_EXPORT))
         assert window.build_selection() == {}, "清空后仍有勾选残留"
         window.apply_preset(preset_store.read_preset(saved))
         assert _pump_scan(app, window), "加载配置后的自动解析超时"
@@ -3115,19 +3430,83 @@ def run_selftest_config() -> int:
         assert not window.missing_dbc_channels, f"误报缺失={window.missing_dbc_channels}"
         assert window.current_export_policy() == export, \
             f"导出策略={window.current_export_policy()!r}"
+        # B3：加载后 6 个控件逐个同步（不是只回读 policy）。
+        assert window.chk_split.isChecked() is False, "拆表复选框未同步"
+        assert RESAMPLE_CHOICES[window.combo_resample.currentIndex()][1] == 10.0, \
+            "重采样控件未同步"
+        assert FORMAT_CHOICES[window.combo_format.currentIndex()][1] == "parquet", \
+            "导出格式控件未同步"
+        assert window._current_time_format() == "absolute", "时间格式控件未同步"
+        assert window._fill_policy() == "linear", "填充方式控件未同步"
+        assert window._fill_gap_ms() == 50.0, "最大保持时长控件未同步"
         assert window.last_restore.get("restored") == 1, f"恢复信号={window.last_restore!r}"
         assert window.last_restore.get("missed") == 0, f"未匹配={window.last_restore!r}"
         assert window.build_selection() == selected, f"恢复后勾选={window.build_selection()!r}"
-        print("[config] 3/6 加载预设 + 自动解析 + 勾选恢复完成", flush=True)
+        print("[config] 3/6 加载预设 + 自动解析 + 勾选/6 字段恢复完成", flush=True)
         # 3) UI 侧保存路径同样可往返（复用已恢复的勾选）。
         ui_saved = window.save_preset("UI往返")
         ui_raw = json.loads(ui_saved.read_text(encoding="utf-8"))
         assert ui_raw.get("selected") == selected, f"UI 保存 selected={ui_raw.get('selected')!r}"
         assert ui_raw.get("dbc_by_channel") == {"1": dbc, "2": dbc}, "UI 保存 DBC 不一致"
+        assert ui_raw.get("export") == export, f"UI 保存 export={ui_raw.get('export')!r}"
         print("[config] 4/6 UI 侧保存往返完成", flush=True)
         channels = len(window.dbc_by_channel)
         signals = int(window.last_restore["restored"])
         policy = window.current_export_policy()
+        # 3b) B2：非法值回落默认 + warnings；B4：schema 1 旧配置补默认值。
+        legacy = {
+            "schema": 1,
+            "name": "旧版配置",
+            "saved_at": "2026-01-01T00:00:00+08:00",
+            "dbc_by_channel": {"1": dbc},
+            "selected": selected,
+            "export": {"split_by_message": True, "resample_hz": None,
+                       "export_format": "csv"},
+        }
+        legacy_path = temp_root / "legacy_schema1.json"
+        legacy_path.write_text(json.dumps(legacy, ensure_ascii=False, indent=2) + "\n",
+                               encoding="utf-8")
+        legacy_preset = preset_store.read_preset(legacy_path)
+        expected_legacy = dict(preset_store.DEFAULT_EXPORT)
+        expected_legacy.update({"split_by_message": True, "resample_hz": None,
+                                "export_format": "csv"})
+        assert legacy_preset.export == expected_legacy, \
+            f"schema1 补齐结果={legacy_preset.export!r}"
+        assert legacy_preset.export["time_format"] == "relative_s", "schema1 未补 time_format"
+        assert legacy_preset.export["fill_policy"] == "hold", "schema1 未补 fill_policy"
+        assert legacy_preset.export["ffill_max_gap_ms"] is None, \
+            "schema1 未补 ffill_max_gap_ms"
+        assert legacy_preset.warnings == [], f"schema1 误报 warnings={legacy_preset.warnings!r}"
+        window.apply_export_policy(legacy_preset.export)
+        assert window.current_export_policy() == expected_legacy, \
+            f"schema1 控件同步={window.current_export_policy()!r}"
+        bad_path = temp_root / "bad_export.json"
+        bad_export = {"split_by_message": True, "resample_hz": -1,
+                      "export_format": "bogus", "time_format": "bogus",
+                      "fill_policy": "bogus", "ffill_max_gap_ms": 0}
+        bad_path.write_text(json.dumps({"schema": 2, "name": "bad", "export": bad_export},
+                                       ensure_ascii=False, indent=2) + "\n",
+                            encoding="utf-8")
+        bad_preset = preset_store.read_preset(bad_path)
+        assert bad_preset.export["resample_hz"] is None, "非法重采样未回落"
+        assert bad_preset.export["export_format"] == "csv", "非法导出格式未回落"
+        assert bad_preset.export["time_format"] == "relative_s", "非法时间格式未回落"
+        assert bad_preset.export["fill_policy"] == "hold", "非法填充方式未回落"
+        assert bad_preset.export["ffill_max_gap_ms"] is None, "非法保持时长未回落"
+        assert len(bad_preset.warnings) == 5, f"warnings={bad_preset.warnings!r}"
+        # 3c) C1：settings.json 与预设分离，预设扫描不得把它当坏配置。
+        settings_saved = preset_store.save_settings(
+            {"cache_budget_mb": 512, "cache_dir": str(temp_root / "cache")})
+        assert settings_saved.name == preset_store.SETTINGS_FILENAME, "设置文件名错误"
+        settings_raw = json.loads(settings_saved.read_text(encoding="utf-8"))
+        assert settings_raw == {"cache_budget_mb": 512,
+                                "cache_dir": str(temp_root / "cache")}, \
+            f"settings={settings_raw!r}"
+        assert preset_store.read_settings() == settings_raw, "设置读取不一致"
+        presets_now, _skipped_now = preset_store.scan_presets()
+        assert all(item.name != preset_store.SETTINGS_FILENAME for item in presets_now), \
+            "settings.json 被误当预设"
+        print("[config] 4b/6 schema1 兼容 / 非法回落 / settings.json 完成", flush=True)
         # 4) 缺失 DBC：一个路径指向不存在的文件，加载不得抛异常且通道进"缺失"集合。
         missing_dbc = str(temp_root / "does_not_exist.dbc")
         missing_saved = preset_store.save_preset(
@@ -3483,6 +3862,111 @@ def run_selftest_progress() -> int:
     print(f"PROGRESS_OK phase1={len(phase1)} phase2={len(phase2)} frames_max={frames_max} "
           f"timefmt_relative={'ok' if relative_ok else 'fail'} "
           f"timefmt_absolute={'ok' if absolute_ok else 'fail'} bench={bench_text}")
+    return 0
+
+
+def run_selftest_progress_monotonic() -> int:
+    """``--selftest-progress-monotonic``：真实转换的进度条单调性验收（Step 19 A2）。
+
+    对 ``multi_channel.blf`` + ``demo.dbc`` 真跑 CSV / Parquet 两次转换，在
+    ``progress_hook`` 里记录每次回调后的 ``progress_bar.value()``，断言：
+
+    * 整条进度序列单调不减（phase 1 → phase 2 切换处也不回退）；
+    * 终值 100 且 100 只在序列末尾出现一次；
+    * phase 2 的起点不低于 phase 1 的峰值（加权映射：70% 交界）。
+
+    成功打印 ``MONO_OK phase1_max=.. phase2_start=.. final=100 seq_len=..``，返回 0。
+    """
+    if core is None:
+        print("MONO_SKIP no_kernel")
+        return 0
+    root = Path(__file__).resolve().parent.parent
+    blf_path = (root / "fixtures" / "multi_channel.blf").resolve()
+    dbc_path = (root / "fixtures" / "demo.dbc").resolve()
+    absent = [str(p) for p in (blf_path, dbc_path) if not p.is_file()]
+    if absent:
+        print(f"MONO_SKIP no_fixture {' '.join(absent)}")
+        return 0
+    app = QApplication.instance()
+    if app is None:
+        print("MONO_FAIL no_qapplication")
+        return 2
+    window: MainWindow | None = None
+    temp_dirs: list[Path] = []
+    phase1_max = 0
+    phase2_start = 100
+    seq_len = 0
+
+    def _run(export_format: str) -> tuple[list[tuple[int, int]], dict | None, str | None]:
+        out_dir = Path(tempfile.mkdtemp(prefix=f"fblf_mono_{export_format}_"))
+        temp_dirs.append(out_dir)
+        index = next((i for i, (_label, value) in enumerate(FORMAT_CHOICES)
+                      if value == export_format), 0)
+        window.combo_format.setCurrentIndex(index)
+        sequence: list[tuple[int, int]] = []  # (进度条值, payload.phase)
+
+        def hook(payload: dict) -> None:
+            sequence.append((int(window.progress_bar.value()),
+                             int(payload.get("phase", 1) or 1)))
+
+        window.progress_hook = hook
+        try:
+            window.start_convert(str(out_dir))
+            if not _pump_convert(app, window):
+                raise AssertionError(f"{export_format} 转换超时")
+        finally:
+            window.progress_hook = None
+        # 成功终态由 _finish_progress_ok 写入 100；补记最后一格（不属于 progress_cb）。
+        sequence.append((int(window.progress_bar.value()), 2))
+        return sequence, window.last_report, window.last_error
+
+    try:
+        window = MainWindow()
+        window.quiet_dialogs = True
+        _setup_scan_tree(window, str(blf_path), {1: str(dbc_path), 2: str(dbc_path)})
+        for export_format in ("csv", "parquet"):
+            sequence, report, error = _run(export_format)
+            if error is not None:
+                raise AssertionError(f"{export_format} 转换失败：{error}")
+            if not report or not report.get("ok"):
+                raise AssertionError(f"{export_format} 未返回 ok=True 的报告")
+            values = [value for value, _phase in sequence]
+            for previous, current in zip(values, values[1:]):
+                if current < previous:
+                    raise AssertionError(
+                        f"{export_format} 进度回退：{values}")
+            if not values or values[-1] != 100:
+                raise AssertionError(f"{export_format} 终值不是 100：{values}")
+            if values.count(100) != 1 or values.index(100) != len(values) - 1:
+                raise AssertionError(f"{export_format} 100 出现在结束前：{values}")
+            run_phase1 = [value for value, phase in sequence if phase == 1]
+            run_phase2 = [value for value, phase in sequence if phase == 2]
+            if not run_phase1:
+                raise AssertionError(f"{export_format} 没收到 phase 1 回调")
+            if not run_phase2:
+                raise AssertionError(f"{export_format} 没收到 phase 2 回调")
+            run_phase1_max = max(run_phase1)
+            run_phase2_start = run_phase2[0]
+            if run_phase2_start < run_phase1_max:
+                raise AssertionError(
+                    f"{export_format} phase 切换回退：phase1_max={run_phase1_max} "
+                    f"phase2_start={run_phase2_start} seq={values}")
+            phase1_max = max(phase1_max, run_phase1_max)
+            phase2_start = min(phase2_start, run_phase2_start)
+            seq_len += len(values)
+            print(f"MONO_RUN export={export_format} phase1_max={run_phase1_max} "
+                  f"phase2_start={run_phase2_start} final={values[-1]} "
+                  f"seq_len={len(values)}", flush=True)
+    except Exception as exc:  # noqa: BLE001 - 自检要把任何异常变成可 grep 的失败行
+        print(f"MONO_FAIL {type(exc).__name__}: {exc}")
+        return 2
+    finally:
+        if window is not None:
+            _destroy_window(window)
+        for path in temp_dirs:
+            shutil.rmtree(path, ignore_errors=True)
+    print(f"MONO_OK phase1_max={phase1_max} phase2_start={phase2_start} "
+          f"final=100 seq_len={seq_len}")
     return 0
 
 
@@ -4034,6 +4518,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
     selftest = "--selftest" in args[1:]
     deep = "--selftest-deep" in args[1:]
     config_test = "--selftest-config" in args[1:]
+    monotonic_test = "--selftest-progress-monotonic" in args[1:]
     progress_test = "--selftest-progress" in args[1:]
     parse_test = "--selftest-parse" in args[1:]
     fill_test = "--selftest-fill" in args[1:]
@@ -4051,6 +4536,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
         return run_selftest_config()
     if fill_test:
         return run_selftest_fill()
+    if monotonic_test:
+        return run_selftest_progress_monotonic()
     if progress_test:
         return run_selftest_progress()
     if parse_test:
