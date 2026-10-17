@@ -5587,3 +5587,593 @@ fn step17c_export_html_absolute_axis_and_header() {
     })
     .expect("Python 侧断言失败");
 }
+
+// ---------------------------------------------------------------------------
+// Fix A：帧缓存/会话正确性与 GIL 安全（A1~A8 自证）
+// ---------------------------------------------------------------------------
+
+const FIXA_DBC: &str = r#"VERSION ""
+
+BO_ 256 MsgA: 8 Vector__XXX
+ SG_ A : 0|16@1+ (1,0) [0|65535] "" Vector__XXX
+
+BO_ 512 MsgB: 8 Vector__XXX
+ SG_ B : 0|16@1+ (1,0) [0|65535] "" Vector__XXX
+
+BO_ 768 MsgC: 8 Vector__XXX
+ SG_ C : 0|16@1+ (1,0) [0|65535] "" Vector__XXX
+"#;
+
+/// 三报文合成现场（Fix A 的 A2/A3 用）：每条 2000 帧、间隔 10 ms。
+fn write_fixa_fixture(dir: &Path) -> (PathBuf, PathBuf) {
+    let blf = dir.join("fixa.blf");
+    let dbc = dir.join("fixa.dbc");
+    std::fs::write(&dbc, FIXA_DBC).expect("写入 Fix A DBC");
+    let mut writer = blf_asc::BlfWriter::create(&blf).expect("创建 Fix A BLF");
+    for i in 0..2000u32 {
+        for (offset, id) in [0u16, 1, 2].into_iter().zip([0x100u32, 0x200, 0x300]) {
+            let value = ((i as u16).wrapping_mul(7).wrapping_add(offset)) % 1000;
+            let mut data = vec![0u8; 8];
+            data[0..2].copy_from_slice(&value.to_le_bytes());
+            push_msg(&mut writer, 0, id, i as f64 * 0.01, data);
+        }
+    }
+    writer.finish().expect("完成 Fix A BLF");
+    (blf, dbc)
+}
+
+/// 一条单报文的选择（Fix A 里频繁用到）。
+fn fixa_selection(message: &str) -> Selection {
+    let mut per_channel: HashMap<String, Vec<String>> = HashMap::new();
+    per_channel.insert(message.to_string(), Vec::new());
+    let mut selection = Selection::default();
+    selection.channels.insert(1, per_channel);
+    selection
+}
+
+fn fixa_refs(plan: &DecodePlan) -> Vec<&fast_blf_core::MessagePlan> {
+    plan.messages().collect()
+}
+
+/// Fix A1：`view()` 只在锁内取快照，I/O 全在锁外 —— 忙 view 期间 `info()` 仍能立刻返回。
+///
+/// 旧实现全程持 state 锁做逐桶 `read_at`，观察线程的 `info()` 会被堵到 view 结束；
+/// 新实现下观察线程在同一个观察窗口内能成功调用几十次。
+#[test]
+fn fixa_a1_view_does_not_hold_state_lock_during_io() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc) = write_step17_fixture(dir.path());
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        let config = step17_config(py, &blf, &dbc, None, &cache_dir, 200, "relative_s")?;
+        let session = fast_blf_core::open_plot_session(py, &config, None)?;
+        session.add_signals(py, PyList::new(py, ["ch1/MsgA/A"])?.as_any())?;
+
+        // 宽 view（50000 桶）会做大量随机读，足够长地占住 I/O 时间。
+        let started = std::time::Instant::now();
+        let probe = session.view(py, 0.0, 59.999, 50_000)?;
+        let single_view = started.elapsed();
+        let probe_points = probe
+            .get_item("t")?
+            .expect("view 必须含 t")
+            .cast_into::<PyList>()?
+            .len();
+        drop(probe);
+        assert!(probe_points > 0, "宽 view 必须有数据");
+
+        let watching = AtomicBool::new(true);
+        let calls = AtomicU64::new(0);
+        let max_latency = AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                while watching.load(Ordering::Relaxed) {
+                    let started = std::time::Instant::now();
+                    let result = Python::attach(|py| {
+                        session
+                            .info(py)
+                            .map(|_| ())
+                            .map_err(|err| err.to_string())
+                    });
+                    assert!(result.is_ok(), "info() 必须始终可用：{result:?}");
+                    let millis = started.elapsed().as_millis() as u64;
+                    max_latency.fetch_max(millis, Ordering::Relaxed);
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+            for _ in 0..4 {
+                let _ = session.view(py, 0.0, 59.999, 50_000).expect("宽 view");
+            }
+            watching.store(false, Ordering::Relaxed);
+            // 主线程默认持着 GIL；等观察线程时必须先放手，否则两边都进不去。
+            py.detach(|| {
+                let _ = watcher.join();
+            });
+        });
+
+        let calls = calls.load(Ordering::Relaxed);
+        let max_latency = max_latency.load(Ordering::Relaxed);
+        println!(
+            "FIXA_A1 single_view={:.1}ms points={probe_points} info_calls={calls} info_max={max_latency}ms",
+            single_view.as_secs_f64() * 1000.0
+        );
+        // 旧实现下观察线程在整个 view 期间一次都拿不到锁（calls 只会是 0~1）。
+        assert!(
+            calls >= 20,
+            "view() 期间 info() 必须能反复返回（实际 {calls} 次）"
+        );
+        assert!(
+            max_latency < 300,
+            "info() 单次耗时必须远小于 view：{max_latency}ms"
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// Fix A1（续）：`close()` 后预取在下个检查点退出，且**不**写回半成品 meta；
+/// 会话级 `close()` 也立刻把 `prefetch_status` 置为“已关闭会话”。
+#[test]
+fn fixa_a1_close_aborts_prefetch_without_writing_meta() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc) = write_fixa_fixture(dir.path());
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        // 只选 MsgA 建 key：目录里只有 MsgA 段。
+        let config =
+            step17_config_multi(py, &blf, &dbc, &[("MsgA", "A")], &cache_dir, 200, "relative_s")?;
+        let session = fast_blf_core::open_plot_session(py, &config, None)?;
+        let key_dir = step17_cache_key_dir(&cache_dir);
+        let key = key_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        session.close();
+
+        let mut dbc_map = BTreeMap::new();
+        dbc_map.insert(1u32, dbc.clone());
+        let paths = vec![blf.clone()];
+        let plan = DecodePlan::build(&dbc_map, &fixa_selection("MsgB")).expect("构建 MsgB 计划");
+        let refs = fixa_refs(&plan);
+        let options = fast_blf_core::frame_cache::CacheOptions {
+            blf_paths: &paths,
+            dbc_by_channel: &dbc_map,
+            cache_dir: &cache_dir,
+            budget_mb: 200,
+        };
+        let before = fast_blf_core::frame_cache::read_meta(&key_dir).expect("读 meta");
+
+        // abort 一上来就是 true（等价于 close() 发生在预取开始前）。
+        let err = fast_blf_core::frame_cache::prefetch_cache(
+            &options,
+            &key,
+            &refs,
+            &|_payload| {},
+            &|| true,
+        )
+        .expect_err("abort=true 的预取必须中止");
+        assert_eq!(
+            err.code,
+            fast_blf_core::frame_cache::CACHE_ABORTED,
+            "必须是可识别的中止错误：{err}"
+        );
+
+        let after = fast_blf_core::frame_cache::read_meta(&key_dir).expect("读 meta");
+        assert_eq!(
+            after.messages.len(),
+            before.messages.len(),
+            "中止后不得把半成品段写进 meta"
+        );
+        assert!(
+            after.message(1, 0x200).is_none(),
+            "被中止的报文绝不能出现在 meta 里"
+        );
+        println!(
+            "FIXA_A1_ABORT code={} messages_before={} messages_after={}",
+            err.code,
+            before.messages.len(),
+            after.messages.len()
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// Fix A1（续）：会话级 `close()` 期间正在预取 —— 状态必须立刻收敛到“已关闭”。
+#[test]
+fn fixa_a1_close_marks_prefetch_status_closed() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc) = write_fixa_fixture(dir.path());
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        let config_a =
+            step17_config_multi(py, &blf, &dbc, &[("MsgA", "A")], &cache_dir, 200, "relative_s")?;
+        let first = fast_blf_core::open_plot_session(py, &config_a, None)?;
+        first.close();
+
+        let config_all = step17_config_multi(
+            py,
+            &blf,
+            &dbc,
+            &[("MsgA", "A"), ("MsgB", "B"), ("MsgC", "C")],
+            &cache_dir,
+            200,
+            "relative_s",
+        )?;
+        let second = fast_blf_core::open_plot_session(py, &config_all, None)?;
+        // open 立即返回，缺的两个报文进了后台预取。
+        second.close();
+        let status = second.prefetch_status(py)?;
+        let busy: bool = status.get_item("busy")?.unwrap().extract()?;
+        let message: String = status.get_item("message")?.unwrap().extract()?;
+        assert!(!busy, "close() 后 prefetch 必须报不忙");
+        assert!(message.contains("已关闭"), "message={message}");
+        // 给预取线程一点时间，确认它没有把 busy 又置回 true。
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let status = second.prefetch_status(py)?;
+        let busy: bool = status.get_item("busy")?.unwrap().extract()?;
+        assert!(!busy, "中止后预取不得复活：{status:?}");
+        let view = second.view(py, 0.0, 19.999, 500)?;
+        let t = view.get_item("t")?.unwrap().cast_into::<PyList>()?.len();
+        assert_eq!(t, 0, "已关闭的会话不得再返回数据");
+        println!("FIXA_A1_CLOSE busy={busy} message={message}");
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// Fix A2：两个线程分别以不同报文集合对同一 key 触发预取，
+/// 结束后 `meta.messages` 必须**同时**含两边的报文。
+#[test]
+fn fixa_a2_concurrent_prefetch_keeps_both_message_sets() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc) = write_fixa_fixture(dir.path());
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        let config =
+            step17_config_multi(py, &blf, &dbc, &[("MsgA", "A")], &cache_dir, 200, "relative_s")?;
+        let session = fast_blf_core::open_plot_session(py, &config, None)?;
+        let key_dir = step17_cache_key_dir(&cache_dir);
+        let key = key_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        session.close();
+        assert!(fast_blf_core::frame_cache::read_meta(&key_dir)
+            .expect("读 meta")
+            .message(1, 0x200)
+            .is_none());
+
+        let mut dbc_map = BTreeMap::new();
+        dbc_map.insert(1u32, dbc.clone());
+        let paths = vec![blf.clone()];
+        std::thread::scope(|scope| {
+            for message in ["MsgB", "MsgC"] {
+                let paths = paths.clone();
+                let dbc_map = dbc_map.clone();
+                let cache_dir = cache_dir.clone();
+                let key = key.clone();
+                scope.spawn(move || {
+                    let plan = DecodePlan::build(&dbc_map, &fixa_selection(message))
+                        .expect("构建预取计划");
+                    let refs = fixa_refs(&plan);
+                    assert!(!refs.is_empty(), "{message} 必须有报文");
+                    let options = fast_blf_core::frame_cache::CacheOptions {
+                        blf_paths: &paths,
+                        dbc_by_channel: &dbc_map,
+                        cache_dir: &cache_dir,
+                        budget_mb: 200,
+                    };
+                    fast_blf_core::frame_cache::prefetch_cache(
+                        &options,
+                        &key,
+                        &refs,
+                        &|_payload| {},
+                        &|| false,
+                    )
+                    .expect("并发预取");
+                });
+            }
+        });
+
+        let meta = fast_blf_core::frame_cache::read_meta(&key_dir).expect("读最终 meta");
+        let names: Vec<&str> = meta
+            .messages
+            .iter()
+            .map(|message| message.message.as_str())
+            .collect();
+        assert!(names.contains(&"MsgA"), "原有的 MsgA 不得丢：{names:?}");
+        assert!(names.contains(&"MsgB"), "并发写入的 MsgB 不得丢：{names:?}");
+        assert!(names.contains(&"MsgC"), "并发写入的 MsgC 不得丢：{names:?}");
+        println!("FIXA_A2 messages={names:?}");
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// Fix A3：会话 A 持有 key1 的租约；会话 B（另一个 key）触发 LRU 时
+/// key1 必须存活，而无租约的旧 key 必须被删。
+#[test]
+fn fixa_a3_lease_protects_key_from_other_sessions_lru() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc) = write_fixa_fixture(dir.path());
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        let config =
+            step17_config_multi(py, &blf, &dbc, &[("MsgA", "A")], &cache_dir, 200, "relative_s")?;
+        let session_a = fast_blf_core::open_plot_session(py, &config, None)?;
+        let key_dir_a = step17_cache_key_dir(&cache_dir);
+        assert!(
+            fast_blf_core::frame_cache::has_lease(&key_dir_a),
+            "open 必须在 key 目录写 .inuse-* 租约"
+        );
+
+        // 造一个无租约的旧 key，撑爆 32 MiB 预算。
+        let old_dir = cache_dir.join("fixa_old_key");
+        std::fs::create_dir_all(&old_dir).expect("创建旧 key 目录");
+        let data = std::fs::File::create(old_dir.join("ch1_id1.bin")).expect("创建旧 key 数据");
+        data.set_len(40 * 1024 * 1024).expect("扩展旧 key 数据");
+        drop(data);
+        let old_meta = serde_json::json!({
+            "format_version": fast_blf_core::CACHE_FORMAT_VERSION,
+            "key": "fixa_old_key",
+            "created_at": 1u64,
+            "cache_bytes": 40u64 * 1024 * 1024,
+            "t_min": 0.0,
+            "t_max": 1.0,
+            "abs_min_micros": null,
+            "abs_max_micros": null,
+            "files": [],
+            "messages": [],
+            "warnings": [],
+        });
+        std::fs::write(
+            old_dir.join("meta.json"),
+            serde_json::to_vec_pretty(&old_meta).expect("序列化旧 meta"),
+        )
+        .expect("写旧 meta");
+
+        // 改 mtime ⇒ 数据源 key 变化 ⇒ 会话 B 用另一个 key 目录（于是 LRU 会真的考虑 key1）。
+        let handle = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&blf)
+            .expect("打开 BLF 改 mtime");
+        handle
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(11))
+            .expect("修改 BLF mtime");
+        drop(handle);
+
+        let config_b =
+            step17_config_multi(py, &blf, &dbc, &[("MsgA", "A")], &cache_dir, 32, "relative_s")?;
+        let session_b = fast_blf_core::open_plot_session(py, &config_b, None)?;
+        let info_b = session_b.info(py)?;
+        let evicted: u64 = info_b.get_item("evicted_bytes")?.unwrap().extract()?;
+        assert!(!old_dir.exists(), "无租约的旧 key 必须被 LRU 删除");
+        assert!(
+            key_dir_a.exists(),
+            "会话 A 仍开着这个 key，LRU 绝不能删它"
+        );
+        assert!(
+            fast_blf_core::frame_cache::has_lease(&key_dir_a),
+            "租约文件必须还在"
+        );
+        assert!(evicted > 0, "evicted_bytes 必须回报删除量：{evicted}");
+        // 关闭 A 后租约消失，key1 才回到可回收候选。
+        session_a.close();
+        assert!(
+            !fast_blf_core::frame_cache::has_lease(&key_dir_a),
+            "close() 必须清掉自己的租约"
+        );
+        println!("FIXA_A3 evicted_bytes={evicted} leased_key_kept=true");
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// Fix A4：源帧 dlc > 实际 data 长度时，写入的 dlc 必须被夹紧，且必须进 `info().warnings`。
+#[test]
+fn fixa_a4_short_payload_is_clamped_and_warned() {
+    const DLC_DBC: &str = r#"VERSION ""
+
+BO_ 768 MsgS: 8 Vector__XXX
+ SG_ S : 0|16@1+ (1,0) [0|65535] "" Vector__XXX
+"#;
+    let dir = tempfile::tempdir().expect("临时目录");
+    let blf = dir.path().join("short_dlc.blf");
+    let dbc = dir.path().join("short_dlc.dbc");
+    std::fs::write(&dbc, DLC_DBC).expect("写 DBC");
+    let mut writer = blf_asc::BlfWriter::create(&blf).expect("创建 BLF");
+    for i in 0..3u32 {
+        // 关键：dlc 声明 12 字节，真实 data 只有 8 字节（经典 CAN 段只能存 8）。
+        let msg = blf_asc::Message {
+            timestamp: i as f64 * 0.1,
+            arbitration_id: 0x300u32.into(),
+            is_extended_id: false,
+            is_fd: false,
+            channel: 0,
+            dlc: 12,
+            data: vec![0x11u8; 8].into(),
+            ..Default::default()
+        };
+        writer.on_message_received(&msg).expect("写入超长 dlc 帧");
+    }
+    writer.finish().expect("完成 BLF");
+
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        let config =
+            step17_config_multi(py, &blf, &dbc, &[("MsgS", "S")], &cache_dir, 200, "relative_s")?;
+        let session = fast_blf_core::open_plot_session(py, &config, None)?;
+        let info = session.info(py)?;
+        let warnings: Vec<String> = info
+            .get_item("warnings")?
+            .unwrap()
+            .extract::<Vec<String>>()?;
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("MsgS") && warning.contains("DLC 大于实际数据长度")),
+            "短 payload 必须进 warnings：{warnings:?}"
+        );
+        let warning = warnings
+            .iter()
+            .find(|warning| warning.contains("DLC 大于实际数据长度"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(warning.contains('3'), "告警必须带计数：{warning}");
+
+        let key_dir = step17_cache_key_dir(&cache_dir);
+        let meta = fast_blf_core::frame_cache::read_meta(&key_dir).expect("读 meta");
+        let message = meta.message(1, 0x300).expect("meta 应含 MsgS");
+        assert_eq!(message.stride, 17, "MsgS 是经典 CAN");
+        assert_eq!(message.frames, 3);
+        for index in 0..message.frames {
+            let record = fast_blf_core::frame_cache::read_record_at(&key_dir, message, index)
+                .expect("读记录");
+            assert_eq!(record.dlc, 8, "写入的 dlc 必须夹到经典段容量 8");
+            assert_eq!(record.payload[0], 0x11, "真实 payload 必须保留");
+        }
+        println!("FIXA_A4 warning={warning}");
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// Fix A6：段文件缺失 ⇒ `view().truncated == true` 且 `info().warnings` 点名该段。
+#[test]
+fn fixa_a6_missing_segment_is_reported_not_silent() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc) = write_step17_fixture(dir.path());
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        let config = step17_config(py, &blf, &dbc, None, &cache_dir, 200, "relative_s")?;
+        let session = fast_blf_core::open_plot_session(py, &config, None)?;
+        session.add_signals(py, PyList::new(py, ["ch1/MsgA/A"])?.as_any())?;
+        let before = session.view(py, 0.0, 59.999, 500)?;
+        assert!(
+            !before.get_item("truncated")?.unwrap().extract::<bool>()?,
+            "数据齐全时不得报 truncated"
+        );
+
+        let key_dir = step17_cache_key_dir(&cache_dir);
+        let meta = fast_blf_core::frame_cache::read_meta(&key_dir).expect("读 meta");
+        let segment = meta.message(1, 0x100).expect("meta 应含 MsgA").file.clone();
+        std::fs::remove_file(key_dir.join(&segment)).expect("删掉段文件");
+
+        let view = session.view(py, 0.0, 59.999, 500)?;
+        let truncated: bool = view.get_item("truncated")?.unwrap().extract()?;
+        assert!(truncated, "段文件缺失必须置 truncated=true");
+        let info = session.info(py)?;
+        let warnings: Vec<String> = info
+            .get_item("warnings")?
+            .unwrap()
+            .extract::<Vec<String>>()?;
+        assert!(
+            warnings.iter().any(|warning| warning.contains(&segment)),
+            "warnings 必须点名缺失的段 {segment}：{warnings:?}"
+        );
+        // 真实错误必须被计数（不静默）。
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("视图读取共")),
+            "必须给出视图错误计数：{warnings:?}"
+        );
+        println!("FIXA_A6 truncated={truncated} segment={segment}");
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// Fix A7：桶稀疏（点数 < width）但数据可信 ⇒ `truncated == false`。
+#[test]
+fn fixa_a7_sparse_but_trusted_window_is_not_truncated() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc) = write_step17_fixture(dir.path());
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        let config = step17_config(py, &blf, &dbc, None, &cache_dir, 200, "relative_s")?;
+        let session = fast_blf_core::open_plot_session(py, &config, None)?;
+        session.add_signals(py, PyList::new(py, ["ch1/MsgA/A"])?.as_any())?;
+
+        // 50 万桶 / 6 万帧 ⇒ 绝大多数桶为空，点数必然 < width（确定性，不依赖夹具细节）。
+        let view = session.view(py, 0.0, 59.999, 500_000)?;
+        let truncated: bool = view.get_item("truncated")?.unwrap().extract()?;
+        let points = view
+            .get_item("t")?
+            .unwrap()
+            .cast_into::<PyList>()?
+            .len();
+        assert!(points > 0);
+        assert!(
+            points < 500_000,
+            "本用例需要稀疏窗口（点数 {points} 应 < width）"
+        );
+        assert!(
+            !truncated,
+            "稀疏不是缺数据：点数 {points} < width 时不得报 truncated"
+        );
+        let info = session.info(py)?;
+        let warnings: Vec<String> = info
+            .get_item("warnings")?
+            .unwrap()
+            .extract::<Vec<String>>()?;
+        assert!(
+            !warnings.iter().any(|warning| warning.contains("视图读取")),
+            "正常稀疏不得产生视图错误：{warnings:?}"
+        );
+        println!("FIXA_A7 points={points} truncated={truncated}");
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// Fix A8：`stats()` 未知 key → BAD_CONFIG 点名；已知道未就绪 → 占位行且与入参等长。
+#[test]
+fn fixa_a8_stats_is_strict_and_keeps_input_length() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc) = write_fixa_fixture(dir.path());
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        let config =
+            step17_config_multi(py, &blf, &dbc, &[("MsgA", "A")], &cache_dir, 200, "relative_s")?;
+        let session = fast_blf_core::open_plot_session(py, &config, None)?;
+        session.add_signals(py, PyList::new(py, ["ch1/MsgA/A"])?.as_any())?;
+
+        // ① 未知 key：必须抛 BAD_CONFIG，且消息里点名该 key。
+        let unknown = "不存在/报文/信号";
+        let err = session
+            .stats(py, PyList::new(py, ["ch1/MsgA/A", unknown])?.as_any())
+            .expect_err("未知 key 必须报错");
+        let text = err.to_string();
+        assert!(text.contains("BAD_CONFIG"), "{text}");
+        assert!(text.contains(unknown), "错误消息必须点名未知 key：{text}");
+
+        // ② 已缓存 + 未缓存：返回两条，第二条 count=0 且 pending=true（位置对齐）。
+        let rows = session.stats(py, PyList::new(py, ["ch1/MsgA/A", "ch1/MsgB/B"])?.as_any())?;
+        assert_eq!(rows.len(), 2, "必须与入参等长");
+        let first = rows.get_item(0)?.cast_into::<PyDict>()?;
+        let second = rows.get_item(1)?.cast_into::<PyDict>()?;
+        let first_key: String = first.get_item("key")?.unwrap().extract()?;
+        let second_key: String = second.get_item("key")?.unwrap().extract()?;
+        assert_eq!(first_key, "ch1/MsgA/A");
+        assert_eq!(second_key, "ch1/MsgB/B");
+        let first_count: u64 = first.get_item("count")?.unwrap().extract()?;
+        let first_pending: bool = first.get_item("pending")?.unwrap().extract()?;
+        let second_count: u64 = second.get_item("count")?.unwrap().extract()?;
+        let second_pending: bool = second.get_item("pending")?.unwrap().extract()?;
+        assert!(first_count > 0 && !first_pending, "已缓存的行必须有数据");
+        assert_eq!(second_count, 0, "未缓存的行 count 必须是 0");
+        assert!(second_pending, "未缓存的行必须标 pending=true");
+        println!(
+            "FIXA_A8 rows={} first=({first_key},{first_count}) second=({second_key},{second_count},{second_pending}) err={text}",
+            rows.len()
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}

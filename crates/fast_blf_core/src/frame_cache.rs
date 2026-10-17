@@ -16,9 +16,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use blf_asc::BlfReader;
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,26 @@ pub const FD_STRIDE: usize = 73;
 const MIB: u64 = 1024 * 1024;
 const PAYLOAD_CLASSIC: usize = 8;
 const PAYLOAD_FD: usize = 64;
+
+/// key 目录互斥锁文件名（`create_new(true)` 语义，跨平台、零依赖）。
+const KEY_LOCK_FILE: &str = ".lock";
+/// 会话租约文件前缀：`.inuse-<pid>-<nonce>`。
+const LEASE_PREFIX: &str = ".inuse-";
+/// 抢 key 锁的最长等待时间。
+const KEY_LOCK_TIMEOUT: Duration = Duration::from_secs(20);
+/// 抢锁失败后的退避间隔。
+const KEY_LOCK_RETRY: Duration = Duration::from_millis(5);
+/// 锁文件年龄超过该值即视为残留（进程被 kill 等），可直接抢占。
+const KEY_LOCK_STALE: Duration = Duration::from_secs(30 * 60);
+/// `view()` 刷新 `last_used_at` 的节流窗口（60 s）。
+pub const TOUCH_INTERVAL_MILLIS: u64 = 60 * 1000;
+/// `last_used_at` 落在该窗口内的 key 不参与 LRU（10 分钟）。
+pub const RECENT_USE_WINDOW_MILLIS: u64 = 10 * 60 * 1000;
+/// 抢 key 锁超时的内部错误码（不进 §4 稳定清单，只用于诊断；与
+/// [`CACHE_BUDGET_EXCEEDED`] 同样是本模块内定义的一次性常量）。
+pub const CACHE_LOCK_TIMEOUT: &str = "CACHE_LOCK_TIMEOUT";
+/// 预取被 `close()` 中止（不算失败，调用方不得当告警上报）。
+pub const CACHE_ABORTED: &str = "CACHE_ABORTED";
 
 /// 一个输入文件的稳定身份：绝对路径 + size + mtime（缓存 key 的组成部分）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -86,6 +107,12 @@ pub struct CacheMeta {
     pub message_set: Vec<(u32, u32)>,
     /// Unix 毫秒；LRU 按它从旧到新删。
     pub created_at: u64,
+    /// Unix 毫秒；最近一次被 `open` / `view` 使用的时间。
+    ///
+    /// LRU **不会**删除该时间在 [`RECENT_USE_WINDOW_MILLIS`] 内的 key，
+    /// 避免把用户正在看的旧 key 立刻删掉。旧版本 meta 没有该字段 → 0（可被回收）。
+    #[serde(default)]
+    pub last_used_at: u64,
     /// 整个 `<key>/` 目录的字节数（含 meta.json）。
     pub cache_bytes: u64,
     pub t_min: f64,
@@ -200,6 +227,10 @@ pub fn open_cache(
         .map(|message| (message.channel, message.frame_id))
         .collect();
 
+    // meta 的 read-modify-write 与段文件写入全部在 key 锁内，避免同 key 的两个会话
+    // 互相覆盖 meta（丢 messages）或截断对方正在写的段。锁外只做 key 计算（读 BLF 元信息）。
+    let _lock = KeyLock::acquire(&dir, KEY_LOCK_TIMEOUT)?;
+
     if let Some((mut meta, pruned)) = load_existing_meta(&dir, &key) {
         let existing: BTreeSet<(u32, u32)> = meta
             .messages
@@ -209,35 +240,24 @@ pub fn open_cache(
         let missing: Vec<(u32, u32)> = required.difference(&existing).copied().collect();
         if pruned {
             meta.cache_bytes = directory_bytes(&dir);
+        }
+        // 命中：需要的段全在；部分命中：已付过磁盘代价的段继续可用。两种都不读 BLF。
+        if missing.is_empty() || !meta.messages.is_empty() {
+            meta.last_used_at = now_millis();
+            let (evicted, deleted) = enforce_lru(options.cache_dir, options.budget_mb, &key);
+            if evicted > 0 {
+                meta.warnings
+                    .push(lru_warning(evicted, &deleted, options.budget_mb));
+            }
+            if pruned || evicted > 0 {
+                meta.cache_bytes = directory_bytes(&dir);
+            }
+            // 一次写入同时落 `last_used_at` / 剔除结果 / LRU 说明，避免多次 RMW。
             write_meta(&dir, &meta)?;
-        }
-        if missing.is_empty() {
-            let (evicted, deleted) = enforce_lru(options.cache_dir, options.budget_mb, &key);
-            if evicted > 0 {
-                meta.warnings
-                    .push(lru_warning(evicted, &deleted, options.budget_mb));
-                write_meta(&dir, &meta)?;
-            }
             return Ok(CacheOpen {
                 dir,
                 meta,
-                cache_hit: true,
-                evicted_bytes: evicted,
-                missing: Vec::new(),
-            });
-        }
-        // 已经付过磁盘代价的段继续可用；缺失段交给后台预取，open 不等待。
-        if !meta.messages.is_empty() {
-            let (evicted, deleted) = enforce_lru(options.cache_dir, options.budget_mb, &key);
-            if evicted > 0 {
-                meta.warnings
-                    .push(lru_warning(evicted, &deleted, options.budget_mb));
-                write_meta(&dir, &meta)?;
-            }
-            return Ok(CacheOpen {
-                dir,
-                meta,
-                cache_hit: false,
+                cache_hit: missing.is_empty(),
                 evicted_bytes: evicted,
                 missing,
             });
@@ -252,6 +272,7 @@ pub fn open_cache(
         &required,
         true,
         progress,
+        &|| false,
     )?;
     let (need_bytes, strides) = estimate_bytes(messages, &scan);
     if need_bytes > options.budget_mb.saturating_mul(MIB) {
@@ -274,8 +295,10 @@ pub fn open_cache(
         progress,
         false,
         None,
+        &|| false,
     )?;
     meta.created_at = now_millis();
+    meta.last_used_at = meta.created_at;
     meta.key = key.clone();
     meta.dbc_hash = dbc_fingerprint(options.dbc_by_channel);
     meta.message_set = required.iter().copied().collect();
@@ -305,14 +328,24 @@ pub fn open_cache(
 ///
 /// 返回 `(更新后的 meta, 本次 LRU 删除的其它 key 字节数)`。
 /// 调用方需保证 `key` 是当前会话的 key。
+///
+/// * 整个 read-modify-write **在 key 锁内**完成：锁内重新读盘 → 合并 → 原子写，
+///   绝不回写调用方的内存旧快照，因此同 key 的两个会话不会丢 `messages`；
+/// * `abort` 在每个进度检查点（约 50 ms）被调用一次，返回 true 即中止并返回
+///   [`CACHE_ABORTED`]；中止时**不写** `meta.json`，已写的半成品段因未进 meta 而不可见。
 pub fn prefetch_cache(
     options: &CacheOptions<'_>,
     key: &str,
     messages: &[&MessagePlan],
     progress: &dyn Fn(Progress),
+    abort: &dyn Fn() -> bool,
 ) -> Result<(CacheMeta, u64), CoreError> {
     validate_budget(options.budget_mb)?;
     let dir = options.cache_dir.join(key);
+    if abort() {
+        return Err(prefetch_aborted());
+    }
+    let _lock = KeyLock::acquire(&dir, KEY_LOCK_TIMEOUT)?;
     let mut meta = read_meta(&dir)?;
     if meta.key != key || meta.format_version != CACHE_FORMAT_VERSION {
         return Err(CoreError::blf_parse(format!(
@@ -347,6 +380,7 @@ pub fn prefetch_cache(
         &required,
         true,
         progress,
+        abort,
     )?;
     let (need_bytes, strides) = estimate_bytes(&missing, &scan);
     // 估算闸门只看“本次新增需要”的字节；已存在的段不再计入。
@@ -363,6 +397,7 @@ pub fn prefetch_cache(
         progress,
         true,
         Some(&meta),
+        abort,
     )?;
     meta.messages.extend(additions.messages);
     meta.messages
@@ -395,9 +430,17 @@ pub fn prefetch_cache(
         meta.warnings
             .push(lru_warning(evicted, &deleted, options.budget_mb));
     }
+    // 写回前再查一次 abort：`close()` 之后绝不再往磁盘写 meta。
+    if abort() {
+        return Err(prefetch_aborted());
+    }
     meta.cache_bytes = directory_bytes(&dir);
     write_meta(&dir, &meta)?;
     Ok((meta, evicted))
+}
+
+fn prefetch_aborted() -> CoreError {
+    CoreError::new(CACHE_ABORTED, "后台预取已因会话关闭而中止")
 }
 
 /// 读 `meta.json`。
@@ -409,6 +452,141 @@ pub fn read_meta(dir: &Path) -> Result<CacheMeta, CoreError> {
     serde_json::from_slice(&text).map_err(|err| {
         CoreError::blf_parse(format!("解析帧缓存元数据失败：{}（{err}）", path.display()))
     })
+}
+
+// ---------------------------------------------------------------------------
+// key 目录互斥（零依赖：`create_new(true)` 锁文件）与使用租约
+// ---------------------------------------------------------------------------
+
+/// `<key>/.lock` 的互斥守卫：`create_new(true)` 建锁文件，`Drop` 时删除。
+///
+/// 不引依赖、跨平台可用；抢不到就 5 ms 退避重试，最多等 `timeout`。
+/// 锁文件年龄超过 [`KEY_LOCK_STALE`] 视为残留（进程被 kill 等），直接抢占，
+/// 避免崩溃一次就永久卡住该 key。
+struct KeyLock {
+    path: PathBuf,
+}
+
+impl KeyLock {
+    fn acquire(dir: &Path, timeout: Duration) -> Result<Self, CoreError> {
+        std::fs::create_dir_all(dir).map_err(|err| {
+            CoreError::new(
+                DISK_FULL,
+                format!("无法创建帧缓存目录：{}（{err}）", dir.display()),
+            )
+        })?;
+        let path = dir.join(KEY_LOCK_FILE);
+        let deadline = Instant::now() + timeout;
+        loop {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    // pid + 时间戳：只用于诊断与残留识别。
+                    let _ = writeln!(file, "{} {}", std::process::id(), now_millis());
+                    return Ok(Self { path });
+                }
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                    if lock_is_stale(&path) {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(CoreError::new(
+                            CACHE_LOCK_TIMEOUT,
+                            format!(
+                                "等待帧缓存锁超时：{}（另一个会话正在写同一 key）",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(KEY_LOCK_RETRY);
+                }
+                Err(err) => {
+                    return Err(CoreError::new(
+                        DISK_FULL,
+                        format!("创建帧缓存锁失败：{}（{err}）", path.display()),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+impl Drop for KeyLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn lock_is_stale(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    match metadata.modified() {
+        Ok(modified) => modified
+            .elapsed()
+            .map(|age| age >= KEY_LOCK_STALE)
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// 在 key 目录写一份“正在使用”租约 `.inuse-<pid>-<nonce>`，返回其路径。
+///
+/// `PlotSession::open` 时写入、`close` 时尽力删除；一次失败只是让 LRU 多等 10 分钟，无害。
+pub fn acquire_lease(dir: &Path) -> Option<PathBuf> {
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+    std::fs::create_dir_all(dir).ok()?;
+    let nonce = NONCE.fetch_add(1, Ordering::Relaxed) ^ now_millis();
+    let path = dir.join(format!(
+        "{LEASE_PREFIX}{}-{nonce:x}",
+        std::process::id()
+    ));
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            let _ = writeln!(file, "leased");
+            Some(path)
+        }
+        Err(_) => None,
+    }
+}
+
+/// 尽力删除租约文件（失败也无害）。
+pub fn release_lease(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+/// 目录里是否存在活跃租约（任何 `.inuse-*` 文件）。
+pub fn has_lease(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(LEASE_PREFIX)
+    })
+}
+
+/// 刷新 key 目录的 `last_used_at`（`view()` 节流调用）。
+///
+/// 锁内**重新读盘**再改这一个字段，绝不回写调用方的内存快照；抢不到锁就放弃
+/// （best-effort，`timeout` 故意给得很短，避免拖慢 UI 的 `view()`）。
+pub fn touch_meta(cache_dir: &Path, key: &str, timeout: Duration) -> Result<(), CoreError> {
+    if key.is_empty() {
+        return Ok(());
+    }
+    let dir = cache_dir.join(key);
+    let _lock = KeyLock::acquire(&dir, timeout)?;
+    let mut meta = read_meta(&dir)?;
+    if meta.key != key || meta.format_version != CACHE_FORMAT_VERSION {
+        return Err(CoreError::blf_parse(format!(
+            "帧缓存元数据与 key 不匹配：{}",
+            dir.display()
+        )));
+    }
+    meta.last_used_at = now_millis();
+    write_meta(&dir, &meta)
 }
 
 /// DBC 内容指纹（按通道号排序；读不到的文件把错误串也计入，保证 key 稳定）。
@@ -485,6 +663,7 @@ fn scan_inputs(
     required: &BTreeSet<(u32, u32)>,
     report_progress: bool,
     progress: &dyn Fn(Progress),
+    abort: &dyn Fn() -> bool,
 ) -> Result<ScanOutcome, CoreError> {
     let mut files = Vec::with_capacity(paths.len());
     let mut counts: BTreeMap<(u32, u32), u64> = BTreeMap::new();
@@ -572,11 +751,15 @@ fn scan_inputs(
                 }
             }
             frames_processed += 1;
-            if report_progress {
-                let due = !emitted_first || last_emit.elapsed() >= throttle;
-                if due {
-                    emitted_first = true;
-                    last_emit = std::time::Instant::now();
+            let due = !emitted_first || last_emit.elapsed() >= throttle;
+            if due {
+                emitted_first = true;
+                last_emit = std::time::Instant::now();
+                // 每个检查点（≈ 50 ms 一块）看一眼 abort：`close()` 后立即收手。
+                if abort() {
+                    return Err(prefetch_aborted());
+                }
+                if report_progress {
                     progress(Progress {
                         phase: 1,
                         stage: "cache".to_string(),
@@ -651,6 +834,8 @@ struct SegmentWriter {
     last_timestamp: f64,
     unsorted: bool,
     warned_mismatch: bool,
+    /// `data.len() < dlc` 的帧数（已零填充写入，**不得静默**）。
+    short_payload_frames: u64,
 }
 
 fn build_segments(
@@ -662,6 +847,7 @@ fn build_segments(
     progress: &dyn Fn(Progress),
     append: bool,
     existing: Option<&CacheMeta>,
+    abort: &dyn Fn() -> bool,
 ) -> Result<CacheMeta, CoreError> {
     let required: BTreeSet<(u32, u32)> = messages
         .iter()
@@ -720,6 +906,7 @@ fn build_segments(
                 last_timestamp: f64::NEG_INFINITY,
                 unsorted: false,
                 warned_mismatch: false,
+                short_payload_frames: 0,
             },
         );
     }
@@ -782,13 +969,17 @@ fn build_segments(
                         segment.unsorted = true;
                     }
                     segment.last_timestamp = message.timestamp;
-                    write_record(
+                    let short_payload = write_record(
                         &mut segment.writer,
                         message.timestamp,
                         message.dlc,
                         message.data.as_slice(),
                         segment.meta.stride == FD_STRIDE as u32,
                     )?;
+                    if short_payload {
+                        segment.short_payload_frames =
+                            segment.short_payload_frames.saturating_add(1);
+                    }
                     segment.meta.frames = segment.meta.frames.saturating_add(1);
                 }
             }
@@ -797,6 +988,11 @@ fn build_segments(
             if due {
                 emitted_first = true;
                 last_emit = std::time::Instant::now();
+                // 每个检查点（≈ 50 ms 一块）看一眼 abort：`close()` 后立即收手。
+                // 半成品段因为没有进 `meta.json`，下次预取会整段重写，不会留下错误数据。
+                if abort() {
+                    return Err(prefetch_aborted());
+                }
                 progress(Progress {
                     phase: 1,
                     stage: "cache".to_string(),
@@ -845,6 +1041,14 @@ fn build_segments(
                 segment.meta.frames,
             )?;
         }
+        if segment.short_payload_frames > 0 {
+            // A4：DLC 大于实际 data 长度的帧必须记账，不许静默。
+            warnings.push(short_payload_warning(
+                segment.meta.channel,
+                &segment.meta.message,
+                segment.short_payload_frames,
+            ));
+        }
         metas.push(segment.meta);
     }
     metas.sort_by_key(|message| (message.channel, message.frame_id));
@@ -855,6 +1059,7 @@ fn build_segments(
         dbc_hash: String::new(),
         message_set: Vec::new(),
         created_at: now_millis(),
+        last_used_at: now_millis(),
         cache_bytes: 0,
         t_min: if scan.raw_min.is_finite() {
             scan.raw_min
@@ -880,11 +1085,13 @@ fn write_record(
     dlc: u8,
     data: &[u8],
     fd: bool,
-) -> Result<(), CoreError> {
+) -> Result<bool, CoreError> {
     let payload_len = if fd { PAYLOAD_FD } else { PAYLOAD_CLASSIC };
     let mut record = [0u8; FD_STRIDE];
     record[0..8].copy_from_slice(&timestamp.to_le_bytes());
-    record[8] = dlc;
+    // DLC 必须与记录的真实 payload 容量一致：否则解码侧按 DLC 越界读到的全是零填充，
+    // 高位信号会静默丢位，或者把填充零当成真值。
+    record[8] = dlc.min(payload_len as u8);
     let copy_len = data.len().min(payload_len);
     if let Some(target) = record.get_mut(9..9 + copy_len) {
         target.copy_from_slice(&data[..copy_len]);
@@ -892,7 +1099,15 @@ fn write_record(
     let stride = if fd { FD_STRIDE } else { CLASSIC_STRIDE };
     writer
         .write_all(&record[..stride])
-        .map_err(|err| CoreError::new(DISK_FULL, format!("写入帧缓存失败：{err}")))
+        .map_err(|err| CoreError::new(DISK_FULL, format!("写入帧缓存失败：{err}")))?;
+    // 返回值：源帧的 data 短于它声明的 DLC（已零填充，必须计入 warnings）。
+    Ok(data.len() < dlc as usize)
+}
+
+fn short_payload_warning(channel: u32, message: &str, frames: u64) -> String {
+    format!(
+        "报文 Ch{channel}/{message} 有 {frames} 帧 DLC 大于实际数据长度；已零填充写入（高位信号可能失真）"
+    )
 }
 
 struct RawRecord {
@@ -1008,6 +1223,7 @@ fn lru_warning(evicted: u64, deleted: &[String], budget_mb: u64) -> String {
 /// 返回 `(删除的字节数, 被删除的 key 列表)`。
 fn enforce_lru(cache_dir: &Path, budget_mb: u64, current_key: &str) -> (u64, Vec<String>) {
     let budget = budget_mb.saturating_mul(MIB);
+    let now = now_millis();
     let Ok(entries) = std::fs::read_dir(cache_dir) else {
         return (0, Vec::new());
     };
@@ -1024,7 +1240,15 @@ fn enforce_lru(cache_dir: &Path, budget_mb: u64, current_key: &str) -> (u64, Vec
         if name == current_key {
             continue;
         }
+        // 有活跃租约的 key 一律不动（会话正开着它）。
+        if has_lease(&path) {
+            continue;
+        }
         if let Ok(meta) = read_meta(&path) {
+            // 最近 10 分钟被 open/view 用过的 key 也不动，避免删掉用户正在看的缓存。
+            if now.saturating_sub(meta.last_used_at) < RECENT_USE_WINDOW_MILLIS {
+                continue;
+            }
             removable.push((meta.created_at, path, bytes, name));
         }
     }
@@ -1491,6 +1715,8 @@ mod tests {
             dbc_hash: String::new(),
             message_set: Vec::new(),
             created_at,
+            // 历史 key 等价于“很久没用过”，可被回收。
+            last_used_at: 0,
             cache_bytes: 0,
             t_min: 0.0,
             t_max: 1.0,
@@ -1499,6 +1725,18 @@ mod tests {
             files: Vec::new(),
             messages: Vec::new(),
             warnings: Vec::new(),
+        }
+    }
+
+    fn fake_message(name: &str, frame_id: u32) -> CachedMessageMeta {
+        CachedMessageMeta {
+            channel: 1,
+            frame_id,
+            message: name.to_string(),
+            file: format!("ch1_id{frame_id}.bin"),
+            stride: CLASSIC_STRIDE as u32,
+            frames: 0,
+            is_fd: false,
         }
     }
 
@@ -1520,5 +1758,160 @@ mod tests {
             dir.path().join("current").exists(),
             "当前正在用的 key 绝不能删"
         );
+    }
+
+    /// A2：两个线程各自“读 meta → 加自己那部分 → 写回”，结束时两边都必须还在。
+    ///
+    /// 旧实现（无锁 RMW）下，后写的一方会把对方刚写进去的 `messages` 覆盖掉。
+    #[test]
+    fn concurrent_meta_merge_keeps_both_message_sets() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let key = "racekey";
+        let key_dir = dir.path().join(key);
+        std::fs::create_dir_all(&key_dir).expect("创建 key 目录");
+        write_meta(&key_dir, &fake_meta(key, 1)).expect("写初始 meta");
+
+        let handles: Vec<_> = [("A", 0x100u32), ("B", 0x200u32)]
+            .into_iter()
+            .map(|(name, frame_id)| {
+                let key_dir = key_dir.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        let _lock = KeyLock::acquire(&key_dir, KEY_LOCK_TIMEOUT).expect("拿锁");
+                        // 锁内重新读盘 → 合并 → 原子写：绝不回写内存旧快照。
+                        let mut meta = read_meta(&key_dir).expect("锁内读 meta");
+                        if !meta.messages.iter().any(|message| message.message == name) {
+                            meta.messages.push(fake_message(name, frame_id));
+                        }
+                        meta.message_set = meta
+                            .messages
+                            .iter()
+                            .map(|message| (message.channel, message.frame_id))
+                            .collect();
+                        write_meta(&key_dir, &meta).expect("锁内写 meta");
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("等待线程");
+        }
+
+        let meta = read_meta(&key_dir).expect("读最终 meta");
+        assert!(
+            meta.messages.iter().any(|message| message.message == "A"),
+            "并发的 A 必须还在：{:?}",
+            meta.messages
+        );
+        assert!(
+            meta.messages.iter().any(|message| message.message == "B"),
+            "并发的 B 必须还在：{:?}",
+            meta.messages
+        );
+    }
+
+    /// A3：持有租约的 key 即使预算为 0 也不能删；无租约的旧 key 必须被删。
+    #[test]
+    fn lru_skips_leased_key_and_keeps_it_alive() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let leased_dir = dir.path().join("leased");
+        let stale_dir = dir.path().join("stale");
+        for (path, key, created_at) in [
+            (&leased_dir, "leased", 1u64),
+            (&stale_dir, "stale", 2),
+        ] {
+            std::fs::create_dir_all(path).expect("创建 key 目录");
+            std::fs::write(path.join("ch1_id1.bin"), [0u8; 16]).expect("写入数据");
+            write_meta(path, &fake_meta(key, created_at)).expect("写 meta");
+        }
+        let lease = acquire_lease(&leased_dir).expect("写租约");
+        assert!(has_lease(&leased_dir));
+
+        // 预算 0 ⇒ 目录一定超预算，但带租约的 key 必须被跳过。
+        let (evicted, deleted) = enforce_lru(dir.path(), 0, "someone-else");
+        assert!(evicted > 0, "无租约的旧 key 必须被删并回报字节数");
+        assert_eq!(deleted, vec!["stale".to_string()], "只该删 stale：{deleted:?}");
+        assert!(leased_dir.exists(), "持有租约的 key 绝不能删");
+        assert!(!stale_dir.exists(), "无租约的旧 key 必须被删");
+
+        // 租约释放后（模拟 close）它才回到可回收候选。
+        release_lease(&lease);
+        assert!(!has_lease(&leased_dir));
+        let (evicted, deleted) = enforce_lru(dir.path(), 0, "someone-else");
+        assert!(evicted > 0 && deleted == vec!["leased".to_string()]);
+        assert!(!leased_dir.exists());
+    }
+
+    /// A3 补充：`last_used_at` 在近 10 分钟内的 key 也不参与 LRU。
+    #[test]
+    fn lru_skips_recently_used_key() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let recent_dir = dir.path().join("recent");
+        std::fs::create_dir_all(&recent_dir).expect("创建 key 目录");
+        std::fs::write(recent_dir.join("ch1_id1.bin"), [0u8; 16]).expect("写入数据");
+        let mut meta = fake_meta("recent", 1);
+        meta.last_used_at = now_millis();
+        write_meta(&recent_dir, &meta).expect("写 meta");
+
+        let (evicted, deleted) = enforce_lru(dir.path(), 0, "someone-else");
+        assert_eq!(evicted, 0, "刚用过的不该删：{deleted:?}");
+        assert!(recent_dir.exists());
+    }
+
+    /// A4：写入记录的 DLC 必须被夹到段容量，且源 data 短于 DLC 时必须回报（→ warnings）。
+    #[test]
+    fn write_record_clamps_dlc_and_reports_short_payload() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let classic = dir.path().join("classic.bin");
+        {
+            let mut writer = BufWriter::new(File::create(&classic).expect("建文件"));
+            // dlc=64 落在 17 字节经典段上 ⇒ 只能写 8；且 data 只有 8 字节 ⇒ 短 payload。
+            let short = write_record(&mut writer, 1.0, 64, &[0xAAu8; 8], false).expect("写记录");
+            assert!(short, "dlc=64 > data.len()=8 必须回报短 payload");
+            let short = write_record(&mut writer, 2.0, 8, &[0u8; 4], false).expect("写记录");
+            assert!(short, "dlc=8 > data.len()=4 必须回报短 payload");
+            writer.flush().expect("刷新");
+        }
+        let bytes = std::fs::read(&classic).expect("读回记录");
+        assert_eq!(bytes.len(), CLASSIC_STRIDE * 2);
+        assert_eq!(bytes[8], 8, "dlc=64 必须被夹到经典段容量 8");
+        assert_eq!(bytes[9], 0xAA, "真实 payload 必须保留");
+        assert_eq!(bytes[CLASSIC_STRIDE + 8], 8, "dlc=8 保持在容量内");
+
+        // CAN FD 段：容量 64，dlc=64 不夹，但 data 只有 8 字节仍要回报。
+        let fd = dir.path().join("fd.bin");
+        {
+            let mut writer = BufWriter::new(File::create(&fd).expect("建文件"));
+            let short = write_record(&mut writer, 3.0, 64, &[0x55u8; 8], true).expect("写记录");
+            assert!(short, "FD 段 dlc=64 > data.len()=8 必须回报");
+            let short = write_record(&mut writer, 4.0, 64, &[0x55u8; 64], true).expect("写记录");
+            assert!(!short, "data 满足 dlc 时不得报警");
+            writer.flush().expect("刷新");
+        }
+        let bytes = std::fs::read(&fd).expect("读回 FD 记录");
+        assert_eq!(bytes.len(), FD_STRIDE * 2);
+        assert_eq!(bytes[8], 64, "FD 段容量 64，dlc=64 不被夹");
+
+        let warning = short_payload_warning(1, "MsgA", 7);
+        assert!(warning.contains("Ch1/MsgA"), "{warning}");
+        assert!(warning.contains('7'), "告警必须带计数：{warning}");
+    }
+
+    /// A2 配套：`touch_meta` 只改 `last_used_at`，不丢其它字段（锁内重新读盘）。
+    #[test]
+    fn touch_meta_only_refreshes_last_used_at() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let key = "touchkey";
+        let key_dir = dir.path().join(key);
+        std::fs::create_dir_all(&key_dir).expect("创建 key 目录");
+        let mut meta = fake_meta(key, 5);
+        meta.messages.push(fake_message("MsgA", 0x100));
+        write_meta(&key_dir, &meta).expect("写 meta");
+
+        touch_meta(dir.path(), key, KEY_LOCK_TIMEOUT).expect("刷新 last_used_at");
+        let after = read_meta(&key_dir).expect("读 meta");
+        assert!(after.last_used_at > 0);
+        assert_eq!(after.created_at, 5, "不得改动其它字段");
+        assert_eq!(after.messages.len(), 1, "不得丢 messages");
     }
 }

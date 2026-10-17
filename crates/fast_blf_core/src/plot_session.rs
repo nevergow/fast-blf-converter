@@ -11,7 +11,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::DateTime;
 use pyo3::prelude::*;
@@ -106,8 +108,13 @@ impl BucketAgg {
         }
     }
 
+    /// 合并一个样本/桶；**拒绝** NaN/inf：
+    /// 只要 min/max/sum 任一非有限就整样本跳过，`mean` 永远不会被 NaN 污染。
     fn merge(&mut self, min: f32, max: f32, sum: f64, count: u64) {
         if count == 0 {
+            return;
+        }
+        if !min.is_finite() || !max.is_finite() || !sum.is_finite() {
             return;
         }
         self.min = self.min.min(min);
@@ -139,7 +146,8 @@ struct PrefetchStatus {
 }
 
 struct SessionState {
-    meta: CacheMeta,
+    /// 不可变快照（`Arc`）：`compute_view` 只在锁内 clone 它，真正读盘全在锁外。
+    meta: Arc<CacheMeta>,
     dir: PathBuf,
     cache_hit: bool,
     /// 本会话（open + 后台预取）因目录上限 LRU 删除的其它 key 字节数。
@@ -150,6 +158,10 @@ struct SessionState {
     prefetch: PrefetchStatus,
     prefetch_queue: BTreeSet<(u32, u32)>,
     warnings: Vec<String>,
+    /// `view()` 真实读盘/解码错误累计数（A6：不许静默）。
+    view_errors: u64,
+    /// 首次读盘/解码错误的描述（含段文件名）。
+    view_error_first: Option<String>,
     closed: bool,
 }
 
@@ -163,6 +175,10 @@ struct SessionInner {
     catalog: Vec<CatalogSignal>,
     catalog_by_key: HashMap<String, usize>,
     messages: BTreeMap<(u32, u32), Arc<MessagePlan>>,
+    /// `.inuse-<pid>-<nonce>` 租约文件；`close`/`Drop` 时尽力删。
+    lease: Mutex<Option<PathBuf>>,
+    /// `last_used_at` 刷新节流（Unix 毫秒）。
+    last_touch_millis: AtomicU64,
 }
 
 impl SessionInner {
@@ -179,6 +195,101 @@ impl SessionInner {
         self.state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn lock_lease(&self) -> std::sync::MutexGuard<'_, Option<PathBuf>> {
+        self.lease
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// `close()` 的实体：纯内存状态 + 删一个租约文件，**不做任何长 I/O**。
+    ///
+    /// 预取线程在每个进度检查点（≈ 50 ms）看 `closed`，因此它会在下一次检查点退出。
+    fn close_impl(&self) {
+        {
+            let mut state = self.lock_state();
+            state.closed = true;
+            state.active.clear();
+            state.pyramids.clear();
+            state.prefetch_queue.clear();
+            state.prefetch.busy = false;
+            state.prefetch.message = "已关闭会话".to_string();
+        }
+        let lease = self.lock_lease().take();
+        if let Some(path) = lease {
+            frame_cache::release_lease(&path);
+        }
+    }
+
+    /// 锁内只取内存快照（供 `info()`），锁全部在 `py.detach` 内取。
+    fn info_snapshot(&self) -> InfoSnapshot {
+        let state = self.lock_state();
+        let mut warnings = state.warnings.clone();
+        if let Some(first) = &state.view_error_first {
+            warnings.push(format!(
+                "视图读取共 {} 个错误（首次：{}）",
+                state.view_errors, first
+            ));
+        }
+        InfoSnapshot {
+            time_info: TimeInfo::from_meta(&state.meta, state.time_format),
+            files: state
+                .meta
+                .files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect(),
+            cache_bytes: state.meta.cache_bytes,
+            cache_hit: state.cache_hit,
+            evicted_bytes: state.evicted_bytes,
+            warnings,
+            message_set: state
+                .meta
+                .messages
+                .iter()
+                .map(|message| (message.channel, message.frame_id))
+                .collect(),
+            pyramid_bytes: state
+                .pyramids
+                .values()
+                .map(|entry| entry.pyramid.bytes() as u64)
+                .sum(),
+            prefetch_busy: state.prefetch.busy,
+        }
+    }
+
+    /// 节流刷新 `meta.last_used_at`（≤ 60 s 一次）；抢不到 key 锁就放弃，绝不阻塞 `view`。
+    fn touch_if_due(&self) {
+        let now = now_millis();
+        let previous = self.last_touch_millis.load(Ordering::Relaxed);
+        if now.saturating_sub(previous) < frame_cache::TOUCH_INTERVAL_MILLIS {
+            return;
+        }
+        if self
+            .last_touch_millis
+            .compare_exchange(previous, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let _ = frame_cache::touch_meta(
+            &self.cache_dir,
+            &self.key,
+            Duration::from_millis(150),
+        );
+    }
+
+    /// 记录 `view()` 期间的真实错误（锁内只改两个字段，无 I/O）。
+    fn record_view_errors(&self, diag: &ViewDiag) {
+        if diag.errors == 0 {
+            return;
+        }
+        let mut state = self.lock_state();
+        state.view_errors = state.view_errors.saturating_add(diag.errors);
+        if state.view_error_first.is_none() {
+            state.view_error_first = diag.first.clone();
+        }
     }
 
     fn build_for_message(
@@ -202,10 +313,15 @@ impl SessionInner {
         build_pyramids(&dir, &message_meta, &signals)
     }
 
+    /// 计算一个窗口的抽稀包络。
+    ///
+    /// **锁粒度**：锁内只拿一份快照（`Arc<CacheMeta>` + 金字塔句柄 + 时间参数），
+    /// 立即放锁；所有 `read_at` / 解码都在锁外进行。因此预取线程持锁时，
+    /// `view()` 不会把锁竞争带回到持有 GIL 的 UI 线程上。
     fn compute_view(&self, t0: f64, t1: f64, width_px: usize) -> Result<ViewData, CoreError> {
-        let state = self.lock_state();
-        let time_info = TimeInfo::from_meta(&state.meta, state.time_format);
-        if state.closed || width_px == 0 {
+        let snapshot = self.view_snapshot();
+        let time_info = snapshot.time_info.clone();
+        if snapshot.closed || width_px == 0 {
             return Ok(ViewData {
                 t: Vec::new(),
                 series: Vec::new(),
@@ -228,8 +344,8 @@ impl SessionInner {
         }
         // 上限保护：GUI 实际只用 ≤2000，但接口允许调用方传更大值。
         let n_out = width_px.clamp(1, 100_000);
-        let meta = state.meta.clone();
-        let format = state.time_format;
+        let meta = Arc::clone(&snapshot.meta);
+        let format = snapshot.format;
         let raw_min = if meta.t_min.is_finite() {
             meta.t_min
         } else {
@@ -239,50 +355,51 @@ impl SessionInner {
         let raw_t1 = to_raw_seconds(t1, raw_min, format);
         let span = t1 - t0;
 
-        let mut by_message: BTreeMap<
-            (u32, u32),
-            Vec<(String, Arc<PyramidEntry>, Arc<SignalPlan>)>,
-        > = BTreeMap::new();
-        let mut missing = false;
-        for key in &state.active {
-            let Some(&index) = self.catalog_by_key.get(key) else {
-                continue;
-            };
-            let catalog = &self.catalog[index];
-            let Some(entry) = state.pyramids.get(key) else {
-                missing = true;
-                continue;
-            };
-            by_message
-                .entry((catalog.channel, catalog.frame_id))
-                .or_default()
-                .push((key.clone(), Arc::clone(entry), Arc::clone(&catalog.signal)));
-        }
-
         struct PendingSeries {
             key: String,
             values: Vec<Option<BucketAgg>>,
         }
         let mut pending: Vec<PendingSeries> = Vec::new();
+        let mut diag = ViewDiag::default();
 
-        for (message_key, entries) in by_message {
+        // 锁外：打开段文件 / 二分定位 / 逐桶读盘。
+        for (message_key, entries) in &snapshot.by_message {
             if entries.is_empty() {
                 continue;
             }
             let Some(message_meta) = meta.message(message_key.0, message_key.1) else {
+                diag.record(format!(
+                    "缓存 meta 缺少报文段 Ch{}/{}（{}.bin）",
+                    message_key.0, message_key.1, message_key.1
+                ));
                 continue;
             };
-            let path = message_meta.path(&state.dir);
+            let path = message_meta.path(&snapshot.dir);
             let file = match File::open(&path) {
                 Ok(file) => file,
-                Err(_) => {
-                    missing = true;
+                Err(err) => {
+                    diag.record(format!(
+                        "打开帧缓存失败：{}（{err}）",
+                        message_meta.file
+                    ));
                     continue;
                 }
             };
             let stride = message_meta.stride as usize;
-            let boundaries =
-                time_boundaries(&file, stride, message_meta.frames, raw_t0, raw_t1, n_out)?;
+            let boundaries = match time_boundaries(
+                &file,
+                stride,
+                message_meta.frames,
+                raw_t0,
+                raw_t1,
+                n_out,
+            ) {
+                Ok(boundaries) => boundaries,
+                Err(err) => {
+                    diag.record(format!("{}（{}）", err.message, message_meta.file));
+                    continue;
+                }
+            };
             let first = boundaries.first().copied().unwrap_or(0);
             let last_exclusive = boundaries.last().copied().unwrap_or(0);
             if last_exclusive <= first {
@@ -313,19 +430,30 @@ impl SessionInner {
                     continue;
                 }
                 // 同报文的全部信号共享一次边界帧读取与一次桶遍历。
-                let aggs = exact_range_multi(levels, &file, &message_meta, &signals, start, end);
+                let aggs = exact_range_multi(
+                    levels,
+                    &file,
+                    message_meta,
+                    &signals,
+                    start,
+                    end,
+                    &mut diag,
+                );
                 for (index, agg) in aggs.into_iter().enumerate() {
                     if let Some(series) = values.get_mut(index) {
                         series.push(if agg.count == 0 { None } else { Some(agg) });
                     }
                 }
             }
-            for (index, (key, _, _)) in entries.into_iter().enumerate() {
+            for (index, (key, _, _)) in entries.iter().enumerate() {
                 let values = values
                     .get_mut(index)
                     .map(std::mem::take)
                     .unwrap_or_default();
-                pending.push(PendingSeries { key, values });
+                pending.push(PendingSeries {
+                    key: key.clone(),
+                    values,
+                });
             }
         }
 
@@ -366,7 +494,11 @@ impl SessionInner {
             }
         }
 
-        let truncated = missing || out_t.len() < width_px;
+        // A7：`truncated` **只**由“真缺数据”（金字塔未就绪 / 读盘或解码出错）置位；
+        // 稀疏（桶为空但数据可信）不再算 truncated。
+        let truncated = snapshot.pending > 0 || diag.errors > 0;
+        self.record_view_errors(&diag);
+        self.touch_if_due();
         Ok(ViewData {
             t: out_t,
             series: out_series,
@@ -375,6 +507,38 @@ impl SessionInner {
             t_max_str: time_info.t_max_str,
             t_axis: time_info.t_axis,
         })
+    }
+
+    /// 锁内取一份轻量快照：`meta` 是 `Arc`，金字塔是 `Arc`，全程零 I/O。
+    fn view_snapshot(&self) -> ViewSnapshot {
+        let state = self.lock_state();
+        let mut by_message: BTreeMap<
+            (u32, u32),
+            Vec<(String, Arc<PyramidEntry>, Arc<SignalPlan>)>,
+        > = BTreeMap::new();
+        let mut pending = 0u64;
+        for key in &state.active {
+            let Some(&index) = self.catalog_by_key.get(key) else {
+                continue;
+            };
+            let catalog = &self.catalog[index];
+            match state.pyramids.get(key) {
+                Some(entry) => by_message
+                    .entry((catalog.channel, catalog.frame_id))
+                    .or_default()
+                    .push((key.clone(), Arc::clone(entry), Arc::clone(&catalog.signal))),
+                None => pending = pending.saturating_add(1),
+            }
+        }
+        ViewSnapshot {
+            closed: state.closed,
+            time_info: TimeInfo::from_meta(&state.meta, state.time_format),
+            dir: state.dir.clone(),
+            format: state.time_format,
+            meta: Arc::clone(&state.meta),
+            by_message,
+            pending,
+        }
     }
 
     fn add_signals_with_arc(self: Arc<Self>, keys: &[String]) -> Result<(u64, u64), CoreError> {
@@ -422,27 +586,49 @@ impl SessionInner {
         Ok((added, pending))
     }
 
-    fn stats_impl(&self, keys: &[String]) -> Result<Vec<(String, SignalStats)>, CoreError> {
-        let mut wanted: Vec<String> = if keys.is_empty() {
+    /// 全量统计。
+    ///
+    /// 严格性（A8）：
+    /// * 未知 key → `BAD_CONFIG`，消息里点名每个不存在的 key（绝不静默少一条）；
+    /// * 已知但尚未缓存/金字塔未就绪 → 占位行（`count = 0`, `pending = true`），
+    ///   与入参**等长**且**同序**，调用方按位置对齐不会错位。
+    fn stats_impl(&self, keys: &[String]) -> Result<Vec<StatRow>, CoreError> {
+        let wanted: Vec<String> = if keys.is_empty() {
             let state = self.lock_state();
             state.active.iter().cloned().collect()
         } else {
             keys.to_vec()
         };
-        wanted.sort();
-        wanted.dedup();
-        let mut out = Vec::new();
+        let unknown: Vec<&str> = wanted
+            .iter()
+            .filter(|key| !self.catalog_by_key.contains_key(key.as_str()))
+            .map(String::as_str)
+            .collect();
+        if !unknown.is_empty() {
+            return Err(CoreError::bad_config(format!(
+                "未知信号 key：{}（请用 info().signals[*].key 的取值）",
+                unknown.join("、")
+            )));
+        }
+
+        let mut out = Vec::with_capacity(wanted.len());
         for key in wanted {
             let entry = {
                 let state = self.lock_state();
                 state.pyramids.get(&key).cloned()
             };
+            // 未知已在上面拦截，这里的 `else` 理论上不会走到，但绝不允许静默少一条。
+            let Some(&index) = self.catalog_by_key.get(&key) else {
+                out.push(StatRow {
+                    key,
+                    stats: SignalStats::default(),
+                    pending: true,
+                });
+                continue;
+            };
             let entry = match entry {
-                Some(entry) => entry,
+                Some(entry) => Some(entry),
                 None => {
-                    let Some(&index) = self.catalog_by_key.get(&key) else {
-                        continue;
-                    };
                     let catalog = &self.catalog[index];
                     let built = self
                         .build_for_message((catalog.channel, catalog.frame_id), &[key.clone()])?;
@@ -453,16 +639,81 @@ impl SessionInner {
                         found = Some(Arc::clone(&entry));
                         state.pyramids.insert(built_key, entry);
                     }
-                    match found {
-                        Some(entry) => entry,
-                        None => continue,
-                    }
+                    found
                 }
             };
-            out.push((key, entry.stats));
+            match entry {
+                Some(entry) => out.push(StatRow {
+                    key,
+                    stats: entry.stats,
+                    pending: false,
+                }),
+                // 已知 key 但报文段还没缓存 / 金字塔未就绪：占位而不是跳过。
+                None => out.push(StatRow {
+                    key,
+                    stats: SignalStats::default(),
+                    pending: true,
+                }),
+            }
         }
         Ok(out)
     }
+}
+
+/// `compute_view` 的锁内快照：全部是 `Arc` / 克隆句柄，不包含任何文件 I/O。
+struct ViewSnapshot {
+    closed: bool,
+    time_info: TimeInfo,
+    dir: PathBuf,
+    format: TimeFormat,
+    meta: Arc<CacheMeta>,
+    by_message: BTreeMap<(u32, u32), Vec<(String, Arc<PyramidEntry>, Arc<SignalPlan>)>>,
+    /// `active` 中尚无金字塔的信号数（未就绪 = 真缺数据）。
+    pending: u64,
+}
+
+/// `view()` 期间的读盘/解码错误记账（A6：不许静默）。
+#[derive(Debug, Default)]
+struct ViewDiag {
+    errors: u64,
+    first: Option<String>,
+}
+
+impl ViewDiag {
+    fn record(&mut self, text: String) {
+        self.errors = self.errors.saturating_add(1);
+        if self.first.is_none() {
+            self.first = Some(text);
+        }
+    }
+}
+
+/// `info()` 的锁内快照。
+struct InfoSnapshot {
+    time_info: TimeInfo,
+    files: Vec<String>,
+    cache_bytes: u64,
+    cache_hit: bool,
+    evicted_bytes: u64,
+    warnings: Vec<String>,
+    message_set: BTreeSet<(u32, u32)>,
+    pyramid_bytes: u64,
+    prefetch_busy: bool,
+}
+
+/// `stats()` 的一行：未就绪时 `pending = true` 且 `count == 0`（保持与入参等长）。
+#[derive(Debug, Clone)]
+struct StatRow {
+    key: String,
+    stats: SignalStats,
+    pending: bool,
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -569,8 +820,11 @@ pub fn open_session(
     }
     warnings.extend(opened.meta.warnings.clone());
 
+    // A3：在 key 目录写一份租约，`enforce_lru` 看到任何 `.inuse-*` 就跳过该 key。
+    let lease = frame_cache::acquire_lease(&opened.dir);
+
     let state = SessionState {
-        meta: opened.meta,
+        meta: Arc::new(opened.meta),
         dir: opened.dir,
         cache_hit: opened.cache_hit,
         evicted_bytes,
@@ -580,6 +834,8 @@ pub fn open_session(
         prefetch: PrefetchStatus::default(),
         prefetch_queue: BTreeSet::new(),
         warnings,
+        view_errors: 0,
+        view_error_first: None,
         closed: false,
     };
 
@@ -593,6 +849,8 @@ pub fn open_session(
         catalog,
         catalog_by_key,
         messages,
+        lease: Mutex::new(lease),
+        last_touch_millis: AtomicU64::new(now_millis()),
     });
 
     // 部分命中：open 已立即返回；缺失段转后台预取（不阻塞调用方）。
@@ -609,6 +867,20 @@ pub fn open_session(
     Ok(PlotSession { inner })
 }
 
+impl Drop for SessionInner {
+    fn drop(&mut self) {
+        // 会话对象被释放时也尽力清租约（`close()` 已清过则这里是 None）。
+        let lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        if let Some(path) = lease {
+            frame_cache::release_lease(&path);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PyO3 类
 // ---------------------------------------------------------------------------
@@ -622,27 +894,23 @@ pub struct PlotSession {
 #[pymethods]
 impl PlotSession {
     /// 打开后立刻可用：时间范围、文件、缓存字节、信号清单。
+    ///
+    /// 锁全在 `py.detach` 里拿：预取线程持 state 锁时，UI 线程调用 `info()`
+    /// 不会带着 GIL 等锁（那会把 Qt 事件循环一起冻住）。
     pub fn info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let state = self.inner.lock_state();
+        let inner = Arc::clone(&self.inner);
+        let snapshot = py.detach(move || inner.info_snapshot());
         let out = PyDict::new(py);
-        let time_info = TimeInfo::from_meta(&state.meta, state.time_format);
+        let time_info = &snapshot.time_info;
         out.set_item("t_min", time_info.t_min)?;
         out.set_item("t_max", time_info.t_max)?;
         out.set_item("t_min_str", time_info.t_min_str.as_deref())?;
         out.set_item("t_max_str", time_info.t_max_str.as_deref())?;
         out.set_item("t_axis", axis_to_pylist(py, &time_info.t_axis)?)?;
-        out.set_item(
-            "files",
-            state
-                .meta
-                .files
-                .iter()
-                .map(|file| file.path.clone())
-                .collect::<Vec<_>>(),
-        )?;
-        out.set_item("cache_bytes", state.meta.cache_bytes)?;
-        out.set_item("cache_hit", state.cache_hit)?;
-        out.set_item("evicted_bytes", state.evicted_bytes)?;
+        out.set_item("files", snapshot.files)?;
+        out.set_item("cache_bytes", snapshot.cache_bytes)?;
+        out.set_item("cache_hit", snapshot.cache_hit)?;
+        out.set_item("evicted_bytes", snapshot.evicted_bytes)?;
 
         let signals = PyList::empty(py);
         for signal in &self.inner.catalog {
@@ -653,21 +921,18 @@ impl PlotSession {
             item.set_item("unit", signal.unit.as_deref())?;
             item.set_item(
                 "cached",
-                state.meta.has_message(signal.channel, signal.frame_id),
+                snapshot
+                    .message_set
+                    .contains(&(signal.channel, signal.frame_id)),
             )?;
             // 全链路唯一标识，与 stats/add_signals/remove_signals 入参一致。
             item.set_item("key", &signal.key)?;
             signals.append(item)?;
         }
         out.set_item("signals", signals)?;
-        out.set_item("warnings", state.warnings.clone())?;
-        let pyramid_bytes: usize = state
-            .pyramids
-            .values()
-            .map(|entry| entry.pyramid.bytes())
-            .sum();
-        out.set_item("pyramid_bytes", pyramid_bytes as u64)?;
-        out.set_item("prefetch_busy", state.prefetch.busy)?;
+        out.set_item("warnings", snapshot.warnings)?;
+        out.set_item("pyramid_bytes", snapshot.pyramid_bytes)?;
+        out.set_item("prefetch_busy", snapshot.prefetch_busy)?;
         Ok(out)
     }
 
@@ -679,8 +944,18 @@ impl PlotSession {
                 TimeFormat::VALID.join(" / ")
             ))
         })?;
-        let mut state = self.inner.lock_state();
-        state.time_format = parsed;
+        let inner = Arc::clone(&self.inner);
+        let applied = Python::try_attach(|py| {
+            let inner = Arc::clone(&inner);
+            py.detach(move || {
+                let mut state = inner.lock_state();
+                state.time_format = parsed;
+            })
+        });
+        if applied.is_none() {
+            let mut state = self.inner.lock_state();
+            state.time_format = parsed;
+        }
         Ok(())
     }
 
@@ -706,28 +981,38 @@ impl PlotSession {
         items: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let keys = extract_keys(items)?;
-        let removed = {
-            let mut state = self.inner.lock_state();
+        let inner = Arc::clone(&self.inner);
+        let removed = py.detach(move || {
+            let mut state = inner.lock_state();
             let mut removed = 0u64;
-            for key in keys {
-                if state.active.remove(&key) {
+            for key in &keys {
+                if state.active.remove(key) {
                     removed += 1;
                 }
             }
             removed
-        };
+        });
         let out = PyDict::new(py);
         out.set_item("removed", removed)?;
         Ok(out)
     }
 
     pub fn prefetch_status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let state = self.inner.lock_state();
+        let inner = Arc::clone(&self.inner);
+        let (busy, done, total, message) = py.detach(move || {
+            let state = inner.lock_state();
+            (
+                state.prefetch.busy,
+                state.prefetch.done,
+                state.prefetch.total,
+                state.prefetch.message.clone(),
+            )
+        });
         let out = PyDict::new(py);
-        out.set_item("busy", state.prefetch.busy)?;
-        out.set_item("done", state.prefetch.done)?;
-        out.set_item("total", state.prefetch.total)?;
-        out.set_item("message", &state.prefetch.message)?;
+        out.set_item("busy", busy)?;
+        out.set_item("done", done)?;
+        out.set_item("total", total)?;
+        out.set_item("message", message)?;
         Ok(out)
     }
 
@@ -768,15 +1053,17 @@ impl PlotSession {
         let inner = Arc::clone(&self.inner);
         let stats = py.detach(move || inner.stats_impl(&keys))?;
         let out = PyList::empty(py);
-        for (key, value) in stats {
+        for row in stats {
             let dict = PyDict::new(py);
-            dict.set_item("key", key)?;
-            dict.set_item("count", value.count)?;
-            dict.set_item("vmin", value.vmin)?;
-            dict.set_item("vmax", value.vmax)?;
-            dict.set_item("mean", value.mean)?;
-            dict.set_item("first", value.first)?;
-            dict.set_item("last", value.last)?;
+            dict.set_item("key", row.key)?;
+            dict.set_item("count", row.stats.count)?;
+            dict.set_item("vmin", row.stats.vmin)?;
+            dict.set_item("vmax", row.stats.vmax)?;
+            dict.set_item("mean", row.stats.mean)?;
+            dict.set_item("first", row.stats.first)?;
+            dict.set_item("last", row.stats.last)?;
+            // A8：未缓存/未就绪时是占位行（count=0, pending=true），不会少返回。
+            dict.set_item("pending", row.pending)?;
             out.append(dict)?;
         }
         Ok(out)
@@ -796,14 +1083,19 @@ impl PlotSession {
         Ok(out)
     }
 
+    /// 关闭会话：纯内存标记 + 删租约文件；预取线程在下个检查点退出。
+    ///
+    /// Rust 侧（测试/嵌入）也直接调用它而没有 `Python` 参数，因此这里用
+    /// `try_attach` 取 GIL 令牌后**立刻 detach** 再取 state 锁：绝不在持 GIL 时等锁。
     pub fn close(&self) {
-        let mut state = self.inner.lock_state();
-        state.closed = true;
-        state.active.clear();
-        state.pyramids.clear();
-        state.prefetch_queue.clear();
-        state.prefetch.busy = false;
-        state.prefetch.message = "已关闭会话".to_string();
+        let inner = Arc::clone(&self.inner);
+        let attempted = Python::try_attach(|py| {
+            let work = Arc::clone(&inner);
+            py.detach(move || work.close_impl())
+        });
+        if attempted.is_none() {
+            inner.close_impl();
+        }
     }
 }
 
@@ -1060,6 +1352,7 @@ fn choose_level(
 /// 精确聚合任意帧区间（同一报文的多个信号共享原始帧读取）。
 ///
 /// 贪心用最粗的“对齐且完整”的桶；两个边界最多各剩 <10 帧才逐帧解码。
+/// 读盘/解码错误写入 `diag`（A6：**不许** `Err(_) => {}` 静默吞掉）。
 fn exact_range_multi(
     levels: &[Level],
     file: &File,
@@ -1067,6 +1360,7 @@ fn exact_range_multi(
     signals: &[Arc<SignalPlan>],
     start: u64,
     end: u64,
+    diag: &mut ViewDiag,
 ) -> Vec<BucketAgg> {
     let mut aggs = vec![BucketAgg::empty(); signals.len()];
     let mut index = start;
@@ -1117,16 +1411,22 @@ fn exact_range_multi(
             Ok(record) => {
                 let data_len = record.data_len.min(record.dlc as usize);
                 for (signal_index, signal) in signals.iter().enumerate() {
-                    if let Ok(value) =
-                        decode_signal_bytes(signal, record.dlc, &record.payload[..data_len])
-                    {
-                        if let Some(agg) = aggs.get_mut(signal_index) {
-                            agg.merge(f32_min_cover(value), f32_max_cover(value), value, 1);
+                    match decode_signal_bytes(signal, record.dlc, &record.payload[..data_len]) {
+                        // A5：与金字塔构建同一个谓词过滤非有限值。
+                        Ok(value) if value.is_finite() => {
+                            if let Some(agg) = aggs.get_mut(signal_index) {
+                                agg.merge(f32_min_cover(value), f32_max_cover(value), value, 1);
+                            }
                         }
+                        Ok(_) => {}
+                        Err(err) => diag.record(format!(
+                            "解码 Ch{}/{} 失败：{}（{}）",
+                            message.channel, signal.name, err.message, message.file
+                        )),
                     }
                 }
             }
-            Err(_) => {}
+            Err(err) => diag.record(format!("{}（{}）", err.message, message.file)),
         }
         index = index.saturating_add(1);
     }
@@ -1230,6 +1530,10 @@ impl LevelBuilder {
     }
 
     fn push(&mut self, frame_index: u64, value: f64) {
+        // A5：金字塔构建与 view 原始帧兜底用同一个谓词过滤非有限值。
+        if !value.is_finite() {
+            return;
+        }
         let bucket = (frame_index / self.bucket_size) as usize;
         let Some(min) = self.min.get_mut(bucket) else {
             return;
@@ -1459,7 +1763,7 @@ fn prefetch_worker(inner: Arc<SessionInner>) {
             }
             if state.prefetch_queue.is_empty() {
                 state.prefetch.busy = false;
-                state.prefetch.message = String::new();
+                // 不清空 message：保留「预取完成」/上次消息，外部才能区分「完成」与「没开始」。
                 return;
             }
             let batch: Vec<(u32, u32)> = state.prefetch_queue.iter().copied().collect();
@@ -1481,19 +1785,28 @@ fn prefetch_worker(inner: Arc<SessionInner>) {
             let mut state = progress_inner.lock_state();
             state.prefetch.message = payload.message;
         };
-        let result = frame_cache::prefetch_cache(&options, &inner.key, &refs, &progress);
+        // 每个块（≈ 50 ms）检查一次 closed：`close()` 后预取立即收手。
+        let abort_inner = Arc::clone(&inner);
+        let abort = move || abort_inner.lock_state().closed;
+        let result = frame_cache::prefetch_cache(&options, &inner.key, &refs, &progress, &abort);
 
         match result {
             Ok((meta, evicted)) => {
                 let jobs: Vec<((u32, u32), Vec<String>)> = {
                     let mut state = inner.lock_state();
-                    // 预取阶段新增的告警（含 LRU 删除说明）并入会话级 warnings。
+                    // 写回 meta 前再查一次 `closed`：关闭后绝不再复活金字塔。
+                    if state.closed {
+                        state.prefetch.busy = false;
+                        state.prefetch.message = "已关闭会话".to_string();
+                        return;
+                    }
+                    // 预取阶段新增的告警（含 LRU 删除说明、DLC 截断说明）并入会话级 warnings。
                     for warning in &meta.warnings {
                         if !state.warnings.contains(warning) {
                             state.warnings.push(warning.clone());
                         }
                     }
-                    state.meta = meta;
+                    state.meta = Arc::new(meta);
                     state.evicted_bytes = state.evicted_bytes.saturating_add(evicted);
                     let mut jobs = Vec::new();
                     for message_key in &batch {
@@ -1554,6 +1867,11 @@ fn prefetch_worker(inner: Arc<SessionInner>) {
             Err(err) => {
                 let mut state = inner.lock_state();
                 state.prefetch.busy = false;
+                // `close()` 主动中止不是错误，不写告警。
+                if state.closed || err.code == frame_cache::CACHE_ABORTED {
+                    state.prefetch.message = "已关闭会话".to_string();
+                    return;
+                }
                 state.prefetch.message = err.to_string();
                 state.warnings.push(err.to_string());
                 return;
@@ -1596,7 +1914,7 @@ fn export_html_report(
     let stats = inner.stats_impl(&active)?;
     let stats_by_key: BTreeMap<String, SignalStats> = stats
         .iter()
-        .map(|(key, value)| (key.clone(), *value))
+        .map(|row| (row.key.clone(), row.stats))
         .collect();
 
     // 报告与界面走同一条取数路径：从 view(t_min, t_max, width) 拿抽稀包络，
@@ -1660,7 +1978,7 @@ fn render_html(
     info: &TimeInfo,
     files: usize,
     view: &ViewData,
-    stats: &[(String, SignalStats)],
+    stats: &[StatRow],
     stats_by_key: &BTreeMap<String, SignalStats>,
     signal_meta: &BTreeMap<String, (String, Option<String>)>,
 ) -> String {
@@ -1721,7 +2039,9 @@ fn render_html(
     };
     let stats_rows: String = stats
         .iter()
-        .map(|(key, stat)| {
+        .map(|row| {
+            let key = &row.key;
+            let stat = &row.stats;
             let (signal, unit) = signal_meta
                 .get(key)
                 .cloned()
@@ -1954,6 +2274,121 @@ mod tests {
             let max = f32_max_cover(value);
             assert!((min as f64) <= value, "min {min} 未覆盖 {value}");
             assert!((max as f64) >= value, "max {max} 未覆盖 {value}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix A5：非有限值（NaN/inf）一律丢，不许混进 sum / mean / 包络
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bucket_merge_rejects_non_finite_samples() {
+        let mut agg = BucketAgg::empty();
+        agg.merge(f32::NAN, f32::NAN, f64::NAN, 1);
+        agg.merge(f32::INFINITY, f32::NEG_INFINITY, f64::INFINITY, 1);
+        agg.merge(0.0, 0.0, f64::NEG_INFINITY, 1);
+        assert_eq!(agg.count, 0, "非有限样本一律不算有效采样");
+        assert!(agg.mean().is_finite(), "mean 不得是 NaN：{}", agg.mean());
+
+        agg.merge(1.0, 2.0, 3.0, 1);
+        assert_eq!(agg.count, 1);
+        assert_eq!(agg.min, 1.0);
+        assert_eq!(agg.max, 2.0);
+        assert_eq!(agg.mean(), 3.0);
+    }
+
+    /// 写一个经典 CAN 段文件（17 B/帧：`t f64 + dlc u8 + payload[8]`）。
+    fn write_classic_segment(dir: &Path, raws: &[u16]) -> CachedMessageMeta {
+        let mut bytes = Vec::with_capacity(raws.len() * frame_cache::CLASSIC_STRIDE);
+        for (index, raw) in raws.iter().enumerate() {
+            let mut record = [0u8; frame_cache::CLASSIC_STRIDE];
+            record[0..8].copy_from_slice(&(index as f64).to_le_bytes());
+            record[8] = 8;
+            record[9..11].copy_from_slice(&raw.to_le_bytes());
+            bytes.extend_from_slice(&record);
+        }
+        std::fs::write(dir.join("ch1_id256.bin"), &bytes).expect("写段文件");
+        CachedMessageMeta {
+            channel: 1,
+            frame_id: 0x100,
+            message: "MsgA".to_string(),
+            file: "ch1_id256.bin".to_string(),
+            stride: frame_cache::CLASSIC_STRIDE as u32,
+            frames: raws.len() as u64,
+            is_fd: false,
+        }
+    }
+
+    fn plan_with_factor(name: &str, factor: f64) -> Arc<SignalPlan> {
+        Arc::new(SignalPlan {
+            name: name.to_string(),
+            start_bit: 0,
+            bit_len: 16,
+            order: crate::bit_slice::ByteOrder::Intel,
+            is_signed: false,
+            factor,
+            offset: 0.0,
+            unit: String::new(),
+            min: None,
+            max: None,
+        })
+    }
+
+    /// A5：注入 inf/NaN 序列 → 金字塔 `stats` 只算有效样本，`mean` 不是 NaN，
+    /// `view()` 的原始帧兜底路径（`exact_range_multi`）也丢同样的样本。
+    #[test]
+    fn non_finite_samples_are_dropped_from_pyramid_and_view() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let message = write_classic_segment(dir.path(), &[1, 2, 3, 4, 5]);
+        let finite = plan_with_factor("Finite", 1.0);
+        let infinite = plan_with_factor("Infinite", f64::INFINITY);
+        let nan = plan_with_factor("Nan", f64::NAN);
+        let signals = vec![
+            ("ch1/MsgA/Finite".to_string(), Arc::clone(&finite)),
+            ("ch1/MsgA/Infinite".to_string(), Arc::clone(&infinite)),
+            ("ch1/MsgA/Nan".to_string(), Arc::clone(&nan)),
+        ];
+
+        // ① 金字塔：只统计有效样本。
+        let built = build_pyramids(dir.path(), &message, &signals).expect("建金字塔");
+        let by_key: BTreeMap<&str, &PyramidEntry> =
+            built.iter().map(|(key, entry)| (key.as_str(), entry)).collect();
+        let ok = by_key.get("ch1/MsgA/Finite").expect("Finite 必须建成");
+        assert_eq!(ok.stats.count, 5);
+        assert!(ok.stats.mean.is_finite(), "mean={}", ok.stats.mean);
+        assert!((ok.stats.mean - 3.0).abs() < 1e-12);
+        assert_eq!(ok.stats.vmin, 1.0);
+        assert_eq!(ok.stats.vmax, 5.0);
+        for key in ["ch1/MsgA/Infinite", "ch1/MsgA/Nan"] {
+            let bad = by_key.get(key).expect("非有限信号也必须建成");
+            assert_eq!(bad.stats.count, 0, "{key} 不得计入任何有效样本");
+            assert!(bad.stats.mean.is_finite(), "{key} 的 mean 不得是 NaN");
+            assert!(bad.stats.vmin.is_finite() && bad.stats.vmax.is_finite());
+            for level in &bad.pyramid.levels {
+                assert!(level.count.iter().all(|count| *count == 0));
+            }
+        }
+
+        // ② 原始帧兜底（view 的边界路径）：同一个谓词过滤。
+        let path = message.path(dir.path());
+        let file = File::open(&path).expect("打开段");
+        let mut diag = ViewDiag::default();
+        let aggs = exact_range_multi(
+            &[],
+            &file,
+            &message,
+            &[finite, infinite, nan],
+            0,
+            4,
+            &mut diag,
+        );
+        assert_eq!(diag.errors, 0, "这里没有真实错误：{diag:?}");
+        assert_eq!(aggs[0].count, 5);
+        assert!(aggs[0].mean().is_finite());
+        assert!((aggs[0].mean() - 3.0).abs() < 1e-12);
+        for agg in &aggs[1..] {
+            assert_eq!(agg.count, 0, "非有限样本不得进入桶聚合");
+            assert!(agg.mean().is_finite(), "桶 mean 不得是 NaN");
         }
     }
 }
