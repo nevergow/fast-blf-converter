@@ -69,6 +69,20 @@ BLF **没有随机访问索引** —— 想只看某段时间窗，不先把帧�
 * **`export_html()` 产出空报告**（`DATA.series[*].t` 长度 0 —— 只有骨架没有曲线；原测试只断言了"无外链"，
   漏了"有点"）→ 现在内嵌每信号抽稀序列 + 绝对时间轴 + 全量统计，仍零外链、体积 <8 MiB。
 
+### 6. 发版前的并发与缓存安全加固（只读审查 10 条，全部修复）
+
+这一轮专门查“正常路径没问题、异常路径会静默出错”的地方：
+
+* **预取期间界面不再冻结**：取数先拍快照再放锁做 I/O；`close/info/prefetch_status` 先释放 GIL 再拿锁
+  —— 实测预取 7 个报文时 `info()` **p95 0.10 ms / 最大 0.54 ms**（修复前会阻塞到预取结束）
+* **多会话/多线程同时预取不丢记录**：缓存元数据读-改-写加目录级互斥（`create_new` 锁 + 超时）
+* **LRU 不误删在用的缓存**：`.inuse-<pid>-<nonce>` 租约 + 10 分钟最近使用保护
+* **dlc 与 payload 对齐**：短包/异常帧不再零填充当真值
+* **NaN/Inf 不污染包络**，**读盘/解码错误不再被吞**（计入 `view_errors` 并置 `truncated`）
+* **`truncated`** 只表示真缺数据；**`stats()`** 遇未知 key 报 `BAD_CONFIG`、未就绪返回 `pending=true` 占位
+* **大报文排序改分块外部排序**（64 MiB/块 + k 路归并、原子 rename、失败不留坏文件）
+* **金字塔内存上限 256 MiB**（`pyramid_budget_bytes`），超限按 LRU 淘汰、按需重建，结果逐值不变
+
 ## v0.3.0 更新（第三轮反馈：进度/通道/填充 + 画图与报告）
 
 > **为什么一版发全**：原计划 v0.2.1（修 ①②③）与 v0.3.0（画图）分两次发。
@@ -234,16 +248,17 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python gui/main.py --selftest
 
 ### 方式 A（推荐）：直接下载已发布的绿色包
 
-**https://github.com/nevergow/fast-blf-converter/releases/tag/v0.2.0** → 下载 `FastBLFConverter-portable.zip`（72.9 MB）
+**https://github.com/nevergow/fast-blf-converter/releases/tag/v0.4.0** → 下载 `FastBLFConverter-portable.zip`（**73.8 MB**）
 
 ```bash
 # 或用 gh CLI（私有仓库需先登录）
-gh release download v0.2.0 -R nevergow/fast-blf-converter -D ./ci-out
+gh release download v0.4.0 -R nevergow/fast-blf-converter -D ./ci-out
 ```
 
-sha256：`97fd56633c3e3176febdecc5dc933b7ac58048edb08ad562926cc282d255282d`
+sha256：`3775b77d128c82e7c22d632c1279b586faef9508d4fd7f1e6237deb69396fde3`
 
-Release 同时附了复选框视觉基线图 `check-states.png`（三态 + 行选中高亮的渲染对照）。
+> 该包由 CI（`windows-latest`）构建，**215 个条目**、解压即用（onedir）。
+> 校验四方一致：本地构建产物 / GitHub `digest` / `gh release download` / API 直链（HTTP 200）。
 
 ### 方式 A2：自己触发一次构建（改动后出包用这条）
 
