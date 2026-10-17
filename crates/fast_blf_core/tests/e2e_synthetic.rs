@@ -4201,7 +4201,11 @@ fn step17_view_point_counts_are_bounded_by_width() {
     .expect("Python 侧断言失败");
 }
 
-/// 6）时间口径零成本：set_time_format 只改显示层；min/max 数组完全一致且 ≤16ms。
+/// 6）时间口径零成本：`set_time_format` 只改显示层。
+///
+/// 确定性断言（**不看墙钟**，不受并发建缓存/线程调度影响）：切口径前后
+/// `pyramid_bytes` / `cache_bytes` 必须完全不变 —— 证明它既没重建金字塔（零解码），
+/// 也没写盘（零 I/O）；`view()` 的 min/max 数组逐值一致。
 #[test]
 fn step17_set_time_format_is_zero_cost_and_keeps_min_max() {
     let dir = tempfile::tempdir().expect("临时目录");
@@ -4212,28 +4216,40 @@ fn step17_set_time_format_is_zero_cost_and_keeps_min_max() {
         let session = fast_blf_core::open_plot_session(py, &config, None)?;
         session.add_signals(py, PyList::new(py, ["ch1/MsgA/A"])?.as_any())?;
         let before = step17_view(&session.view(py, 0.0, 59.999, 500)?)?;
+        let info_before = session.info(py)?;
+        let pyramid_before: u64 = info_before.get_item("pyramid_bytes")?.unwrap().extract()?;
+        let cache_bytes_before: u64 = info_before.get_item("cache_bytes")?.unwrap().extract()?;
+        assert!(pyramid_before > 0, "前置条件：金字塔必须已建好");
+
         let started = std::time::Instant::now();
         session.set_time_format("absolute")?;
         let elapsed = started.elapsed();
         let after = step17_view(&session.view(py, 0.0, 59.999, 500)?)?;
-        assert!(
-            elapsed.as_millis() <= 16,
-            "set_time_format 耗时 {:?}，超过 16ms",
-            elapsed
+        // 零成本的结构性证据：常驻金字塔字节与磁盘字节都不变（无解码、无 I/O）。
+        let info_after = session.info(py)?;
+        let pyramid_after: u64 = info_after.get_item("pyramid_bytes")?.unwrap().extract()?;
+        let cache_bytes_after: u64 = info_after.get_item("cache_bytes")?.unwrap().extract()?;
+        assert_eq!(
+            pyramid_before, pyramid_after,
+            "set_time_format 不得重建/淘汰金字塔（零解码）"
+        );
+        assert_eq!(
+            cache_bytes_before, cache_bytes_after,
+            "set_time_format 不得写盘（零 I/O）"
         );
         assert_eq!(before.t, after.t);
         let a = before.series.get("ch1/MsgA/A").expect("before 缺曲线");
         let b = after.series.get("ch1/MsgA/A").expect("after 缺曲线");
         assert_eq!(a.0, b.0, "min 数组必须完全一致");
         assert_eq!(a.1, b.1, "max 数组必须完全一致");
-        let info = session.info(py)?;
+        let info = info_after;
         // 该合成 BLF 的头部墙钟为 0（BlfWriter 默认），absolute 字符串允许为 None；
         // 真正有墙钟的夹具在 step17_timefmt_absolute_info 里单独断言。
         let t_min_str = info
             .get_item("t_min_str")?
             .and_then(|value| value.extract::<String>().ok());
         println!(
-            "STEP17_TIMEFORMAT ok set_time_format={:.3}ms points={} t_min_str={t_min_str:?}",
+            "STEP17_TIMEFORMAT ok set_time_format={:.3}ms points={} pyramid_bytes={pyramid_before} t_min_str={t_min_str:?}",
             elapsed.as_secs_f64() * 1000.0,
             a.0.len()
         );
@@ -5704,9 +5720,12 @@ fn fixa_a1_view_does_not_hold_state_lock_during_io() {
             calls >= 20,
             "view() 期间 info() 必须能反复返回（实际 {calls} 次）"
         );
+        // 用相对口径（比单次宽 view 还短，并留 500 ms 见底）而不是固定毫秒：并行跑测时
+        // 机器负载会把单次 info() 的 GIL 排队拉长，绝对阈值会假阳。
+        let budget = single_view.as_millis().max(500) as u64;
         assert!(
-            max_latency < 300,
-            "info() 单次耗时必须远小于 view：{max_latency}ms"
+            max_latency < budget,
+            "info() 单次耗时必须远小于一次宽 view：info={max_latency}ms budget={budget}ms"
         );
         Ok(())
     })
@@ -6176,4 +6195,216 @@ fn fixa_a8_stats_is_strict_and_keeps_input_length() {
         Ok(())
     })
     .expect("Python 侧断言失败");
+}
+
+// ---------------------------------------------------------------------------
+// Fix B1：段排序改为分块外部排序（大报文时间戳回退不再全量进内存）
+// ---------------------------------------------------------------------------
+
+const FIXB_B1_FILE: &str = "ch1_id256.bin";
+
+/// Fix B1 现场：1 帧 BLF（只为拿稳定 cache key）+ 由测试自己合成的段文件。
+/// 返回 `(blf, dbc, cache_dir, key_dir, key)`。
+fn fixb_b1_scene(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf, String) {
+    let blf = dir.join("fixb_b1.blf");
+    let dbc = dir.join("fixb_b1.dbc");
+    std::fs::write(&dbc, STEP17_DBC).expect("写入 Fix B DBC");
+    let mut writer = blf_asc::BlfWriter::create(&blf).expect("创建 Fix B BLF");
+    push_msg(&mut writer, 0, 0x100, 0.0, vec![0u8; 8]);
+    writer.finish().expect("完成 Fix B BLF");
+
+    let mut dbc_map = BTreeMap::new();
+    dbc_map.insert(1u32, dbc.clone());
+    let key = fast_blf_core::frame_cache::compute_cache_key(std::slice::from_ref(&blf), &dbc_map)
+        .expect("计算 cache key");
+    let cache_dir = dir.join("cache");
+    let key_dir = cache_dir.join(&key);
+    std::fs::create_dir_all(&key_dir).expect("建 key 目录");
+    (blf, dbc, cache_dir, key_dir, key)
+}
+
+/// 合成段文件：`t = (frames-1-i)*0.001`（严格逆序 → 必然触发 `sort_segment`）。
+fn write_fixb_b1_segment(path: &Path, frames: u64, stride: usize) {
+    use std::io::Write;
+    let handle = std::fs::File::create(path).expect("创建段文件");
+    let mut writer = std::io::BufWriter::new(handle);
+    let mut record = vec![0u8; stride];
+    for index in 0..frames {
+        let timestamp = (frames - 1 - index) as f64 * 0.001;
+        record[0..8].copy_from_slice(&timestamp.to_le_bytes());
+        record[8] = 8;
+        record[9..11].copy_from_slice(&((index % 1000) as u16).to_le_bytes());
+        writer.write_all(&record).expect("写记录");
+    }
+    writer.flush().expect("刷新段文件");
+}
+
+/// 目录里除段文件以外的残留（临时文件必须清空）。
+fn fixb_b1_leftovers(key_dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(key_dir)
+        .expect("列 key 目录")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name != FIXB_B1_FILE)
+        .collect();
+    names.sort();
+    names
+}
+
+/// Fix B1：300 万条逆序记录 → 分块外部排序（块数 > 1）、严格非降、条数/布局不变、
+/// `view()` 取到正确 min/max，且不残留任何临时文件。
+#[test]
+fn fixb_b1_sort_segment_is_chunked_and_strictly_sorted() {
+    const FRAMES: u64 = 3_000_000;
+    let stride = fast_blf_core::CLASSIC_STRIDE;
+
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc, cache_dir, key_dir, key) = fixb_b1_scene(dir.path());
+    let path = key_dir.join(FIXB_B1_FILE);
+    write_fixb_b1_segment(&path, FRAMES, stride);
+
+    let started = std::time::Instant::now();
+    let chunks = fast_blf_core::frame_cache::sort_segment(&path, stride, FRAMES)
+        .expect("分块外部排序必须成功");
+    let elapsed = started.elapsed();
+    println!(
+        "FIXB_B1 frames={FRAMES} stride={stride} chunk_bytes={} chunk_count={chunks} elapsed={:.2}s",
+        fast_blf_core::frame_cache::SORT_CHUNK_BYTES,
+        elapsed.as_secs_f64()
+    );
+    assert!(
+        chunks > 1,
+        "300 万条 × 88 B 远超 {} B，必须分成多块（实际 {chunks} 块）",
+        fast_blf_core::frame_cache::SORT_CHUNK_BYTES
+    );
+
+    // ① 布局/条数：17 B × frames，与 meta.frames 一致。
+    let file_len = std::fs::metadata(&path).expect("段文件元信息").len();
+    assert_eq!(
+        file_len,
+        FRAMES * stride as u64,
+        "段文件长度必须 = frames × stride（17 字节布局不变）"
+    );
+    // ② 临时文件全部清干净（成功路径）。
+    let leftovers = fixb_b1_leftovers(&key_dir);
+    assert!(leftovers.is_empty(), "成功后不许残留临时文件：{leftovers:?}");
+
+    // ③ 严格非降 + 值集合不变。
+    let bytes = std::fs::read(&path).expect("读回段文件");
+    let mut previous = f64::NEG_INFINITY;
+    let mut count = 0u64;
+    let mut min_value = u16::MAX;
+    let mut max_value = 0u16;
+    for record in bytes.chunks_exact(stride) {
+        let mut raw_ts = [0u8; 8];
+        raw_ts.copy_from_slice(&record[0..8]);
+        let timestamp = f64::from_le_bytes(raw_ts);
+        assert!(
+            timestamp >= previous,
+            "排序后必须非降：{previous} -> {timestamp}（第 {count} 条）"
+        );
+        previous = timestamp;
+        let mut raw = [0u8; 2];
+        raw.copy_from_slice(&record[9..11]);
+        let value = u16::from_le_bytes(raw);
+        min_value = min_value.min(value);
+        max_value = max_value.max(value);
+        count += 1;
+    }
+    assert_eq!(count, FRAMES, "排序后条数必须与 meta.frames 一致");
+    assert_eq!((min_value, max_value), (0, 999), "排序不得丢帧或改帧");
+    assert_eq!(
+        previous,
+        (FRAMES - 1) as f64 * 0.001,
+        "最大时间戳必须落在最后一条"
+    );
+
+    // ④ 段 + meta 交给 PlotSession：view() 必须取到正确 min/max。
+    let message_meta = fast_blf_core::CachedMessageMeta {
+        channel: 1,
+        frame_id: 0x100,
+        message: "MsgA".to_string(),
+        file: FIXB_B1_FILE.to_string(),
+        stride: stride as u32,
+        frames: FRAMES,
+        is_fd: false,
+    };
+    let meta = fast_blf_core::CacheMeta {
+        format_version: fast_blf_core::CACHE_FORMAT_VERSION.to_string(),
+        key: key.clone(),
+        dbc_hash: String::new(),
+        message_set: vec![(1, 0x100)],
+        created_at: 0,
+        last_used_at: 0,
+        cache_bytes: file_len,
+        t_min: 0.0,
+        t_max: (FRAMES - 1) as f64 * 0.001,
+        abs_min_micros: None,
+        abs_max_micros: None,
+        files: Vec::new(),
+        messages: vec![message_meta],
+        warnings: Vec::new(),
+    };
+    std::fs::write(
+        key_dir.join("meta.json"),
+        serde_json::to_string(&meta).expect("序列化 meta"),
+    )
+    .expect("写 meta.json");
+
+    let t_max = (FRAMES - 1) as f64 * 0.001;
+    with_python(|py| -> PyResult<()> {
+        let config = step17_config(
+            py,
+            &blf,
+            &dbc,
+            Some(("MsgA", "A")),
+            &cache_dir,
+            200,
+            "relative_s",
+        )?;
+        let session = fast_blf_core::open_plot_session(py, &config, None)?;
+        session.add_signals(py, PyList::new(py, ["ch1/MsgA/A"])?.as_any())?;
+        let view = step17_view(&session.view(py, 0.0, t_max, 800)?)?;
+        let (min, max, _mean) = view.series.get("ch1/MsgA/A").expect("必须有 A 序列");
+        let global_min = min.iter().copied().fold(f64::INFINITY, f64::min);
+        let global_max = max.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let info = session.info(py)?;
+        let pyramid_bytes: u64 = info.get_item("pyramid_bytes")?.unwrap().extract()?;
+        println!(
+            "FIXB_B1 view points={} min={global_min} max={global_max} pyramid_bytes={pyramid_bytes}",
+            view.t.len()
+        );
+        assert_eq!(global_min, 0.0, "view 必须取到正确最小值");
+        assert_eq!(global_max, 999.0, "view 必须取到正确最大值");
+        assert!(view.t.len() <= 800, "点数必须 ≤ width");
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// Fix B1（异常路径）：`frames` 与文件实际条数不符 → 报错，原段**逐字节不变**，
+/// 且已写出的临时块全部清理（绝不留下“半排序”的段文件）。
+#[test]
+fn fixb_b1_sort_failure_keeps_original_segment_and_cleans_temps() {
+    const FRAMES: u64 = 900_000; // 900_000×88 B > 64 MiB → 至少 2 块，失败点落在第 2 块
+    let stride = fast_blf_core::CLASSIC_STRIDE;
+
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (_blf, _dbc, _cache_dir, key_dir, _key) = fixb_b1_scene(dir.path());
+    let path = key_dir.join(FIXB_B1_FILE);
+    write_fixb_b1_segment(&path, FRAMES, stride);
+    let before = std::fs::read(&path).expect("读原段");
+
+    let err = fast_blf_core::frame_cache::sort_segment(&path, stride, FRAMES + 1)
+        .expect_err("记录数不足必须报错");
+    println!(
+        "FIXB_B1 failure code={} message={}",
+        err.code, err.message
+    );
+    assert_eq!(err.code, fast_blf_core::BLF_PARSE);
+
+    let after = std::fs::read(&path).expect("读回原段");
+    assert_eq!(after, before, "失败路径必须原样保留排序前的段文件");
+    let leftovers = fixb_b1_leftovers(&key_dir);
+    assert!(leftovers.is_empty(), "失败路径也必须清干净临时文件：{leftovers:?}");
 }

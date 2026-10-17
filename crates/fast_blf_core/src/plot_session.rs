@@ -27,6 +27,20 @@ use crate::error::{CoreError, EMPTY_RESULT};
 use crate::exporter::TimeFormat;
 use crate::frame_cache::{self, CacheMeta, CacheOptions, CachedMessageMeta};
 
+/// 包络金字塔常驻内存上限（生产值）：256 MiB。
+pub const PYRAMID_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// 实际生效的预算。
+///
+/// 单元测试把它压到 1 MiB，否则触发淘汰需要上亿个样本；生产构建永远是
+/// [`PYRAMID_BUDGET_BYTES`]（`cfg(test)` 不参与库的正常编译）。
+#[cfg(test)]
+pub(crate) const PYRAMID_BUDGET_LIMIT: u64 = 1024 * 1024;
+#[cfg(not(test))]
+pub(crate) const PYRAMID_BUDGET_LIMIT: u64 = PYRAMID_BUDGET_BYTES;
+
+const MIB: u64 = 1024 * 1024;
+
 /// `open_plot_session` 的 Rust 侧输入（Python config 已解析成强类型）。
 pub struct SessionConfig {
     pub blf_paths: Vec<PathBuf>,
@@ -154,6 +168,16 @@ struct SessionState {
     evicted_bytes: u64,
     active: BTreeSet<String>,
     pyramids: HashMap<String, Arc<PyramidEntry>>,
+    /// `pyramids` 的字节账本（与插入/淘汰一一对应，`info()` 直接读它）。
+    pyramid_bytes: u64,
+    /// LRU：key → 最后使用（Unix 毫秒）。
+    pyramid_used: HashMap<String, u64>,
+    /// 曾经建成的 key（用于区分「首次构建」与「淘汰后重建」）。
+    pyramid_seen: std::collections::HashSet<String>,
+    /// 累计被淘汰的信号数 / 字节数 / 重建次数（`warnings` 汇总后上报）。
+    pyramid_evictions: u64,
+    pyramid_evicted_bytes: u64,
+    pyramid_rebuilds: u64,
     time_format: TimeFormat,
     prefetch: PrefetchStatus,
     prefetch_queue: BTreeSet<(u32, u32)>,
@@ -163,6 +187,68 @@ struct SessionState {
     /// 首次读盘/解码错误的描述（含段文件名）。
     view_error_first: Option<String>,
     closed: bool,
+}
+
+impl SessionState {
+    /// 记一笔金字塔占用的字节（插入/替换都走这里），随后按 LRU 预算淘汰。
+    ///
+    /// `protect` 是「本次 `view()` / `stats()` 正在使用的信号」，绝不淘汰。
+    fn insert_pyramid(&mut self, key: String, entry: PyramidEntry, protect: &BTreeSet<String>) {
+        let bytes = entry.pyramid.bytes() as u64;
+        if let Some(previous) = self.pyramids.insert(key.clone(), Arc::new(entry)) {
+            self.pyramid_bytes = self
+                .pyramid_bytes
+                .saturating_sub(previous.pyramid.bytes() as u64);
+        }
+        if !self.pyramid_seen.insert(key.clone()) {
+            // 相同 key 已经有金字塔 → 这是淘汰后的按需重建。
+            self.pyramid_rebuilds = self.pyramid_rebuilds.saturating_add(1);
+        }
+        self.pyramid_bytes = self.pyramid_bytes.saturating_add(bytes);
+        self.pyramid_used.insert(key.clone(), now_millis());
+        self.enforce_pyramid_budget(&key, protect);
+    }
+
+    /// 刷新 LRU 时间戳（信号被 `view()` / `stats()` 真正用到时调用）。
+    fn touch_pyramid(&mut self, key: &str) {
+        if self.pyramids.contains_key(key) {
+            let now = now_millis();
+            self.pyramid_used.insert(key.to_string(), now);
+        }
+    }
+
+    /// 常驻金字塔字节超预算 → 按 LRU 淘汰**其它**信号。
+    ///
+    /// 若剩余候选全在 `protect` / `keep` 里（本次调用本身就需要它们），
+    /// 宁可不淘汰 —— 正确性优先于预算，且不写告警噪音。
+    fn enforce_pyramid_budget(&mut self, keep: &str, protect: &BTreeSet<String>) {
+        let mut evicted = 0u64;
+        let mut evicted_bytes = 0u64;
+        while self.pyramid_bytes > PYRAMID_BUDGET_LIMIT {
+            let victim = self
+                .pyramid_used
+                .iter()
+                .filter(|(key, _)| key.as_str() != keep && !protect.contains(key.as_str()))
+                .min_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)))
+                .map(|(key, _)| key.clone());
+            let Some(victim) = victim else {
+                break;
+            };
+            if let Some(entry) = self.pyramids.remove(&victim) {
+                let bytes = entry.pyramid.bytes() as u64;
+                self.pyramid_bytes = self.pyramid_bytes.saturating_sub(bytes);
+                evicted = evicted.saturating_add(1);
+                evicted_bytes = evicted_bytes.saturating_add(bytes);
+            }
+            self.pyramid_used.remove(&victim);
+        }
+        if evicted > 0 {
+            self.pyramid_evictions = self.pyramid_evictions.saturating_add(evicted);
+            self.pyramid_evicted_bytes = self
+                .pyramid_evicted_bytes
+                .saturating_add(evicted_bytes);
+        }
+    }
 }
 
 struct SessionInner {
@@ -212,6 +298,9 @@ impl SessionInner {
             state.closed = true;
             state.active.clear();
             state.pyramids.clear();
+            state.pyramid_bytes = 0;
+            state.pyramid_used.clear();
+            state.pyramid_seen.clear();
             state.prefetch_queue.clear();
             state.prefetch.busy = false;
             state.prefetch.message = "已关闭会话".to_string();
@@ -232,6 +321,16 @@ impl SessionInner {
                 state.view_errors, first
             ));
         }
+        // B2：金字塔淘汰 / 重建都必须上报（正常命中时一条都不多）。
+        if state.pyramid_evictions > 0 || state.pyramid_rebuilds > 0 {
+            warnings.push(format!(
+                "包络金字塔超 {} MiB 上限：LRU 已淘汰 {} 个信号（共 {} 字节），已按需重建 {} 次",
+                PYRAMID_BUDGET_LIMIT / MIB,
+                state.pyramid_evictions,
+                state.pyramid_evicted_bytes,
+                state.pyramid_rebuilds
+            ));
+        }
         InfoSnapshot {
             time_info: TimeInfo::from_meta(&state.meta, state.time_format),
             files: state
@@ -250,12 +349,63 @@ impl SessionInner {
                 .iter()
                 .map(|message| (message.channel, message.frame_id))
                 .collect(),
-            pyramid_bytes: state
-                .pyramids
-                .values()
-                .map(|entry| entry.pyramid.bytes() as u64)
-                .sum(),
+            pyramid_bytes: state.pyramid_bytes,
+            pyramid_budget_bytes: PYRAMID_BUDGET_LIMIT,
             prefetch_busy: state.prefetch.busy,
+        }
+    }
+
+    /// 金字塔「按需重建」入口：把 active 里**已缓存、但金字塔被 LRU 淘汰**的信号补回来。
+    ///
+    /// * 只重建 `meta` 里已有报文段的信号（未缓存报文仍走预取，`view()` 记为 pending）；
+    /// * 失败只记 warning，不把 `view()` 变成异常（与预取路径一致）；
+    /// * 本次调用重建的全部信号都受保护，不会被自己这次插入挤掉。
+    fn ensure_active_pyramids(&self) {
+        let jobs: BTreeMap<(u32, u32), Vec<String>> = {
+            let state = self.lock_state();
+            if state.closed {
+                return;
+            }
+            let mut jobs: BTreeMap<(u32, u32), Vec<String>> = BTreeMap::new();
+            for key in &state.active {
+                if state.pyramids.contains_key(key) {
+                    continue;
+                }
+                let Some(&index) = self.catalog_by_key.get(key) else {
+                    continue;
+                };
+                let catalog = &self.catalog[index];
+                if !state.meta.has_message(catalog.channel, catalog.frame_id) {
+                    continue;
+                }
+                jobs.entry((catalog.channel, catalog.frame_id))
+                    .or_default()
+                    .push(key.clone());
+            }
+            jobs
+        };
+        if jobs.is_empty() {
+            return;
+        }
+        let protect: BTreeSet<String> = jobs.values().flatten().cloned().collect();
+        for (message_key, wanted) in jobs {
+            match self.build_for_message(message_key, &wanted) {
+                Ok(built) => {
+                    let mut state = self.lock_state();
+                    if state.closed {
+                        return;
+                    }
+                    for (key, entry) in built {
+                        state.insert_pyramid(key, entry, &protect);
+                    }
+                }
+                Err(err) => {
+                    let mut state = self.lock_state();
+                    state
+                        .warnings
+                        .push(format!("重建包络金字塔失败：{}", err.message));
+                }
+            }
         }
     }
 
@@ -319,6 +469,8 @@ impl SessionInner {
     /// 立即放锁；所有 `read_at` / 解码都在锁外进行。因此预取线程持锁时，
     /// `view()` 不会把锁竞争带回到持有 GIL 的 UI 线程上。
     fn compute_view(&self, t0: f64, t1: f64, width_px: usize) -> Result<ViewData, CoreError> {
+        // B2：金字塔被 LRU 淘汰后，在本次 view 前按需重建（只重建已缓存报文）。
+        self.ensure_active_pyramids();
         let snapshot = self.view_snapshot();
         let time_info = snapshot.time_info.clone();
         if snapshot.closed || width_px == 0 {
@@ -369,8 +521,8 @@ impl SessionInner {
             }
             let Some(message_meta) = meta.message(message_key.0, message_key.1) else {
                 diag.record(format!(
-                    "缓存 meta 缺少报文段 Ch{}/{}（{}.bin）",
-                    message_key.0, message_key.1, message_key.1
+                    "缓存 meta 缺少报文段 Ch{}/id{:#x}",
+                    message_key.0, message_key.1
                 ));
                 continue;
             };
@@ -511,12 +663,22 @@ impl SessionInner {
 
     /// 锁内取一份轻量快照：`meta` 是 `Arc`，金字塔是 `Arc`，全程零 I/O。
     fn view_snapshot(&self) -> ViewSnapshot {
-        let state = self.lock_state();
+        let mut state = self.lock_state();
         let mut by_message: BTreeMap<
             (u32, u32),
             Vec<(String, Arc<PyramidEntry>, Arc<SignalPlan>)>,
         > = BTreeMap::new();
         let mut pending = 0u64;
+        let used: Vec<String> = state
+            .active
+            .iter()
+            .filter(|key| state.pyramids.contains_key(*key))
+            .cloned()
+            .collect();
+        // 本次 view 真正用到的信号刷新 LRU 时间戳，避免“正在看的信号”被后续淘汰。
+        for key in &used {
+            state.touch_pyramid(key);
+        }
         for key in &state.active {
             let Some(&index) = self.catalog_by_key.get(key) else {
                 continue;
@@ -574,9 +736,10 @@ impl SessionInner {
 
         for (message_key, wanted) in to_build {
             let built = self.build_for_message(message_key, &wanted)?;
+            let protect: BTreeSet<String> = wanted.into_iter().collect();
             let mut state = self.lock_state();
             for (key, entry) in built {
-                state.pyramids.insert(key, Arc::new(entry));
+                state.insert_pyramid(key, entry, &protect);
             }
         }
 
@@ -614,8 +777,11 @@ impl SessionInner {
         let mut out = Vec::with_capacity(wanted.len());
         for key in wanted {
             let entry = {
-                let state = self.lock_state();
-                state.pyramids.get(&key).cloned()
+                let mut state = self.lock_state();
+                let entry = state.pyramids.get(&key).cloned();
+                // 本次 stats 用到的信号刷新 LRU。
+                state.touch_pyramid(&key);
+                entry
             };
             // 未知已在上面拦截，这里的 `else` 理论上不会走到，但绝不允许静默少一条。
             let Some(&index) = self.catalog_by_key.get(&key) else {
@@ -632,12 +798,16 @@ impl SessionInner {
                     let catalog = &self.catalog[index];
                     let built = self
                         .build_for_message((catalog.channel, catalog.frame_id), &[key.clone()])?;
+                    let protect: BTreeSet<String> = [key.clone()].into_iter().collect();
                     let mut state = self.lock_state();
                     let mut found = None;
                     for (built_key, entry) in built {
-                        let entry = Arc::new(entry);
-                        found = Some(Arc::clone(&entry));
-                        state.pyramids.insert(built_key, entry);
+                        let tracked = built_key == key;
+                        state.insert_pyramid(built_key, entry, &protect);
+                        if tracked {
+                            // `key` 在 protect 里，不会被自己这次插入挤掉。
+                            found = state.pyramids.get(&key).cloned();
+                        }
                     }
                     found
                 }
@@ -698,6 +868,8 @@ struct InfoSnapshot {
     warnings: Vec<String>,
     message_set: BTreeSet<(u32, u32)>,
     pyramid_bytes: u64,
+    /// 当前生效的预算（测试下会被压小，见 [`PYRAMID_BUDGET_LIMIT`]）。
+    pyramid_budget_bytes: u64,
     prefetch_busy: bool,
 }
 
@@ -830,6 +1002,12 @@ pub fn open_session(
         evicted_bytes,
         active: BTreeSet::new(),
         pyramids: HashMap::new(),
+        pyramid_bytes: 0,
+        pyramid_used: HashMap::new(),
+        pyramid_seen: std::collections::HashSet::new(),
+        pyramid_evictions: 0,
+        pyramid_evicted_bytes: 0,
+        pyramid_rebuilds: 0,
         time_format: config.time_format,
         prefetch: PrefetchStatus::default(),
         prefetch_queue: BTreeSet::new(),
@@ -932,6 +1110,7 @@ impl PlotSession {
         out.set_item("signals", signals)?;
         out.set_item("warnings", snapshot.warnings)?;
         out.set_item("pyramid_bytes", snapshot.pyramid_bytes)?;
+        out.set_item("pyramid_budget_bytes", snapshot.pyramid_budget_bytes)?;
         out.set_item("prefetch_busy", snapshot.prefetch_busy)?;
         Ok(out)
     }
@@ -1842,9 +2021,10 @@ fn prefetch_worker(inner: Arc<SessionInner>) {
                     }
                     match inner.build_for_message(message_key, &wanted) {
                         Ok(built) => {
+                            let protect: BTreeSet<String> = wanted.into_iter().collect();
                             let mut state = inner.lock_state();
                             for (key, entry) in built {
-                                state.pyramids.insert(key, Arc::new(entry));
+                                state.insert_pyramid(key, entry, &protect);
                             }
                         }
                         Err(err) => {
@@ -2390,5 +2570,262 @@ mod tests {
             assert_eq!(agg.count, 0, "非有限样本不得进入桶聚合");
             assert!(agg.mean().is_finite(), "桶 mean 不得是 NaN");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix B2：金字塔内存预算 + LRU 淘汰 + 按需重建（结果不变）
+    // -----------------------------------------------------------------------
+
+    /// 写一个 `frames` 条的经典 CAN 段（升序时间戳），payload 随 `seed` 变化。
+    fn write_b2_segment(dir: &Path, file: &str, frame_id: u32, frames: u64, seed: u16) -> CachedMessageMeta {
+        let mut bytes = Vec::with_capacity(frames as usize * frame_cache::CLASSIC_STRIDE);
+        for index in 0..frames {
+            let mut record = [0u8; frame_cache::CLASSIC_STRIDE];
+            record[0..8].copy_from_slice(&(index as f64 * 0.001).to_le_bytes());
+            record[8] = 8;
+            let raw = ((index as u16).wrapping_mul(7).wrapping_add(seed.wrapping_mul(13))) % 1000;
+            record[9..11].copy_from_slice(&raw.to_le_bytes());
+            bytes.extend_from_slice(&record);
+        }
+        std::fs::write(dir.join(file), &bytes).expect("写段文件");
+        CachedMessageMeta {
+            channel: 1,
+            frame_id,
+            message: format!("Msg{frame_id}"),
+            file: file.to_string(),
+            stride: frame_cache::CLASSIC_STRIDE as u32,
+            frames,
+            is_fd: false,
+        }
+    }
+
+    /// 直接拼一个 `SessionInner`（不起 BLF/预取线程，方便逐字节比较 `view()`）。
+    fn b2_session(dir: &Path, metas: Vec<CachedMessageMeta>, keys: &[String]) -> Arc<SessionInner> {
+        let t_max = metas
+            .iter()
+            .map(|meta| meta.frames.saturating_sub(1) as f64 * 0.001)
+            .fold(0.0f64, f64::max);
+        let meta = Arc::new(CacheMeta {
+            format_version: frame_cache::CACHE_FORMAT_VERSION.to_string(),
+            key: "b2-key".to_string(),
+            dbc_hash: String::new(),
+            message_set: metas
+                .iter()
+                .map(|meta| (meta.channel, meta.frame_id))
+                .collect(),
+            created_at: 0,
+            last_used_at: 0,
+            cache_bytes: 0,
+            t_min: 0.0,
+            t_max,
+            abs_min_micros: None,
+            abs_max_micros: None,
+            files: Vec::new(),
+            messages: metas,
+            warnings: Vec::new(),
+        });
+        let mut catalog: Vec<CatalogSignal> = Vec::new();
+        for key in keys {
+            let parts: Vec<&str> = key.split('/').collect();
+            let channel = parts[0].trim_start_matches("ch").parse::<u32>().unwrap_or(1);
+            let message = parts[1].to_string();
+            let frame_id = 0x100u32 + (message.trim_start_matches("Msg").parse::<u32>().unwrap_or(0));
+            catalog.push(CatalogSignal {
+                key: key.clone(),
+                channel,
+                message,
+                frame_id,
+                unit: None,
+                signal: plan_with_factor(parts[2], 1.0),
+            });
+        }
+        let mut catalog_by_key = HashMap::new();
+        for (index, signal) in catalog.iter().enumerate() {
+            catalog_by_key.insert(signal.key.clone(), index);
+        }
+        let state = SessionState {
+            meta,
+            dir: dir.to_path_buf(),
+            cache_hit: true,
+            evicted_bytes: 0,
+            active: BTreeSet::new(),
+            pyramids: HashMap::new(),
+            pyramid_bytes: 0,
+            pyramid_used: HashMap::new(),
+            pyramid_seen: std::collections::HashSet::new(),
+            pyramid_evictions: 0,
+            pyramid_evicted_bytes: 0,
+            pyramid_rebuilds: 0,
+            time_format: TimeFormat::RelativeS,
+            prefetch: PrefetchStatus::default(),
+            prefetch_queue: BTreeSet::new(),
+            warnings: Vec::new(),
+            view_errors: 0,
+            view_error_first: None,
+            closed: false,
+        };
+        Arc::new(SessionInner {
+            state: Mutex::new(state),
+            cache_dir: dir.to_path_buf(),
+            key: "b2-key".to_string(),
+            blf_paths: Vec::new(),
+            dbc_by_channel: BTreeMap::new(),
+            budget_mb: frame_cache::DEFAULT_CACHE_BUDGET_MB,
+            catalog,
+            catalog_by_key,
+            messages: BTreeMap::new(),
+            lease: Mutex::new(None),
+            last_touch_millis: AtomicU64::new(now_millis()),
+        })
+    }
+
+    /// B2 自证：超预算 → LRU 淘汰其它信号（不动本次用到的那个）→ 再次需要时按需重建，
+    /// 重建后的 `view()` 与未淘汰时**逐值相同**；`info()` 的 `pyramid_bytes` 始终
+    /// ≤ `pyramid_budget_bytes`，并在 `warnings` 里写明淘汰/重建。
+    #[test]
+    fn pyramid_budget_evicts_lru_and_rebuild_keeps_view_identical() {
+        const FRAMES: u64 = 200_000;
+        let dir = tempfile::tempdir().expect("临时目录");
+        let names = ["Msg0", "Msg1", "Msg2", "Msg3"];
+        let mut metas = Vec::new();
+        let mut keys = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            let frame_id = 0x100 + index as u32;
+            let file = format!("ch1_id{frame_id}.bin");
+            metas.push(write_b2_segment(
+                dir.path(),
+                &file,
+                frame_id,
+                FRAMES,
+                index as u16,
+            ));
+            keys.push(format!("ch1/{name}/Sig"));
+        }
+        let inner = b2_session(dir.path(), metas, &keys);
+        let t_max = (FRAMES - 1) as f64 * 0.001;
+
+        // ① 只激活 1 个信号：拿到“从未淘汰”的基准 view，并确认 4 个信号一定超预算。
+        inner.lock_state().active.insert(keys[0].clone());
+        let reference = inner.compute_view(0.0, t_max, 400).expect("基准 view");
+        assert!(!reference.series.is_empty(), "基准 view 必须有数据");
+        assert!(!reference.truncated, "基准 view 不得为 truncated");
+        let single_bytes = inner.lock_state().pyramid_bytes;
+        assert!(single_bytes > 0, "单位信号金字塔必须占用字节");
+        assert!(
+            single_bytes < PYRAMID_BUDGET_LIMIT,
+            "单个信号 {single_bytes} 必须装得下预算 {PYRAMID_BUDGET_LIMIT}"
+        );
+        assert!(
+            single_bytes.saturating_mul(names.len() as u64) > PYRAMID_BUDGET_LIMIT,
+            "{} 个信号必须超预算（{single_bytes} B × {} > {PYRAMID_BUDGET_LIMIT}）",
+            names.len(),
+            names.len()
+        );
+
+        // ② 全部激活，逐个 stats：每次只保护自己 → 累计必超预算 → LRU 淘汰其它信号。
+        {
+            let mut state = inner.lock_state();
+            for key in &keys {
+                state.active.insert(key.clone());
+            }
+        }
+        for key in &keys {
+            let rows = inner
+                .stats_impl(std::slice::from_ref(key))
+                .expect("stats 必须成功");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].stats.count, FRAMES, "{key} 必须统计到全部帧");
+            let snapshot = inner.info_snapshot();
+            assert!(
+                snapshot.pyramid_bytes <= snapshot.pyramid_budget_bytes,
+                "常驻金字塔 {} B 超预算 {} B",
+                snapshot.pyramid_bytes,
+                snapshot.pyramid_budget_bytes
+            );
+        }
+        let (evictions, evicted_bytes, resident) = {
+            let state = inner.lock_state();
+            let actual: u64 = state
+                .pyramids
+                .values()
+                .map(|entry| entry.pyramid.bytes() as u64)
+                .sum();
+            assert_eq!(
+                state.pyramid_bytes, actual,
+                "pyramid_bytes 账本必须与常驻金字塔一致"
+            );
+            assert!(state.pyramid_evictions > 0, "必须真的发生过淘汰");
+            assert!(state.pyramid_evicted_bytes > 0);
+            (
+                state.pyramid_evictions,
+                state.pyramid_evicted_bytes,
+                state.pyramids.contains_key(&keys[0]),
+            )
+        };
+        // 第一个信号是最老的 LRU，必须被淘汰。
+        assert!(!resident, "最老的信号应被 LRU 淘汰：{keys:?}");
+        let info = inner.info_snapshot();
+        assert_eq!(info.pyramid_budget_bytes, PYRAMID_BUDGET_LIMIT);
+        assert!(
+            info.warnings.iter().any(|line| line.contains("LRU 已淘汰")),
+            "warnings 必须写清淘汰：{:?}",
+            info.warnings
+        );
+
+        // ③ 再次需要被淘汰的信号：按需重建 → view 与基准逐值相同。
+        {
+            let mut state = inner.lock_state();
+            state.active.retain(|key| key == &keys[0]);
+        }
+        let rebuilt_view = inner.compute_view(0.0, t_max, 400).expect("重建后 view");
+        let rebuilds = inner.lock_state().pyramid_rebuilds;
+        assert!(rebuilds > 0, "淘汰后必须按需重建");
+        assert!(!rebuilt_view.truncated, "重建后不得 truncated");
+        assert_eq!(rebuilt_view.t.len(), reference.t.len());
+        for (index, value) in rebuilt_view.t.iter().enumerate() {
+            assert_eq!(
+                value.to_bits(),
+                reference.t[index].to_bits(),
+                "t[{index}] 必须与未淘汰时一致"
+            );
+        }
+        assert_eq!(rebuilt_view.series.len(), reference.series.len());
+        for (after, before) in rebuilt_view.series.iter().zip(&reference.series) {
+            assert_eq!(after.key, before.key);
+            assert_eq!(after.min.len(), before.min.len());
+            for index in 0..before.min.len() {
+                assert_eq!(
+                    after.min[index].to_bits(),
+                    before.min[index].to_bits(),
+                    "{} min[{index}] 重建后必须逐值相同",
+                    before.key
+                );
+                assert_eq!(
+                    after.max[index].to_bits(),
+                    before.max[index].to_bits(),
+                    "{} max[{index}] 重建后必须逐值相同",
+                    before.key
+                );
+                assert_eq!(
+                    after.mean[index].to_bits(),
+                    before.mean[index].to_bits(),
+                    "{} mean[{index}] 重建后必须逐值相同",
+                    before.key
+                );
+            }
+        }
+        let final_info = inner.info_snapshot();
+        assert!(
+            final_info
+                .warnings
+                .iter()
+                .any(|line| line.contains("按需重建") && line.contains("次")),
+            "warnings 必须写清重建次数：{:?}",
+            final_info.warnings
+        );
+        println!(
+            "FIXB_B2 budget={PYRAMID_BUDGET_LIMIT}B single={single_bytes}B evictions={evictions} evicted_bytes={evicted_bytes} rebuilds={rebuilds} pyramid_bytes={}B",
+            final_info.pyramid_bytes
+        );
     }
 }

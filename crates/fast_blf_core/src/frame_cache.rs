@@ -65,6 +65,12 @@ pub const RECENT_USE_WINDOW_MILLIS: u64 = 10 * 60 * 1000;
 pub const CACHE_LOCK_TIMEOUT: &str = "CACHE_LOCK_TIMEOUT";
 /// 预取被 `close()` 中止（不算失败，调用方不得当告警上报）。
 pub const CACHE_ABORTED: &str = "CACHE_ABORTED";
+/// 段排序（时间戳回退时才走的外部排序）的单块内存预算：64 MiB。
+///
+/// 排序峰值内存 ≈ 该常量（一块 `RawRecord` ≈ 88 B）；帧数再多也只多花磁盘。
+pub const SORT_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+/// k 路归并的最大扇入：超出时先做多轮归并，避免瞬时打开上千个 fd。
+const SORT_MERGE_FANIN: usize = 64;
 
 /// 一个输入文件的稳定身份：绝对路径 + size + mtime（缓存 key 的组成部分）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1035,7 +1041,8 @@ fn build_segments(
         })?;
         drop(segment.writer);
         if segment.unsorted {
-            sort_segment(
+            // 分块外部排序：内存 ≈ SORT_CHUNK_BYTES，帧数上亿也不会在写盘中途 OOM。
+            let _chunks = sort_segment(
                 &dir.join(&segment.meta.file),
                 segment.meta.stride as usize,
                 segment.meta.frames,
@@ -1115,56 +1122,351 @@ struct RawRecord {
     body: [u8; FD_STRIDE],
 }
 
-fn sort_segment(path: &Path, stride: usize, frames: u64) -> Result<(), CoreError> {
-    if frames <= 1 {
-        return Ok(());
+/// 时间戳比较：NaN 视作「相等」（与旧实现 `partial_cmp().unwrap_or(Equal)` 一致），
+/// 排序稳定性由 `sort_by` / 归并的 `(chunk, seq)` 次序保证。
+fn timestamp_cmp(a: f64, b: f64) -> std::cmp::Ordering {
+    a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// 单块能装多少条记录（按 `size_of::<RawRecord>()` 折算，至少 1 条）。
+fn sort_chunk_capacity() -> usize {
+    (SORT_CHUNK_BYTES / std::mem::size_of::<RawRecord>()).max(1)
+}
+
+/// 同目录临时文件登记表：`Drop` 时**无条件**清理（成功/失败/提前返回都清）。
+struct TempFiles {
+    base: PathBuf,
+    next_id: u64,
+    files: Vec<PathBuf>,
+}
+
+impl TempFiles {
+    fn new(base: &Path) -> Self {
+        Self {
+            base: base.to_path_buf(),
+            next_id: 0,
+            files: Vec::new(),
+        }
     }
+
+    /// 生成并登记一个同目录临时文件（`<name>.<tag><id>.tmp`，便于随后 rename）。
+    fn alloc(&mut self, tag: &str) -> PathBuf {
+        let name = self
+            .base
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "segment".to_string());
+        let path = self
+            .base
+            .with_file_name(format!("{name}.{tag}{}.tmp", self.next_id));
+        self.next_id = self.next_id.saturating_add(1);
+        self.files.push(path.clone());
+        path
+    }
+
+    /// 登记一个指定的临时路径（例如最终写出的 `<name>.tmp`）。
+    fn track(&mut self, path: PathBuf) -> PathBuf {
+        self.files.push(path.clone());
+        path
+    }
+
+    /// 从清理清单摘掉（即将 rename 成正式文件）。
+    fn forget(&mut self, path: &Path) {
+        self.files.retain(|candidate| candidate != path);
+    }
+}
+
+impl Drop for TempFiles {
+    fn drop(&mut self) {
+        for path in &self.files {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// 读一条记录（`stride` 字节）并解析时间戳。
+fn read_raw_record(
+    reader: &mut impl Read,
+    stride: usize,
+    path: &Path,
+) -> Result<RawRecord, CoreError> {
+    let mut body = [0u8; FD_STRIDE];
+    let Some(buf) = body.get_mut(..stride) else {
+        return Err(CoreError::blf_parse("帧缓存 stride 非法"));
+    };
+    reader.read_exact(buf).map_err(|err| {
+        CoreError::blf_parse(format!("读取帧缓存失败：{}（{err}）", path.display()))
+    })?;
+    let mut ts = [0u8; 8];
+    if let Some(head) = buf.get(..8) {
+        ts.copy_from_slice(head);
+    }
+    Ok(RawRecord {
+        timestamp: f64::from_le_bytes(ts),
+        body,
+    })
+}
+
+/// 把一批已排序记录写进临时文件（保持 17/73 字节既有布局）。
+fn write_raw_records(path: &Path, records: &[RawRecord], stride: usize) -> Result<(), CoreError> {
+    let handle = File::create(path).map_err(|err| {
+        CoreError::new(
+            DISK_FULL,
+            format!("创建排序临时文件失败：{}（{err}）", path.display()),
+        )
+    })?;
+    let mut writer = BufWriter::new(handle);
+    for record in records {
+        let Some(buf) = record.body.get(..stride) else {
+            return Err(CoreError::blf_parse("帧缓存 stride 非法"));
+        };
+        writer.write_all(buf).map_err(|err| {
+            CoreError::new(
+                DISK_FULL,
+                format!("写入排序临时文件失败：{}（{err}）", path.display()),
+            )
+        })?;
+    }
+    writer.flush().map_err(|err| {
+        CoreError::new(
+            DISK_FULL,
+            format!("刷新排序临时文件失败：{}（{err}）", path.display()),
+        )
+    })?;
+    Ok(())
+}
+
+/// 归并堆元素：按 `(timestamp, chunk, seq)` **升序**弹出（`BinaryHeap` 是最大堆，比较取反）。
+///
+/// `(chunk, seq)` 保证时间戳相等时也保持「块内原始顺序、块间原始顺序」——
+/// 与单块稳定排序的结果逐字节一致。
+struct MergeItem {
+    timestamp: f64,
+    chunk: usize,
+    seq: u64,
+    record: RawRecord,
+}
+
+impl PartialEq for MergeItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for MergeItem {}
+
+impl PartialOrd for MergeItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MergeItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match timestamp_cmp(other.timestamp, self.timestamp) {
+            std::cmp::Ordering::Equal => (other.chunk, other.seq).cmp(&(self.chunk, self.seq)),
+            order => order,
+        }
+    }
+}
+
+/// k 路归并：并发打开 `chunks.len()` 个已排序临时块，按时间升序写进 `out`。
+/// 返回写出的记录条数（调用方必须核对它等于 `frames`）。
+fn merge_chunks<W: Write>(
+    chunks: &[(PathBuf, u64)],
+    out: &mut W,
+    stride: usize,
+) -> Result<u64, CoreError> {
+    struct Cursor {
+        reader: BufReader<File>,
+        path: PathBuf,
+        remaining: u64,
+    }
+
+    let mut cursors: Vec<Cursor> = Vec::with_capacity(chunks.len());
+    for (path, count) in chunks {
+        let file = File::open(path).map_err(|err| {
+            CoreError::blf_parse(format!(
+                "打开排序临时文件失败：{}（{err}）",
+                path.display()
+            ))
+        })?;
+        cursors.push(Cursor {
+            reader: BufReader::new(file),
+            path: path.clone(),
+            remaining: *count,
+        });
+    }
+
+    let mut heap: std::collections::BinaryHeap<MergeItem> =
+        std::collections::BinaryHeap::with_capacity(cursors.len().saturating_add(1));
+    for (index, cursor) in cursors.iter_mut().enumerate() {
+        if cursor.remaining == 0 {
+            continue;
+        }
+        let record = read_raw_record(&mut cursor.reader, stride, &cursor.path)?;
+        cursor.remaining = cursor.remaining.saturating_sub(1);
+        heap.push(MergeItem {
+            timestamp: record.timestamp,
+            chunk: index,
+            seq: 0,
+            record,
+        });
+    }
+
+    let mut written: u64 = 0;
+    while let Some(item) = heap.pop() {
+        let Some(buf) = item.record.body.get(..stride) else {
+            return Err(CoreError::blf_parse("帧缓存 stride 非法"));
+        };
+        out.write_all(buf)
+            .map_err(|err| CoreError::new(DISK_FULL, format!("写入排序结果失败：{err}")))?;
+        written = written.saturating_add(1);
+        let Some(cursor) = cursors.get_mut(item.chunk) else {
+            continue;
+        };
+        if cursor.remaining == 0 {
+            continue;
+        }
+        let record = read_raw_record(&mut cursor.reader, stride, &cursor.path)?;
+        cursor.remaining = cursor.remaining.saturating_sub(1);
+        heap.push(MergeItem {
+            timestamp: record.timestamp,
+            chunk: item.chunk,
+            seq: item.seq.saturating_add(1),
+            record,
+        });
+    }
+    Ok(written)
+}
+
+/// 分块外部排序一个时间戳回退的段文件，返回实际使用的**块数**（>1 即真的分了块）。
+///
+/// 契约：
+/// * 内存上限 ≈ [`SORT_CHUNK_BYTES`]（每块 `RawRecord` ≈ 88 B），帧数上亿也不会 OOM；
+/// * 临时文件（`<name>.sortN.tmp` / 多轮归并块 / 最终 `<name>.tmp`）全在同目录，
+///   由 [`TempFiles`] 在 `Drop` 里清理 —— **成功、失败、提前返回都清**；
+/// * 只在最后一步 `rename(<name>.tmp, <name>)`：任何异常路径下原段文件都保持
+///   「排序前的完整内容」，绝不会出现写了一半或排了一半的段；
+/// * 写出记录数必须等于 `frames`，否则报错（meta 的 `frames`/时间范围不会被写坏）。
+pub fn sort_segment(path: &Path, stride: usize, frames: u64) -> Result<u64, CoreError> {
+    if stride != CLASSIC_STRIDE && stride != FD_STRIDE {
+        return Err(CoreError::blf_parse("帧缓存 stride 非法"));
+    }
+    if frames <= 1 {
+        return Ok(0);
+    }
+
+    let mut temps = TempFiles::new(path);
+    let capacity = sort_chunk_capacity();
     let mut reader = BufReader::new(File::open(path).map_err(|err| {
         CoreError::new(
             DISK_FULL,
             format!("重新打开帧缓存失败：{}（{err}）", path.display()),
         )
     })?);
-    let mut records: Vec<RawRecord> = Vec::with_capacity(frames.min(usize::MAX as u64) as usize);
-    for _ in 0..frames {
-        let mut body = [0u8; FD_STRIDE];
-        let Some(buf) = body.get_mut(..stride) else {
-            return Err(CoreError::blf_parse("帧缓存 stride 非法"));
-        };
-        reader.read_exact(buf).map_err(|err| {
-            CoreError::blf_parse(format!("读取帧缓存失败：{}（{err}）", path.display()))
-        })?;
-        let mut ts = [0u8; 8];
-        if let Some(head) = buf.get(..8) {
-            ts.copy_from_slice(head);
+
+    let mut chunks: Vec<(PathBuf, u64)> = Vec::new();
+    let mut chunk_count: u64 = 0;
+    let mut remaining = frames;
+    while remaining > 0 {
+        let want = remaining.min(capacity as u64);
+        let mut records: Vec<RawRecord> = Vec::with_capacity(want.min(usize::MAX as u64) as usize);
+        for _ in 0..want {
+            records.push(read_raw_record(&mut reader, stride, path)?);
         }
-        records.push(RawRecord {
-            timestamp: f64::from_le_bytes(ts),
-            body,
-        });
+        remaining -= want;
+        records.sort_by(|a, b| timestamp_cmp(a.timestamp, b.timestamp));
+        let chunk = temps.alloc("sort");
+        write_raw_records(&chunk, &records, stride)?;
+        drop(records);
+        chunk_count = chunk_count.saturating_add(1);
+        chunks.push((chunk, want));
     }
-    records.sort_by(|a, b| {
-        a.timestamp
-            .partial_cmp(&b.timestamp)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut writer = BufWriter::new(File::create(path).map_err(|err| {
-        CoreError::new(
-            DISK_FULL,
-            format!("重写帧缓存失败：{}（{err}）", path.display()),
-        )
-    })?);
-    for record in records {
-        let Some(buf) = record.body.get(..stride) else {
-            return Err(CoreError::blf_parse("帧缓存 stride 非法"));
+    drop(reader);
+
+    // 扇入有界：块数超过上限时先多轮归并（每轮合并 SORT_MERGE_FANIN 块）。
+    while chunks.len() > SORT_MERGE_FANIN {
+        let mut next: Vec<(PathBuf, u64)> = Vec::new();
+        for batch in chunks.chunks(SORT_MERGE_FANIN) {
+            let merged = temps.alloc("merge");
+            let written = {
+                let mut writer = BufWriter::new(File::create(&merged).map_err(|err| {
+                    CoreError::new(
+                        DISK_FULL,
+                        format!("创建排序临时文件失败：{}（{err}）", merged.display()),
+                    )
+                })?);
+                let written = merge_chunks(batch, &mut writer, stride)?;
+                writer.flush().map_err(|err| {
+                    CoreError::new(
+                        DISK_FULL,
+                        format!("刷新排序临时文件失败：{}（{err}）", merged.display()),
+                    )
+                })?;
+                written
+            };
+            next.push((merged, written));
+        }
+        chunks = next;
+    }
+
+    if chunks.len() == 1 {
+        // 只有一块：排好序的临时块本身就是结果，直接改名，省一次全量拷贝。
+        let Some((chunk, written)) = chunks.pop() else {
+            return Err(CoreError::blf_parse("排序分块丢失"));
         };
-        writer
-            .write_all(buf)
-            .map_err(|err| CoreError::new(DISK_FULL, format!("重写帧缓存失败：{err}")))?;
+        if written != frames {
+            return Err(CoreError::blf_parse(format!(
+                "排序记录数不一致：{written} != {frames}（{}）",
+                path.display()
+            )));
+        }
+        temps.forget(&chunk);
+        return finish_sorted_segment(&chunk, path, &mut temps).map(|()| chunk_count);
     }
-    writer
-        .flush()
-        .map_err(|err| CoreError::new(DISK_FULL, format!("刷新帧缓存失败：{err}")))?;
+
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "segment".to_string());
+    let output = temps.track(path.with_file_name(format!("{name}.tmp")));
+    let written = {
+        let mut writer = BufWriter::new(File::create(&output).map_err(|err| {
+            CoreError::new(
+                DISK_FULL,
+                format!("创建排序结果失败：{}（{err}）", output.display()),
+            )
+        })?);
+        let written = merge_chunks(&chunks, &mut writer, stride)?;
+        writer.flush().map_err(|err| {
+            CoreError::new(
+                DISK_FULL,
+                format!("刷新排序结果失败：{}（{err}）", output.display()),
+            )
+        })?;
+        written
+    };
+    if written != frames {
+        return Err(CoreError::blf_parse(format!(
+            "排序记录数不一致：{written} != {frames}（{}）",
+            path.display()
+        )));
+    }
+    temps.forget(&output);
+    finish_sorted_segment(&output, path, &mut temps).map(|()| chunk_count)
+}
+
+/// 把已排好序的 `source` 原子替换成段文件 `path`（失败时清理临时文件、保留原段）。
+fn finish_sorted_segment(source: &Path, path: &Path, temps: &mut TempFiles) -> Result<(), CoreError> {
+    if let Err(err) = std::fs::rename(source, path) {
+        let _ = std::fs::remove_file(source);
+        temps.forget(source);
+        return Err(CoreError::new(
+            DISK_FULL,
+            format!("替换帧缓存失败：{}（{err}）", path.display()),
+        ));
+    }
     Ok(())
 }
 
