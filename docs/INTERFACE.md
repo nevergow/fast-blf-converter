@@ -194,8 +194,14 @@ sess = fast_blf_core.open_plot_session(config, progress_cb=None)   # -> PlotSess
 
 ### 缓存规则（决定 UX 成败）
 
-* 缓存**只存用户所选报文**的帧（`selected` 里出现的 `(channel, message)`）；编码：经典 CAN 24 B/帧、
-  CAN FD 80 B/帧（t f64 + channel u8 + id u32 + dlc u8 + payload）。
+* 缓存**只存用户所选报文**的帧（`selected` 里出现的 `(channel, message)`）。
+* 磁盘布局：`<cache_dir>/<key>/meta.json` + **一个报文一个数据文件** `ch{ch}_id{id}.bin`
+  （`channel`/`id` 记在文件名与 `meta.json` 里，**不在每帧里重复存**）：
+  * 经典 CAN 记录 stride = **17 字节** = `t f64(8) + dlc u8(1) + payload[8]`
+  * CAN FD  记录 stride = **73 字节** = `t f64(8) + dlc u8(1) + payload[64]`
+  * stride 由该报文首帧的 `is_fd` 决定；固定 stride 是二分查找与 `read_at` 随机访问的前提
+* 随机读取**不用 mmap、不加依赖**：`std::os::unix::fs::FileExt::read_at` /
+  `std::os::windows::fs::FileExt::seek_read`（OS page cache 已足够快）。
 * 缓存键 = `blf_paths`（绝对路径 + size + mtime）+ DBC 内容哈希 + **报文集合** + 内核版本；
   命中即**秒开**（必须实现，不得每次重建）。
 * **预算控制**：估算体积 > `cache_budget_mb` 时**不得静默退化**——必须返回 `CACHE_BUDGET_EXCEEDED`，
