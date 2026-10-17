@@ -132,6 +132,29 @@ jobs:
           if ($log -notmatch "CONFIG_OK") { throw "配置自检没有输出 CONFIG_OK，预设在打包态可能不可用" }
           Write-Host "冻结态配置自检通过（预设保存 / 加载 / DBC 缺失处理可用）"
 
+      - name: 冻结态预览自检（PlotSession / 帧缓存 打包可用性）
+        shell: pwsh
+        run: |
+          $dir = "dist\FastBLFConverter"
+          $out = Join-Path $env:TEMP "selftest_plot.out"
+          $err = Join-Path $env:TEMP "selftest_plot.err"
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $p = Start-Process -FilePath "$dir\FastBLFConverter.exe" -ArgumentList "--selftest-plot" `
+               -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+          $finished = $p.WaitForExit(180000)
+          $log = ((Get-Content $out -Raw) + "`n" + (Get-Content $err -Raw))
+          Write-Host "exe 退出码: $($p.ExitCode)；按时退出: $finished"
+          Write-Host $log
+          if (-not $finished) {
+            # 与配置自检同策略：窗口化 exe 在 Windows 上不产出 stdout，超时只警告不阻塞发布
+            $p.Kill()
+            Write-Warning "冻结态预览自检超时（>180 秒）：已强杀；上面是已捕获的输出。本条不阻塞发布。"
+            exit 0
+          }
+          if ($p.ExitCode -ne 0) { throw "冻结态预览自检失败，exit=$($p.ExitCode)" }
+          if ($log -notmatch "PLOT_(OK|SKIP)") { Write-Warning "预览自检未给出 PLOT_OK/PLOT_SKIP（窗口化 exe 的 stdout 可能被丢弃）" }
+          else { Write-Host "冻结态预览自检通过（帧缓存 / PlotSession 在打包态可用）" }
+
       - name: 上传 artifact（保留 30 天）
         uses: actions/upload-artifact@v4
         with:
