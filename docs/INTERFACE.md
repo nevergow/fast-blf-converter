@@ -173,6 +173,51 @@ config 字段（在 `convert` 的 config 之上）：
 }
 ```
 
+## 1.4 `PlotSession`（v0.4.0：预览的唯一数据通道，替代逐次调 `series_for_plot`）
+
+```python
+sess = fast_blf_core.open_plot_session(config, progress_cb=None)   # -> PlotSession
+```
+
+**为什么需要会话对象**：BLF **没有随机访问索引**，每次"看某段时间窗"都重扫文件是不可接受的
+（1.2 GB 批次 ≈ 30 s/次）。会话对象在 `open` 时**一次性把帧缓存落到磁盘**，之后所有操作都走缓存。
+
+### config 字段
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `blf_paths` / `dbc_by_channel` / `selected` | 同 `convert` | 参与解码的文件与信号 |
+| `time_format` | `str` | 初始时间口径（后续可用 `set_time_format` 零成本切换） |
+| `temp_dir` | `str` | 临时目录（缓存默认放这里） |
+| `cache_dir` | `str \| None` | 帧缓存目录，默认 `<temp_dir>/fblf_frames` |
+| `cache_budget_mb` | `int` | 缓存磁盘上限（MiB），**默认 200**，允许 `32..8192`；越界报 `CONFIG_INVALID` |
+
+### 缓存规则（决定 UX 成败）
+
+* 缓存**只存用户所选报文**的帧（`selected` 里出现的 `(channel, message)`）；编码：经典 CAN 24 B/帧、
+  CAN FD 80 B/帧（t f64 + channel u8 + id u32 + dlc u8 + payload）。
+* 缓存键 = `blf_paths`（绝对路径 + size + mtime）+ DBC 内容哈希 + **报文集合** + 内核版本；
+  命中即**秒开**（必须实现，不得每次重建）。
+* **预算控制**：估算体积 > `cache_budget_mb` 时**不得静默退化**——必须返回 `CACHE_BUDGET_EXCEEDED`，
+  且错误消息给出：需要多少 MiB、上限多少、三个可选动作（提高上限 / 减少所选报文 / 不建缓存继续但较慢）。
+* 未被缓存的报文：`add_signals` 时进入**后台增量预取**（有进度、不冻结界面、可继续看已有信号）。
+
+### 方法
+
+| 方法 | 返回 | 说明 |
+|---|---|---|
+| `info()` | `{t_min, t_max, t_min_str, t_max_str, files, cache_bytes, cache_hit, signals:[{channel,message,signal,unit,cached}]}` | 打开后立刻可用 |
+| `set_time_format(fmt)` | `None` | **纯显示层**，零解码、零 I/O（≤16 ms） |
+| `add_signals(items)` | `{added:int, pending:int}` | 已缓存的立即生效；未缓存的转后台预取 |
+| `remove_signals(items)` | `{removed:int}` | 只影响绘制与统计 |
+| `prefetch_status()` | `{busy, done, total, message}` | 供界面显示 |
+| `view(t0, t1, width_px)` | `{t:[float], series:[{key, min:[], max:[], mean:[]}], truncated:bool}` | **只返回该窗口**的 min/max 包络，每信号点数 ≤ `2*width_px`，桶数由 `width_px` 决定 |
+| `stats(keys)` | `[{key, count, vmin, vmax, mean, first, last}]` | 全量原始数据口径 |
+| `export_html(path, title)` | `{ok, bytes}` | 复用缓存，秒级；单文件离线可开 |
+| `close()` | `None` | 释放句柄；缓存文件保留供下次复用（受预算 LRU 管理） |
+
+`key` = `"ch{channel}/{message}/{signal}"` 字符串，全链路唯一标识。
+
 ## 2. 进度回调协议（唯一线程接口）
 
 `progress_cb` 由 **Rust 工作线程**调用（**并行解码期间就必须持续调用**，不能等收集阶段才批量发），参数是单个 dict：
@@ -283,6 +328,17 @@ pub struct CoreError { pub code: String, pub message: String, pub detail: Option
     （**优先自绘**：min/max 包络与量纲分轴都需要精确控制，且零打包风险）。
     HTML 报告允许内嵌**已由 Hermes 主会话审阅并 vendor 进仓库的前端库**（必须有 license 说明、
     记录在 `docs/DEPS.md`、且构建期不联网）；任何 Python/二进制依赖的新增都必须先经批准。
+
+17. **预览必须走 `PlotSession`（§1.4）**，不得在 GUI 里逐个窗口调用 `series_for_plot`；
+    `series_for_plot` 保留给"一次性导出 HTML/脚本用途"，其内部实现也必须复用帧缓存。
+18. **交互延迟是硬指标（写成可测验收线）**：
+    * 缓存命中打开预览 ≤ **300 ms**；首次建缓存必须有**确定进度**（禁止乒乓动画）；
+    * 加/减**已缓存**信号 ≤ **100 ms**；切换时间口径 ≤ **16 ms**；缩放/平移时单帧 paint ≤ **30 ms**；
+    * 缩放/平移/拖拽期间**不得**重新解码、不得分配百万级数组、不得读 BLF。
+19. **预览必须提供三种显示模式**（可切换并被预设记住）：`车道（每信号一行，共享时间轴）` /
+    `多 Y 轴叠加` / `单 Y 轴`。每信号可改**颜色**、**线型**（折线/阶梯/散点）、可见性；这些设置进预设。
+20. **信号选择用单个三态复选框**（全选 / 部分 / 全不选），**禁止**三个按钮、**禁止**"反选"按钮。
+    该复选框与列表双向联动（勾列表项→变部分/全选；点复选框→全选或全不选）。
 
 ## 6. 验收标准（由 Hermes 主会话执行，DSH 交付后必须自查一遍）
 
