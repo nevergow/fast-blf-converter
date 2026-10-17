@@ -171,7 +171,7 @@ gui/main.py (PySide6, 暗色 Fluent)  ──QThread──►  fast_blf_core (Rus
 
 | 验证项 | 结果 |
 |---|---|
-| 单元 + 集成测试 | **112 项全绿**（53 单元 + 59 集成 `tests/e2e_synthetic.rs`，另 1 项 ignored 为性能基准） |
+| 单元 + 集成测试 | **140 项全绿**（**60 单元 + 80 集成** `tests/e2e_synthetic.rs`，另 4 项 ignored 为性能/重型基准） |
 | 画图数据接口 | 187MB/408 万帧 → **0.96s**（release）、返回点数 **压缩到 1.02%**；逐桶 min/max/mean 与**独立复算**零不符；包络极值覆盖全量极值（不丢峰）；`absolute` 口径命中 `2025-10-16 14:10:00.123456` 定值 |
 | HTML 报告自包含性 | 真实浏览器打开验证：canvas 绘制像素 126KB、7 信号统计表齐全、**零外部 script/link 引用、零 fetch/XHR/Image 调用**、1.24MB < 8MB |
 | 预览控件（离屏实测） | 1100×560 渲染、224 种颜色、调色板曲线像素 3664 个（不是空白图）；AST 级检查确认**渲染路径不 import/不调用内核**、无新增依赖 |
@@ -179,10 +179,12 @@ gui/main.py (PySide6, 暗色 Fluent)  ──QThread──►  fast_blf_core (Rus
 | 进度行为 | 解析进度**单调不减、终值 100%**；8 切片实测阶梯 `12/25/37/50/62/75/87/100`；单文件 187MB 时"已扫帧数"连续跳动 29 次 |
 | 端到端验收 `tests/acceptance.py` | **55/55 通过**（A4 三格式/无空值、A5 百万行防呆、**A6 坏 DBC 容错**、**A6' 空 BLF 扫描**、**A7 时间口径 4 选 1 精确比对**、**A9 宽表同名信号**） |
 | DBC 解析矩阵 | **24/25 种真实写法可解析**（空 `NS_` 段 / `SG_MUL_VAL_` / `SIG_VALTYPE_` / `EV_` / 扩展帧 / CRLF / ENUM 越界…）；唯一失败用例是文件本身引号不规范，按预期给出精确行号 |
-| GUI 无人值守自检 | **8 条全过**：`--selftest` / `--selftest-parse`（`PARSE_OK` 进度单调→100 + Ch1~Ch8 不消失）/ `--selftest-deep`（`DEEP_OK channels=8`）/ `--selftest-config`（`CONFIG_OK`）/ `--selftest-progress`（`PROGRESS_OK`）/ `--selftest-fill`（`FILL_OK hold_distinct=52 linear_distinct=60 gapped_nulls=45 none_nulls=496`）/ **`--selftest-plot`**（`PLOT_OK` 预览离屏渲染 + 报告自包含性门禁）/ `--dump-check-states`（`DUMP_OK`） |
+| GUI 无人值守自检 | **9 条全过**：`--selftest` / `--selftest-parse`（`PARSE_OK` 进度单调→100 + Ch1~Ch8 不消失）/ `--selftest-deep`（`DEEP_OK channels=8`）/ `--selftest-config`（`CONFIG_OK`）/ `--selftest-progress`（`PROGRESS_OK`）/ **`--selftest-progress-monotonic`**（`MONO_OK phase1_max=70 phase2_start=70 final=100`）/ `--selftest-fill`（`FILL_OK hold_distinct=52 linear_distinct=60 gapped_nulls=45 none_nulls=496`）/ **`--selftest-plot`**（`PLOT_OK` 预览离屏渲染 + 报告自包含性门禁）/ `--dump-check-states`（`DUMP_OK`） |
 | GUI 交互路径独立探针 | **11/11**：通道级绑 DBC → 解析 → 报文名从 `ID_0x123` 变真名 → 取消勾选 → **重解析后勾选被恢复** → 全部清除 |
-| 冻结态（PyInstaller onedir，本机实跑） | `--selftest` 内核就绪 0.2.0 / `--selftest-config` **`CONFIG_OK`（预设保存·加载·DBC 缺失处理在打包后可用）** / `--selftest-deep` `DEEP_SKIP no_fixture` / `--dump-check-states` `DUMP_OK` 23079B；`theme.qss` 落在 `_internal/gui/theme.qss` |
+| 冻结态（PyInstaller onedir，本机实跑） | `--selftest` 内核就绪 0.4.0 / `--selftest-config` **`CONFIG_OK`（预设保存·加载·DBC 缺失处理在打包后可用）** / `--selftest-deep` `DEEP_SKIP no_fixture` / `--dump-check-states` `DUMP_OK` 23079B；`theme.qss` 落在 `_internal/gui/theme.qss` |
 | 位序正确性 | Intel/Motorola 与 `cantools` **1440 组随机对拍 0 不一致**（见 `docs/DEPS.md` §7） |
+| **交互延迟（v0.4.0，release，187 MB）** | 建缓存 878 ms / **缓存命中开预览 68 ms** / `view` p95 **14.9 ms** / **缩放·拖动 p95 3.1 ms** / 切口径 **0.0 ms** / 加 6 条信号 24.6 ms / 8 条信号渲染 1.7 ms |
+| **独立探针（主会话手写，不采信执行者自述）** | Step17 12 项（缓存帧数=scan、stats=CSV、包络不丢峰、预算拒绝）/ 17b 4 项（G3 换选择后命中 0.5 ms、单缓存目录）/ 17c+18 25 项（绝对时间定值、HTML 有点、三模式、`view_calls 2→2`、三态复选框、颜色线型持久化）/ 19 9 项（6 字段、schema1 兼容、进度 [0,70,70,100]） |
 | 时间口径正确性 | 4 种口径与**独立算出的定值**逐字符相等（`docs/DEPS.md` §8）：`0/0.01/1`、`0/10/1000`、`1760623800.123456…`、`2025-10-16 14:10:00.123456…` |
 | 互操作（别的实现写的文件） | `python-can 4.6.1` 写的 **187 MB / 4,082,000 帧** BLF（含扩展帧 + CAN FD）：我们的 scan 逐通道帧数与写入方**完全一致** |
 | 性能（单文件 187MB） | scan 32.7 MB/s（5.7s / 408 万帧，单文件=单线程） |
