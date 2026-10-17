@@ -807,3 +807,121 @@ QListWidget#plotLegend::item:hover {
 QListWidget#plotLegend::item:selected {
     background-color: #33475B;
 }
+
+/* --------------------------------------- 画图预览窗（Step 18 重写） -------- */
+/* 顶栏：常驻显示时间口径 / 显示模式 / 窗口 / 全量 / 可见 / 缓存。 */
+QFrame#plotTopBar {
+    background-color: #25252E;
+    border: 1px solid #3A3A46;
+    border-radius: 6px;
+}
+
+QLabel#plotWindowLabel,
+QLabel#plotFullLabel,
+QLabel#plotVisibleLabel,
+QLabel#plotCacheLabel {
+    color: #C8C8D8;
+    background-color: #2D2D38;
+    border: 1px solid #3A3A46;
+    border-radius: 4px;
+    padding: 3px 8px;
+}
+
+QLabel#plotWarn {
+    color: #F05A5A;
+    background-color: #3A2226;
+    border: 1px solid #E5534B;
+    border-radius: 4px;
+    padding: 5px 9px;
+}
+
+QLabel#plotLoading {
+    color: #F0A020;
+    background-color: #33291A;
+    border: 1px solid #7A5A20;
+    border-radius: 4px;
+    padding: 5px 9px;
+}
+
+/* F1：缓存超额内联横幅（红色，不是模态弹窗）。 */
+QFrame#plotBanner {
+    background-color: #3A2226;
+    border: 1px solid #E5534B;
+    border-radius: 6px;
+}
+
+QLabel#plotBannerText {
+    color: #FF8A80;
+    background: transparent;
+}
+
+QPushButton#plotBannerButton {
+    background-color: #4A2A2E;
+    color: #FFD7D2;
+    border: 1px solid #B0443C;
+    border-radius: 5px;
+    padding: 6px 12px;
+    min-width: 0;
+}
+
+QPushButton#plotBannerButton:hover {
+    background-color: #5A3036;
+    border-color: #E5534B;
+}
+
+/* 右侧信号面板：一个三态全选框 + 过滤框 + 每行色块。 */
+QWidget#signalPanel {
+    background-color: #25252E;
+    border: 1px solid #3A3A46;
+    border-radius: 6px;
+}
+
+QCheckBox#plotSelectAll {
+    color: #E8E8F0;
+    font-weight: 600;
+    padding: 3px 2px;
+}
+
+QLineEdit#plotFilter {
+    background-color: #2D2D38;
+    border: 1px solid #3A3A46;
+    border-radius: 5px;
+    padding: 5px 8px;
+    color: #E8E8F0;
+}
+
+QListWidget#plotSignals {
+    background-color: #22222A;
+    alternate-background-color: #262630;
+    border: 1px solid #3A3A46;
+    border-radius: 5px;
+    color: #E8E8F0;
+    outline: none;
+}
+
+QListWidget#plotSignals::item {
+    padding: 1px 2px;
+}
+
+QListWidget#plotSignals::item:hover {
+    background-color: #35353F;
+}
+
+QListWidget#plotSignals::item:selected {
+    background-color: #33475B;
+}
+
+QWidget#signalRow {
+    background: transparent;
+}
+
+QLabel#signalName {
+    background: transparent;
+    color: #E8E8F0;
+}
+
+QScrollArea#plotScroll {
+    background-color: #1E1E24;
+    border: 1px solid #3A3A46;
+    border-radius: 6px;
+}

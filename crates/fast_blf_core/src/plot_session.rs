@@ -204,11 +204,15 @@ impl SessionInner {
 
     fn compute_view(&self, t0: f64, t1: f64, width_px: usize) -> Result<ViewData, CoreError> {
         let state = self.lock_state();
+        let time_info = TimeInfo::from_meta(&state.meta, state.time_format);
         if state.closed || width_px == 0 {
             return Ok(ViewData {
                 t: Vec::new(),
                 series: Vec::new(),
                 truncated: width_px == 0,
+                t_min_str: time_info.t_min_str,
+                t_max_str: time_info.t_max_str,
+                t_axis: time_info.t_axis,
             });
         }
         let (t0, t1) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
@@ -217,6 +221,9 @@ impl SessionInner {
                 t: Vec::new(),
                 series: Vec::new(),
                 truncated: true,
+                t_min_str: time_info.t_min_str,
+                t_max_str: time_info.t_max_str,
+                t_axis: time_info.t_axis,
             });
         }
         // 上限保护：GUI 实际只用 ≤2000，但接口允许调用方传更大值。
@@ -364,6 +371,9 @@ impl SessionInner {
             t: out_t,
             series: out_series,
             truncated,
+            t_min_str: time_info.t_min_str,
+            t_max_str: time_info.t_max_str,
+            t_axis: time_info.t_axis,
         })
     }
 
@@ -615,34 +625,12 @@ impl PlotSession {
     pub fn info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let state = self.inner.lock_state();
         let out = PyDict::new(py);
-        let raw_min = if state.meta.t_min.is_finite() {
-            state.meta.t_min
-        } else {
-            0.0
-        };
-        let raw_max = if state.meta.t_max.is_finite() {
-            state.meta.t_max
-        } else {
-            0.0
-        };
-        let (t_min, t_max) = match state.time_format {
-            TimeFormat::UnixS => (raw_min, raw_max),
-            TimeFormat::RelativeS | TimeFormat::RelativeMs | TimeFormat::Absolute => {
-                (0.0, raw_max - raw_min)
-            }
-        };
-        out.set_item("t_min", t_min)?;
-        out.set_item("t_max", t_max)?;
-        let (t_min_str, t_max_str) = if state.time_format == TimeFormat::Absolute {
-            (
-                state.meta.abs_min_micros.map(format_wall_clock_micros),
-                state.meta.abs_max_micros.map(format_wall_clock_micros),
-            )
-        } else {
-            (None, None)
-        };
-        out.set_item("t_min_str", t_min_str)?;
-        out.set_item("t_max_str", t_max_str)?;
+        let time_info = TimeInfo::from_meta(&state.meta, state.time_format);
+        out.set_item("t_min", time_info.t_min)?;
+        out.set_item("t_max", time_info.t_max)?;
+        out.set_item("t_min_str", time_info.t_min_str.as_deref())?;
+        out.set_item("t_max_str", time_info.t_max_str.as_deref())?;
+        out.set_item("t_axis", axis_to_pylist(py, &time_info.t_axis)?)?;
         out.set_item(
             "files",
             state
@@ -765,6 +753,9 @@ impl PlotSession {
         }
         out.set_item("series", series)?;
         out.set_item("truncated", view.truncated)?;
+        out.set_item("t_min_str", view.t_min_str.as_deref())?;
+        out.set_item("t_max_str", view.t_max_str.as_deref())?;
+        out.set_item("t_axis", axis_to_pylist(py, &view.t_axis)?)?;
         Ok(out)
     }
 
@@ -827,11 +818,149 @@ fn to_raw_seconds(t: f64, raw_min: f64, format: TimeFormat) -> f64 {
     }
 }
 
+/// `absolute` 口径下的一个时间刻度（与 `series_for_plot` 的 `t_axis` 同形）。
+#[derive(Debug, Clone)]
+struct AxisTick {
+    /// 相对秒（`absolute` 口径下 0 = 全局最早时间戳）。
+    t: f64,
+    /// 该时刻的绝对墙钟字符串。
+    label: String,
+}
+
+/// `info()` / `view()` / HTML 报告共用的时间轴视图。
+///
+/// 非 `absolute` 口径只填 `t_min` / `t_max`；`absolute` 口径额外给出墙钟端点与刻度，
+/// 保证三个出口（info / view / HTML）永远是同一套口径。
+#[derive(Debug, Clone)]
+struct TimeInfo {
+    t_min: f64,
+    t_max: f64,
+    t_min_str: Option<String>,
+    t_max_str: Option<String>,
+    t_axis: Vec<AxisTick>,
+}
+
+impl TimeInfo {
+    fn from_meta(meta: &CacheMeta, format: TimeFormat) -> Self {
+        let raw_min = if meta.t_min.is_finite() {
+            meta.t_min
+        } else {
+            0.0
+        };
+        let raw_max = if meta.t_max.is_finite() {
+            meta.t_max
+        } else {
+            raw_min
+        };
+        let (t_min, t_max) = match format {
+            TimeFormat::UnixS => (raw_min, raw_max),
+            TimeFormat::RelativeS | TimeFormat::RelativeMs | TimeFormat::Absolute => {
+                (0.0, raw_max - raw_min)
+            }
+        };
+        if format != TimeFormat::Absolute {
+            return Self {
+                t_min,
+                t_max,
+                t_min_str: None,
+                t_max_str: None,
+                t_axis: Vec::new(),
+            };
+        }
+
+        // 优先用缓存扫描时按 `exporter::TimeTransform` 同一公式算出的头部墙钟
+        // （`wall_us + round((raw - header_epoch) * 1e6)`）。只有文件头墙钟缺失
+        // （例如历史夹具/损坏头）时才退回原始 epoch 微秒，仍保持“绝对时间可显示”，
+        // 不改变无墙钟时 `unix_s` 的既有语义。
+        let Some((abs_min, abs_max)) = absolute_micros_bounds(meta) else {
+            return Self {
+                t_min,
+                t_max,
+                t_min_str: None,
+                t_max_str: None,
+                t_axis: Vec::new(),
+            };
+        };
+        Self {
+            t_min,
+            t_max,
+            t_min_str: Some(format_wall_clock_micros(abs_min)),
+            t_max_str: Some(format_wall_clock_micros(abs_max)),
+            t_axis: build_time_axis(t_min, t_max, abs_min, abs_max),
+        }
+    }
+}
+
+fn finite_micros(seconds: f64) -> Option<i64> {
+    if seconds.is_finite() {
+        Some((seconds * 1_000_000.0).round() as i64)
+    } else {
+        None
+    }
+}
+
+/// `absolute` 的端点微秒：优先取缓存里的 BLF 头部墙钟；头无效时退回原始 epoch。
+fn absolute_micros_bounds(meta: &CacheMeta) -> Option<(i64, i64)> {
+    let min = meta.abs_min_micros.or_else(|| finite_micros(meta.t_min))?;
+    let max = meta
+        .abs_max_micros
+        .or_else(|| finite_micros(meta.t_max))
+        .unwrap_or(min);
+    Some((min, max.max(min)))
+}
+
+/// 10 个等间隔刻度（含首尾）：跨度 <2 秒给到微秒，否则到秒。
+fn build_time_axis(t_min: f64, t_max: f64, abs_min: i64, abs_max: i64) -> Vec<AxisTick> {
+    const TICKS: usize = 10;
+    let span = t_max - t_min;
+    let with_micros = span < 2.0;
+    let mut axis = Vec::with_capacity(TICKS);
+    for index in 0..TICKS {
+        let frac = index as f64 / (TICKS - 1) as f64;
+        let t = t_min + frac * span;
+        // 首尾直接落到缓存里的两个墙钟端点，避免浮点换算让端点差 1 微秒。
+        let micros = if index == 0 {
+            abs_min
+        } else if index + 1 == TICKS {
+            abs_max
+        } else {
+            abs_min + ((t - t_min) * 1_000_000.0).round() as i64
+        };
+        let label = if with_micros {
+            format_wall_clock_micros(micros)
+        } else {
+            format_wall_clock_seconds(micros)
+        };
+        axis.push(AxisTick { t, label });
+    }
+    axis
+}
+
+fn axis_to_pylist<'py>(py: Python<'py>, axis: &[AxisTick]) -> PyResult<Bound<'py, PyList>> {
+    let list = PyList::empty(py);
+    for tick in axis {
+        let item = PyDict::new(py);
+        item.set_item("t", tick.t)?;
+        item.set_item("label", &tick.label)?;
+        list.append(item)?;
+    }
+    Ok(list)
+}
+
 fn format_wall_clock_micros(micros: i64) -> String {
     let seconds = micros.div_euclid(1_000_000);
     let sub_micros = micros.rem_euclid(1_000_000);
     match DateTime::from_timestamp(seconds, (sub_micros * 1000) as u32) {
         Some(dt) => format!("{}.{:06}", dt.format("%Y-%m-%d %H:%M:%S"), sub_micros),
+        None => String::new(),
+    }
+}
+
+/// 秒级墙钟字符串（`absolute` 且时间跨度 ≥ 2 秒时使用）。
+fn format_wall_clock_seconds(micros: i64) -> String {
+    let seconds = micros.div_euclid(1_000_000);
+    match DateTime::from_timestamp(seconds, 0) {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
         None => String::new(),
     }
 }
@@ -1282,6 +1411,9 @@ struct ViewData {
     t: Vec<f64>,
     series: Vec<ViewSeries>,
     truncated: bool,
+    t_min_str: Option<String>,
+    t_max_str: Option<String>,
+    t_axis: Vec<AxisTick>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1439,26 +1571,27 @@ fn export_html_report(
     path: &str,
     title: &str,
 ) -> Result<u64, CoreError> {
-    let (t_min, t_max, active) = {
+    let (time_info, active, files, signal_meta) = {
         let state = inner.lock_state();
         if state.closed {
             return Err(CoreError::bad_config("PlotSession 已关闭"));
         }
-        let raw_min = if state.meta.t_min.is_finite() {
-            state.meta.t_min
-        } else {
-            0.0
-        };
-        let raw_max = if state.meta.t_max.is_finite() {
-            state.meta.t_max
-        } else {
-            raw_min
-        };
-        let (t0, t1) = match state.time_format {
-            TimeFormat::UnixS => (raw_min, raw_max),
-            _ => (0.0, raw_max - raw_min),
-        };
-        (t0, t1, state.active.iter().cloned().collect::<Vec<_>>())
+        let signal_meta: BTreeMap<String, (String, Option<String>)> = inner
+            .catalog
+            .iter()
+            .map(|signal| {
+                (
+                    signal.key.clone(),
+                    (signal.signal.name.clone(), signal.unit.clone()),
+                )
+            })
+            .collect();
+        (
+            TimeInfo::from_meta(&state.meta, state.time_format),
+            state.active.iter().cloned().collect::<Vec<_>>(),
+            state.meta.files.len(),
+            signal_meta,
+        )
     };
     let stats = inner.stats_impl(&active)?;
     let stats_by_key: BTreeMap<String, SignalStats> = stats
@@ -1466,10 +1599,21 @@ fn export_html_report(
         .map(|(key, value)| (key.clone(), *value))
         .collect();
 
+    // 报告与界面走同一条取数路径：从 view(t_min, t_max, width) 拿抽稀包络，
+    // 绝不在这里另算一套桶。先按契约推荐的 width=2000 取；极端多信号导致
+    // 超过 8 MiB 时才逐级降宽（仍是 view，不改变口径），保证报告始终可离线打开。
     let mut html = String::new();
-    for width in [1200usize, 600, 300, 150, 75, 32, 8] {
-        let view = inner.compute_view(t_min, t_max, width)?;
-        html = render_html(title, t_min, t_max, &view, &stats_by_key);
+    for width in [2000usize, 1200, 600, 300, 150, 75, 32, 8] {
+        let view = inner.compute_view(time_info.t_min, time_info.t_max, width)?;
+        html = render_html(
+            title,
+            &time_info,
+            files,
+            &view,
+            &stats,
+            &stats_by_key,
+            &signal_meta,
+        );
         if html.len() <= 8 * 1024 * 1024 {
             return write_html_report(path, &html);
         }
@@ -1506,23 +1650,38 @@ fn write_html_report(path: &str, html: &str) -> Result<u64, CoreError> {
     Ok(html.len() as u64)
 }
 
+/// 全精度数字文本（Rust 的 f64 显示是 round-trip 最短形式，不截断有效数字）。
+fn number_text(value: f64) -> String {
+    serde_json::json!(value).to_string()
+}
+
 fn render_html(
     title: &str,
-    t_min: f64,
-    t_max: f64,
+    info: &TimeInfo,
+    files: usize,
     view: &ViewData,
-    stats: &BTreeMap<String, SignalStats>,
+    stats: &[(String, SignalStats)],
+    stats_by_key: &BTreeMap<String, SignalStats>,
+    signal_meta: &BTreeMap<String, (String, Option<String>)>,
 ) -> String {
     let series_json: Vec<serde_json::Value> = view
         .series
         .iter()
         .map(|series| {
-            let stat = stats.get(&series.key).copied().unwrap_or_default();
+            let stat = stats_by_key.get(&series.key).copied().unwrap_or_default();
+            let (signal, unit) = signal_meta
+                .get(&series.key)
+                .cloned()
+                .unwrap_or_else(|| (series.key.clone(), None));
             json!({
-                "key": series.key,
-                "min": series.min,
-                "max": series.max,
-                "mean": series.mean,
+                "key": &series.key,
+                "signal": signal,
+                "unit": unit,
+                // 契约：每条曲线都带自己的 t；与 view.t 完全一致（同一桶网格）。
+                "t": &view.t,
+                "min": &series.min,
+                "max": &series.max,
+                "mean": &series.mean,
                 "count": stat.count,
                 "vmin": stat.vmin,
                 "vmax": stat.vmax,
@@ -1532,17 +1691,54 @@ fn render_html(
             })
         })
         .collect();
+    let axis_json: Vec<serde_json::Value> = view
+        .t_axis
+        .iter()
+        .map(|tick| json!({"t": tick.t, "label": &tick.label}))
+        .collect();
     let data = json!({
         "title": title,
-        "t_min": t_min,
-        "t_max": t_max,
-        "t": view.t,
+        "files": files,
+        "t_min": info.t_min,
+        "t_max": info.t_max,
+        "t_min_str": info.t_min_str,
+        "t_max_str": info.t_max_str,
+        "t": &view.t,
         "series": series_json,
+        "t_axis": axis_json,
         "truncated": view.truncated,
     });
     // JSON 中不得出现 `</script>`，把所有 `<` 转义掉。
     let data_text = data.to_string().replace('<', "\\u003c");
     let safe_title = escape_html(title);
+    let absolute_line = match (&info.t_min_str, &info.t_max_str) {
+        (Some(start), Some(end)) => format!(
+            "<div class=\"meta\">绝对时间（BLF 头墙钟）：{} ~ {}</div>",
+            escape_html(start),
+            escape_html(end)
+        ),
+        _ => String::new(),
+    };
+    let stats_rows: String = stats
+        .iter()
+        .map(|(key, stat)| {
+            let (signal, unit) = signal_meta
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| (key.clone(), None));
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                escape_html(key),
+                escape_html(&signal),
+                escape_html(unit.as_deref().unwrap_or("")),
+                stat.count,
+                number_text(stat.vmin),
+                number_text(stat.vmax),
+                number_text(stat.mean),
+            )
+        })
+        .collect();
+    let points = view.t.len();
     format!(
         r#"<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -1551,27 +1747,33 @@ fn render_html(
 <style>
 body{{font-family:-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial,sans-serif;margin:0;background:#0f1115;color:#e8eaed}}
 header{{padding:18px 24px;border-bottom:1px solid #262a33}}
-h1{{font-size:18px;margin:0 0 6px}} .meta{{color:#9aa0a6;font-size:12px}}
+h1{{font-size:18px;margin:0 0 6px}} .meta{{color:#9aa0a6;font-size:12px;line-height:1.7}}
+table.stats{{margin-top:12px;border-collapse:collapse;font-size:12px;color:#cfd3d8}}
+table.stats th,table.stats td{{border:1px solid #2a2f3a;padding:4px 8px;text-align:right;white-space:nowrap}}
+table.stats th{{background:#191d24;color:#e8eaed}} table.stats td:first-child,table.stats td:nth-child(2),table.stats td:nth-child(3){{text-align:left}}
 main{{padding:16px 24px 40px}} .lane{{margin:18px 0;border:1px solid #262a33;border-radius:8px;overflow:hidden;background:#14171d}}
 .lane h2{{font-size:13px;margin:0;padding:8px 12px;border-bottom:1px solid #262a33;color:#cfd3d8}}
-.lane canvas{{display:block;width:100%;height:180px}} .empty{{padding:30px;color:#9aa0a6}}
+.lane canvas{{display:block;width:100%;height:200px}} .empty{{padding:30px;color:#9aa0a6}}
 </style></head><body>
 <header><h1>{safe_title}</h1>
-<div class="meta">时间范围：{t_min:.6} s ~ {t_max:.6} s ／ 每信号最多 {points} 个 min/max 包络点（不丢峰）</div></header>
+<div class="meta">文件数：{files} ／ 时间范围：{t_min:.6} s ~ {t_max:.6} s ／ 已抽稀为 {points} 桶（min/max 包络，不丢峰）</div>
+{absolute_line}
+<table class="stats"><thead><tr><th>key</th><th>signal</th><th>unit</th><th>count</th><th>vmin</th><th>vmax</th><th>mean</th></tr></thead><tbody>{stats_rows}</tbody></table>
+</header>
 <main id="lanes"></main>
 <script>
 const DATA={data_text};
 const lanes=document.getElementById('lanes');
 if(!DATA.series.length){{lanes.innerHTML='<div class="empty">当前会话没有可绘制的信号。</div>';}}
 const PALETTE=['#4dabf7','#f783ac','#ffd43b','#69db7c','#b197fc','#ffa94d','#63e6be','#ff6b6b'];
-function fmt(v){{return Number.isFinite(v)?v.toPrecision(7):'-';}}
+function fmt(v){{return Number.isFinite(v)?v.toPrecision(12):'-';}}
 DATA.series.forEach((s,index)=>{{
   const box=document.createElement('div');box.className='lane';
   const head=document.createElement('h2');
-  head.textContent=s.key+'  ·  '+s.count+' 点  ·  min='+fmt(s.vmin)+' max='+fmt(s.vmax)+' mean='+fmt(s.mean_all);
-  const canvas=document.createElement('canvas');canvas.width=1200;canvas.height=180;
+  head.textContent=s.key+'  ·  '+s.signal+(s.unit?' ['+s.unit+']':'')+'  ·  '+s.count+' 点  ·  min='+fmt(s.vmin)+' max='+fmt(s.vmax)+' mean='+fmt(s.mean_all);
+  const canvas=document.createElement('canvas');canvas.width=1200;canvas.height=200;
   box.appendChild(head);box.appendChild(canvas);lanes.appendChild(box);
-  const ctx=canvas.getContext('2d');const W=canvas.width,H=canvas.height,pad=28;
+  const ctx=canvas.getContext('2d');const W=canvas.width,H=canvas.height,pad=34;
   let lo=Infinity,hi=-Infinity;
   for(const v of s.min){{if(Number.isFinite(v)){{lo=Math.min(lo,v);hi=Math.max(hi,v);}}}}
   for(const v of s.max){{if(Number.isFinite(v)){{lo=Math.min(lo,v);hi=Math.max(hi,v);}}}}
@@ -1582,21 +1784,40 @@ DATA.series.forEach((s,index)=>{{
   ctx.clearRect(0,0,W,H);ctx.strokeStyle='#2a2f3a';ctx.lineWidth=1;
   ctx.beginPath();ctx.moveTo(pad,pad);ctx.lineTo(pad,H-pad);ctx.lineTo(W-pad,H-pad);ctx.stroke();
   const color=PALETTE[index%PALETTE.length];
-  if(DATA.t.length){{
+  const ts=(s.t&&s.t.length)?s.t:(DATA.t||[]);
+  if(ts.length){{
     ctx.fillStyle=color+'55';
     ctx.beginPath();
-    DATA.t.forEach((t,i)=>{{const v=s.max[i];if(Number.isFinite(v))ctx.lineTo(x(t),y(v));}});
-    for(let i=DATA.t.length-1;i>=0;i--){{const v=s.min[i];if(Number.isFinite(v))ctx.lineTo(x(DATA.t[i]),y(v));}}
+    ts.forEach((t,i)=>{{const v=s.max[i];if(Number.isFinite(v))ctx.lineTo(x(t),y(v));}});
+    for(let i=ts.length-1;i>=0;i--){{const v=s.min[i];if(Number.isFinite(v))ctx.lineTo(x(ts[i]),y(v));}}
     ctx.closePath();ctx.fill();
     ctx.strokeStyle=color;ctx.lineWidth=1.4;ctx.beginPath();
-    DATA.t.forEach((t,i)=>{{const v=s.mean[i];if(Number.isFinite(v)){{if(i===0)ctx.moveTo(x(t),y(v));else ctx.lineTo(x(t),y(v));}}}});
+    ts.forEach((t,i)=>{{const v=s.mean[i];if(Number.isFinite(v)){{if(i===0)ctx.moveTo(x(t),y(v));else ctx.lineTo(x(t),y(v));}}}});
     ctx.stroke();
   }}
-  ctx.fillStyle='#9aa0a6';ctx.font='11px monospace';
-  ctx.fillText(fmt(hi),4,pad-8);ctx.fillText(fmt(lo),4,H-pad+14);
+  ctx.fillStyle='#9aa0a6';ctx.font='11px monospace';ctx.textAlign='left';ctx.textBaseline='middle';
+  ctx.fillText(fmt(hi),4,pad-10);ctx.fillText(fmt(lo),4,H-pad+10);
+  ctx.font='10px monospace';ctx.textAlign='center';ctx.textBaseline='top';
+  const axis=DATA.t_axis||[];
+  if(axis.length){{
+    axis.forEach(tick=>{{
+      const px=x(tick.t);
+      ctx.save();ctx.translate(px,H-pad+6);ctx.rotate(-Math.PI/8);
+      ctx.fillText(tick.label,0,0);ctx.restore();
+    }});
+  }} else {{
+    for(let i=0;i<=5;i++){{const tv=t0+dt*i/5;ctx.fillText(tv.toPrecision(6)+'s',x(tv),H-pad+6);}}
+  }}
 }});
 </script></body></html>"#,
-        points = if view.t.is_empty() { 0 } else { view.t.len() },
+        safe_title = safe_title,
+        files = files,
+        t_min = info.t_min,
+        t_max = info.t_max,
+        points = points,
+        absolute_line = absolute_line,
+        stats_rows = stats_rows,
+        data_text = data_text,
     )
 }
 

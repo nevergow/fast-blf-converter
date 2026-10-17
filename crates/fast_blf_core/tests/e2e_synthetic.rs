@@ -4686,6 +4686,26 @@ fn step17_export_html_is_self_contained() {
         assert!(!text.contains("http://"), "HTML 不得引用 CDN");
         assert!(!text.contains("https://"), "HTML 不得引用 CDN");
         assert_eq!(text.len() as u64, bytes);
+        // Step 17c 补强：报告不能只有骨架，必须真的内嵌 view() 抽稀出来的数据。
+        let data = step17c_html_data(&text);
+        let series = data["series"].as_array().expect("series 必须是数组");
+        assert!(!series.is_empty(), "报告必须至少包含一条可见曲线");
+        for item in series {
+            let t = item["t"].as_array().expect("series[].t");
+            assert!(!t.is_empty(), "series[].t 不能为空");
+            assert_eq!(
+                item["min"].as_array().map(|values| values.len()),
+                Some(t.len())
+            );
+            assert_eq!(
+                item["max"].as_array().map(|values| values.len()),
+                Some(t.len())
+            );
+            assert_eq!(
+                item["mean"].as_array().map(|values| values.len()),
+                Some(t.len())
+            );
+        }
         println!("STEP17_EXPORT_HTML ok bytes={bytes}");
         Ok(())
     })
@@ -5142,6 +5162,426 @@ fn step17b_g3_vehspd_batttemp_reopen_hits_cache() {
             "STEP17B_G3_REAL cache_hit={cache_hit} open={:.3}ms series={}",
             elapsed.as_secs_f64() * 1000.0,
             view.series.len()
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+// ---------------------------------------------------------------------------
+// Step 17c：absolute 时间轴 + HTML 报告真的带数据
+// ---------------------------------------------------------------------------
+
+/// 按 `(channel, message, signal)` 构造 config（每个 channel 都绑同一份 DBC）。
+fn step17c_config_channels<'py>(
+    py: Python<'py>,
+    blf: &Path,
+    dbc: &Path,
+    selected: &[(u32, &str, &str)],
+    cache_dir: &Path,
+    budget_mb: u64,
+    time_format: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    let config = PyDict::new(py);
+    config.set_item("blf_paths", vec![blf.to_string_lossy().to_string()])?;
+    let mut dbc_map: HashMap<u32, String> = HashMap::new();
+    let mut selected_map: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+    for (channel, message, signal) in selected {
+        dbc_map.insert(*channel, dbc.to_string_lossy().to_string());
+        selected_map
+            .entry(channel.to_string())
+            .or_default()
+            .entry((*message).to_string())
+            .or_default()
+            .push((*signal).to_string());
+    }
+    config.set_item("dbc_by_channel", dbc_map)?;
+    config.set_item("selected", selected_map)?;
+    config.set_item("time_format", time_format)?;
+    config.set_item("temp_dir", cache_dir.to_string_lossy().to_string())?;
+    config.set_item("cache_budget_mb", budget_mb)?;
+    Ok(config)
+}
+
+/// 把 `t_axis` 投影成 `(t, label)`，并断言列表存在。
+fn step17c_axis(dict: &Bound<'_, PyDict>) -> PyResult<Vec<(f64, String)>> {
+    let axis = dict
+        .get_item("t_axis")?
+        .expect("返回 dict 必须含 t_axis")
+        .cast_into::<PyList>()?;
+    let mut ticks = Vec::with_capacity(axis.len());
+    for item in axis.iter() {
+        let item = item.cast_into::<PyDict>()?;
+        let t: f64 = item.get_item("t")?.unwrap().extract()?;
+        let label: String = item.get_item("label")?.unwrap().extract()?;
+        ticks.push((t, label));
+    }
+    Ok(ticks)
+}
+
+/// 从 HTML 里抠出 `const DATA=...;` 并解析成 JSON。
+fn step17c_html_data(text: &str) -> serde_json::Value {
+    let marker = "const DATA=";
+    let start = text.find(marker).expect("HTML 必须含 const DATA=") + marker.len();
+    let rest = &text[start..];
+    let end = rest
+        .find(";\nconst lanes")
+        .expect("DATA 之后必须紧跟 const lanes");
+    serde_json::from_str(&rest[..end]).expect("DATA 必须是合法 JSON")
+}
+
+/// 1）absolute 定值：timefmt.blf + demo.dbc（自检 1 的原始命令），info/view 同口径。
+#[test]
+fn step17c_absolute_axis_matches_contract() {
+    let fixtures = repo_fixtures_dir();
+    let blf = fixtures.join("timefmt.blf");
+    let dbc = fixtures.join("demo.dbc");
+    assert!(
+        blf.exists() && dbc.exists(),
+        "缺少 timefmt.blf / demo.dbc：{}",
+        fixtures.display()
+    );
+    let dir = tempfile::tempdir().expect("临时目录");
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        let config = step17c_config_channels(
+            py,
+            &blf,
+            &dbc,
+            &[(1, "VehSpd", "Spd")],
+            &cache_dir,
+            200,
+            "absolute",
+        )?;
+        let session = fast_blf_core::open_plot_session(py, &config, None)?;
+        session.add_signals(py, PyList::new(py, ["ch1/VehSpd/Spd"])?.as_any())?;
+        let info = session.info(py)?;
+
+        let t_min: f64 = info.get_item("t_min")?.unwrap().extract()?;
+        let t_max: f64 = info.get_item("t_max")?.unwrap().extract()?;
+        assert!((t_min - 0.0).abs() < 1e-12, "absolute 的 t_min 应为 0");
+        assert!((t_max - 1.0).abs() < 1e-9, "t_max={t_max}");
+        let t_min_str: String = info.get_item("t_min_str")?.unwrap().extract()?;
+        let t_max_str: String = info.get_item("t_max_str")?.unwrap().extract()?;
+        assert_eq!(t_min_str, "2025-10-16 14:10:00.123456");
+        assert_eq!(t_max_str, "2025-10-16 14:10:01.123456");
+
+        let axis = step17c_axis(&info)?;
+        assert!(
+            (8..=12).contains(&axis.len()),
+            "t_axis 刻度数应在 8..12，实际 {}",
+            axis.len()
+        );
+        assert!((axis[0].0 - 0.0).abs() < 1e-12);
+        assert!((axis[axis.len() - 1].0 - 1.0).abs() < 1e-9);
+        for pair in axis.windows(2) {
+            assert!(pair[1].0 > pair[0].0, "t_axis 的 t 必须严格单调：{pair:?}");
+        }
+        assert_eq!(axis[0].1, "2025-10-16 14:10:00.123456");
+        assert_eq!(axis[1].1, "2025-10-16 14:10:00.234567");
+        assert_eq!(axis[axis.len() - 1].1, "2025-10-16 14:10:01.123456");
+
+        // label 可复现：同一会话再取一次 info，刻度逐字相同。
+        let info_again = session.info(py)?;
+        let axis_again = step17c_axis(&info_again)?;
+        assert_eq!(axis, axis_again, "t_axis label 必须可复现");
+
+        // view 原样带出 time_format=absolute 的轴与端点。
+        let view = session.view(py, t_min, t_max, 500)?;
+        let view_axis = step17c_axis(&view)?;
+        assert_eq!(axis, view_axis, "view().t_axis 必须与 info() 一致");
+        let view_min: Option<String> = view.get_item("t_min_str")?.unwrap().extract()?;
+        let view_max: Option<String> = view.get_item("t_max_str")?.unwrap().extract()?;
+        assert_eq!(view_min.as_deref(), Some(t_min_str.as_str()));
+        assert_eq!(view_max.as_deref(), Some(t_max_str.as_str()));
+
+        println!(
+            "STEP17C_ABSOLUTE ok ticks={} {t_min_str} -> {t_max_str}",
+            axis.len()
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// 2）其它口径：不得出现绝对字符串/刻度；relative_ms 的 t 仍是秒。
+#[test]
+fn step17c_non_absolute_has_no_wall_clock_axis() {
+    let fixtures = repo_fixtures_dir();
+    let blf = fixtures.join("multi_channel.blf");
+    let dbc = fixtures.join("demo.dbc");
+    assert!(
+        blf.exists() && dbc.exists(),
+        "缺少 multi_channel.blf / demo.dbc"
+    );
+    let dir = tempfile::tempdir().expect("临时目录");
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        let mut relative_t: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        for format in ["relative_s", "relative_ms"] {
+            let config = step17c_config_channels(
+                py,
+                &blf,
+                &dbc,
+                &[(1, "VehSpd", "Spd")],
+                &cache_dir,
+                200,
+                format,
+            )?;
+            let session = fast_blf_core::open_plot_session(py, &config, None)?;
+            session.add_signals(py, PyList::new(py, ["ch1/VehSpd/Spd"])?.as_any())?;
+            let info = session.info(py)?;
+            let t_min_str: Option<String> = info.get_item("t_min_str")?.unwrap().extract()?;
+            let t_max_str: Option<String> = info.get_item("t_max_str")?.unwrap().extract()?;
+            assert_eq!(t_min_str, None, "{format} 不得给 t_min_str");
+            assert_eq!(t_max_str, None, "{format} 不得给 t_max_str");
+            assert!(
+                step17c_axis(&info)?.is_empty(),
+                "{format} 的 t_axis 必须为 []"
+            );
+
+            let t_min: f64 = info.get_item("t_min")?.unwrap().extract()?;
+            let t_max: f64 = info.get_item("t_max")?.unwrap().extract()?;
+            assert!((t_min - 0.0).abs() < 1e-12);
+            assert!((t_max - 4.99).abs() < 1e-9);
+            let view = session.view(py, t_min, t_max, 500)?;
+            assert!(
+                step17c_axis(&view)?.is_empty(),
+                "{format} 的 view().t_axis 必须为 []"
+            );
+            let view_min: Option<String> = view.get_item("t_min_str")?.unwrap().extract()?;
+            assert_eq!(view_min, None);
+            let t = view
+                .get_item("t")?
+                .unwrap()
+                .cast_into::<PyList>()?
+                .iter()
+                .map(|item| item.extract::<f64>())
+                .collect::<PyResult<Vec<_>>>()?;
+            assert!(!t.is_empty(), "{format} 的 view 必须有数据");
+            assert!(
+                t.iter().all(|value| value.is_finite() && *value <= 5.0),
+                "{format} 的 t 必须是秒（relative_ms 不能返回毫秒）：{t:?}"
+            );
+            relative_t.insert(format.to_string(), t);
+            session.close();
+        }
+        assert_eq!(
+            relative_t.get("relative_s"),
+            relative_t.get("relative_ms"),
+            "relative_s 与 relative_ms 的 view.t 必须同为秒"
+        );
+
+        // unix_s：t 是 epoch 秒，但同样不给墙钟字符串/刻度。
+        let config = step17c_config_channels(
+            py,
+            &fixtures.join("timefmt.blf"),
+            &dbc,
+            &[(1, "VehSpd", "Spd")],
+            &cache_dir,
+            200,
+            "unix_s",
+        )?;
+        let session = fast_blf_core::open_plot_session(py, &config, None)?;
+        let info = session.info(py)?;
+        let t_min_str: Option<String> = info.get_item("t_min_str")?.unwrap().extract()?;
+        assert_eq!(t_min_str, None);
+        assert!(step17c_axis(&info)?.is_empty());
+        let t_min: f64 = info.get_item("t_min")?.unwrap().extract()?;
+        assert!(
+            (t_min - 1_760_623_800.123_456).abs() < 1e-3,
+            "unix_s 的 t_min 应是 epoch 秒，实际 {t_min}"
+        );
+        println!("STEP17C_NON_ABSOLUTE ok formats=relative_s/relative_ms/unix_s");
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// 3）HTML 报告：三个可见信号都必须内嵌非空抽稀序列，头部带全量统计。
+#[test]
+fn step17c_export_html_embeds_every_visible_series() {
+    let fixtures = repo_fixtures_dir();
+    let blf = fixtures.join("multi_channel.blf");
+    let dbc = fixtures.join("demo.dbc");
+    assert!(
+        blf.exists() && dbc.exists(),
+        "缺少 multi_channel.blf / demo.dbc"
+    );
+    let dir = tempfile::tempdir().expect("临时目录");
+    let cache_dir = dir.path().join("cache");
+    let html = dir.path().join("step17c_data.html");
+    with_python(|py| -> PyResult<()> {
+        let config = step17c_config_channels(
+            py,
+            &blf,
+            &dbc,
+            &[
+                (1, "VehSpd", "Spd"),
+                (1, "BattTemp", "Temp1"),
+                (2, "Insulation", "Res"),
+            ],
+            &cache_dir,
+            200,
+            "relative_s",
+        )?;
+        let session = fast_blf_core::open_plot_session(py, &config, None)?;
+        session.add_signals(
+            py,
+            PyList::new(
+                py,
+                ["ch1/VehSpd/Spd", "ch1/BattTemp/Temp1", "ch2/Insulation/Res"],
+            )?
+            .as_any(),
+        )?;
+        let result =
+            session.export_html(py, html.to_string_lossy().as_ref(), "Step 17c 三信号报告")?;
+        let bytes: u64 = result.get_item("bytes")?.unwrap().extract()?;
+        assert!(bytes > 0);
+        assert!(bytes <= 8 * 1024 * 1024, "报告必须 < 8 MiB：{bytes}");
+        let text = std::fs::read_to_string(&html).expect("读取 HTML");
+        assert_eq!(text.len() as u64, bytes);
+        let data = step17c_html_data(&text);
+        let series = data["series"].as_array().expect("series 必须是数组");
+        assert_eq!(series.len(), 3, "三个可见信号都必须进报告");
+        let t_min = data["t_min"].as_f64().expect("DATA.t_min");
+        let t_max = data["t_max"].as_f64().expect("DATA.t_max");
+        let mut keys = Vec::new();
+        for item in series {
+            let key = item["key"].as_str().expect("series[].key");
+            keys.push(key.to_string());
+            assert!(
+                item["signal"].as_str().is_some(),
+                "{key} 必须带 signal 字段"
+            );
+            assert!(
+                item["unit"].is_string() || item["unit"].is_null(),
+                "{key} 的 unit 必须是 str|null"
+            );
+            let t = item["t"].as_array().expect("series[].t");
+            assert!(!t.is_empty(), "{key} 的 t 不能为空");
+            assert!(t.len() <= 2 * 2000, "{key} 的 t 超过 2*width：{}", t.len());
+            for field in ["min", "max", "mean"] {
+                let values = item[field].as_array().expect("series[].min/max/mean");
+                assert_eq!(values.len(), t.len(), "{key} 的 {field} 必须与 t 等长");
+            }
+            let count = item["count"].as_u64().expect("count");
+            assert!(count > 0, "{key} 的 count 必须来自全量原始数据");
+            for field in ["vmin", "vmax", "mean_all"] {
+                assert!(
+                    item[field].as_f64().map(|v| v.is_finite()).unwrap_or(false),
+                    "{key} 的 {field} 必须是有限数"
+                );
+            }
+            for value in t {
+                let value = value.as_f64().expect("t 元素必须是 float 秒");
+                assert!(
+                    value >= t_min - 1e-9 && value <= t_max + 1e-9,
+                    "{key} 的 t={value} 越界 [{t_min}, {t_max}]"
+                );
+            }
+        }
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "ch1/BattTemp/Temp1".to_string(),
+                "ch1/VehSpd/Spd".to_string(),
+                "ch2/Insulation/Res".to_string()
+            ]
+        );
+
+        let header = &text[..text.find("<main").expect("HTML 必须有 main")];
+        assert!(header.contains("Step 17c 三信号报告"));
+        assert!(header.contains("文件数：1"));
+        assert!(header.contains("min/max 包络，不丢峰"));
+        assert!(header.contains("已抽稀为 "));
+        for field in ["count", "vmin", "vmax", "mean"] {
+            assert!(header.contains(field), "头部统计表必须含 {field}");
+        }
+        for needle in ["fetch(", "XMLHttpRequest", "src=", "http://", "https://"] {
+            assert_eq!(
+                text.matches(needle).count(),
+                0,
+                "HTML 必须离线自包含，不得出现 {needle}"
+            );
+        }
+        println!(
+            "STEP17C_HTML_DATA ok bytes={bytes} series={} t0={} t_last={}",
+            series.len(),
+            data["series"][0]["t"]
+                .as_array()
+                .map(|v| v.len())
+                .unwrap_or(0),
+            data["series"][2]["t"]
+                .as_array()
+                .map(|v| v.len())
+                .unwrap_or(0)
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// 4）absolute HTML：横轴用 t_axis 的墙钟 label，头部显示起止绝对时间。
+#[test]
+fn step17c_export_html_absolute_axis_and_header() {
+    let fixtures = repo_fixtures_dir();
+    let blf = fixtures.join("timefmt.blf");
+    let dbc = fixtures.join("demo.dbc");
+    assert!(blf.exists() && dbc.exists(), "缺少 timefmt.blf / demo.dbc");
+    let dir = tempfile::tempdir().expect("临时目录");
+    let cache_dir = dir.path().join("cache");
+    let html = dir.path().join("step17c_absolute.html");
+    with_python(|py| -> PyResult<()> {
+        let config = step17c_config_channels(
+            py,
+            &blf,
+            &dbc,
+            &[(1, "VehSpd", "Spd")],
+            &cache_dir,
+            200,
+            "absolute",
+        )?;
+        let session = fast_blf_core::open_plot_session(py, &config, None)?;
+        session.add_signals(py, PyList::new(py, ["ch1/VehSpd/Spd"])?.as_any())?;
+        session.export_html(py, html.to_string_lossy().as_ref(), "Step 17c 绝对时间")?;
+        let text = std::fs::read_to_string(&html).expect("读取 HTML");
+        let header = &text[..text.find("<main").expect("HTML 必须有 main")];
+        assert!(header.contains("绝对时间（BLF 头墙钟）"));
+        assert!(header.contains("2025-10-16 14:10:00.123456"));
+        assert!(header.contains("2025-10-16 14:10:01.123456"));
+        assert!(
+            text.matches("2025-10-16 ").count() >= 2,
+            "HTML 必须出现至少 2 个 YYYY-MM-DD HH:MM:SS 形状的标签"
+        );
+        let data = step17c_html_data(&text);
+        let axis = data["t_axis"].as_array().expect("DATA.t_axis");
+        assert!(
+            (8..=12).contains(&axis.len()),
+            "HTML 的 t_axis 应在 8..12，实际 {}",
+            axis.len()
+        );
+        assert_eq!(
+            axis[0]["label"].as_str(),
+            Some("2025-10-16 14:10:00.123456")
+        );
+        assert_eq!(
+            axis[axis.len() - 1]["label"].as_str(),
+            Some("2025-10-16 14:10:01.123456")
+        );
+        for needle in ["fetch(", "XMLHttpRequest", "src=", "http://", "https://"] {
+            assert_eq!(
+                text.matches(needle).count(),
+                0,
+                "HTML 必须离线自包含，不得出现 {needle}"
+            );
+        }
+        assert!(text.len() <= 8 * 1024 * 1024);
+        println!(
+            "STEP17C_HTML_ABSOLUTE ok ticks={} bytes={}",
+            axis.len(),
+            text.len()
         );
         Ok(())
     })

@@ -113,6 +113,8 @@ PHASE_STAGE_LABELS = {"scan": "扫描中", "decode": "解码中", "merge": "合�
 ABSOLUTE_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6}$")
 NODE_ROLE = Qt.ItemDataRole.UserRole + 1
 TEXT_ROLE = Qt.ItemDataRole.UserRole + 2
+#: Step 18：预览设置写在预设 JSON 的一个附加字段里（不改变 presets.py 的 schema）。
+PREVIEW_PRESET_KEY = "preview"
 #: 节点携带的结构化数据（按名字恢复勾选 / 回读 DBC 绑定用）。
 CH_ROLE = Qt.ItemDataRole.UserRole + 3       # 通道号 int
 MSG_ROLE = Qt.ItemDataRole.UserRole + 4      # 报文名 str
@@ -340,12 +342,18 @@ class Worker(QThread):
     failed = Signal(str)
 
     def __init__(self, mode: str, config: dict | None = None, blf_paths: list[str] | None = None,
-                 dbc_map: dict[int, str] | None = None, parent: QObject | None = None) -> None:
+                 dbc_map: dict[int, str] | None = None,
+                 initial_keys: list[str] | None = None,
+                 parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.mode = mode
         self.config = config or {}
         self.blf_paths = list(blf_paths or [])
         self.dbc_map = dict(dbc_map or {})
+        #: Step 18：打开 PlotSession 时首屏激活的信号（最多 3 条，按勾选顺序）。
+        self.initial_keys = list(initial_keys or [])
+        #: 内核异常的稳定错误码（如 CACHE_BUDGET_EXCEEDED），供预览窗口走内联横幅。
+        self.error_code: str | None = None
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -368,15 +376,74 @@ class Worker(QThread):
             elif self.mode == "series":
                 # Step 16：画图数据只走 series_for_plot（内核侧抽稀），GUI 不解码 BLF。
                 report = core.series_for_plot(self.config)
+            elif self.mode == "session":
+                report = self._open_plot_session()
             else:
                 report = core.convert(self.config, self._progress_bridge)
         except Exception as exc:  # noqa: BLE001 - 任何内核异常都要变成提示
-            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            text = str(exc)
+            self.error_code = next((code for code in (
+                "CACHE_BUDGET_EXCEEDED", "BAD_CONFIG", "EMPTY_RESULT", "DISK_FULL",
+                "BLF_OPEN", "BLF_PARSE", "DBC_PARSE") if code in text), None)
+            self.failed.emit(f"{type(exc).__name__}: {text}")
             return
         if isinstance(report, dict):
             self.finished_ok.emit(report)
         else:
             self.failed.emit(f"内核返回了非预期类型：{type(report).__name__}")
+
+    def _open_plot_session(self) -> dict:
+        """Step 18：在 Worker 线程里打开 PlotSession，带确定进度 + 首屏预激活。
+
+        返回给主线程的 dict 里直接携带 PlotSession 对象；**所有** ``view()`` 都由
+        预览窗口在窗口变化时调用，Worker 这里只做 open / add_signals / stats。
+        """
+        session = core.open_plot_session(self.config, self._progress_bridge)
+        try:
+            time_format = str(self.config.get("time_format") or "relative_s")
+            info = session.info()
+            # 在 Worker 里一次性探明 absolute 墙钟字符串与 unix 原始偏移；之后切口径
+            # 只改枚举，不再调 info() / view()（E2 ≤16ms）。
+            abs_info = info if time_format == "absolute" else None
+            if abs_info is None:
+                session.set_time_format("absolute")
+                abs_info = session.info()
+            if time_format == "unix_s":
+                raw_info = info
+            else:
+                session.set_time_format("unix_s")
+                raw_info = session.info()
+            session.set_time_format(time_format)
+            raw_min = float(raw_info.get("t_min") or 0.0)
+            raw_max = float(raw_info.get("t_max") or (raw_min + 1.0))
+            keys = [str(key) for key in self.initial_keys if key]
+            if not keys:
+                keys = [str(item.get("key")) for item in (info.get("signals") or [])
+                        if item.get("cached")][:3]
+            if keys:
+                session.add_signals(keys)
+            stats = session.stats(keys) if keys else []
+            info = session.info()
+            return {
+                "session": session,
+                "info": info,
+                "stats": stats,
+                "initial_keys": keys,
+                "config": dict(self.config),
+                "format_meta": {
+                    "raw_min": raw_min,
+                    "raw_max": raw_max,
+                    "abs_min_str": abs_info.get("t_min_str"),
+                    "abs_max_str": abs_info.get("t_max_str"),
+                },
+            }
+        except Exception:
+            # 任何失败都必须释放句柄，避免缓存文件句柄泄漏。
+            try:
+                session.close()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
 
 
 # ----------------------------------------------------------------- 主窗口 ----
@@ -401,6 +468,11 @@ class MainWindow(QMainWindow):
         self._plot_action: str | None = None
         self._plot_out_path: str | None = None
         self._plot_time_format: str | None = None
+        #: Step 18：预览会话的缓存预算 / 预览设置（模式、颜色、线型、可见性）。
+        self.preview_cache_budget_mb: int = 200
+        self._preview_view_settings: dict = {}
+        self._preview_settings_from_preset: bool = False
+        self._last_preview_config: dict | None = None
         self._checks_guard = False
         #: 解析前的勾选快照（Step 6a §4：按名字恢复勾选）。
         self._check_snapshot: dict[str, set] | None = None
@@ -1019,11 +1091,40 @@ class MainWindow(QMainWindow):
         self._refresh_action_state()
         return self.missing_dbc_channels
 
+    def _write_preview_settings(self, path: Path) -> None:
+        """把预览设置附加到预设 JSON（Step 18 的"写进预设"；不改 schema / 其它字段）。"""
+        if not self._preview_view_settings:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return
+            data[PREVIEW_PRESET_KEY] = self._preview_view_settings
+            tmp = Path(path).with_name(Path(path).name + ".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                           encoding="utf-8")
+            os.replace(tmp, Path(path))
+        except (OSError, ValueError):
+            try:
+                tmp.unlink()
+            except (OSError, UnboundLocalError):
+                pass
+
+    def _read_preview_settings(self, path: Path | str) -> dict:
+        """从预设 JSON 读取预览设置；旧预设没有该字段时返回空 dict。"""
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        value = data.get(PREVIEW_PRESET_KEY) if isinstance(data, dict) else None
+        return value if isinstance(value, dict) else {}
+
     def save_preset(self, name: str) -> Path:
         """把当前 DBC 映射 + 选中信号 + 导出策略保存为命名配置，返回落盘路径。"""
         path = preset_store.save_preset(
             name, dict(self.dbc_by_channel), self.build_selection(), self.current_export_policy())
         self.current_preset_name = path.stem
+        self._write_preview_settings(path)
         return path
 
     def save_config_dialog(self) -> None:
@@ -1069,6 +1170,12 @@ class MainWindow(QMainWindow):
     def apply_preset(self, preset, skipped: int = 0) -> None:
         """加载配置：DBC 映射 → 自动解析 → 解析完成后恢复勾选 → 应用导出策略。"""
         self.current_preset_name = preset.name
+        preview_settings = self._read_preview_settings(preset.path)
+        if preview_settings:
+            self._preview_view_settings = preview_settings
+            self._preview_settings_from_preset = True
+        else:
+            self._preview_settings_from_preset = False
         missing = self.apply_dbc_map(preset.dbc_by_channel)
         self.apply_export_policy(preset.export)
         if KERNEL_READY and (self.entries or self.dbc_by_channel):
@@ -2192,18 +2299,77 @@ class MainWindow(QMainWindow):
         return True, selection
 
     def start_plot_preview(self, selection: dict | None = None) -> None:
-        """工具栏 / 右键「📈 预览」：取数放 Worker 线程，成功后开独立预览窗。"""
+        """工具栏 / 右键「📈 预览」：在 Worker 线程打开 ``PlotSession``，再开独立预览窗。
+
+        Step 18 起预览不再逐次调 ``series_for_plot``：会话在 open 时一次性把帧缓存
+        落到磁盘，之后缩放 / 平移 / 切口径都只读缓存。
+        """
         if self.plot_worker is not None and self.plot_worker.isRunning():
             self.statusBar().showMessage("取数进行中，请稍候…")
             return
         allowed, current = self._plot_guard()
         if not allowed:
             return
+        # 再预览 = 新会话（旧窗口关闭时已经 session.close()；磁盘缓存命中即秒开）。
+        self._close_preview_window()
         self._plot_selection = selection or current
         self._plot_action = "preview"
         self._plot_out_path = None
         self._plot_time_format = self._current_time_format()
-        self._launch_series_worker()
+        self._launch_preview_session_worker()
+
+    def _close_preview_window(self) -> None:
+        """关闭现有预览窗（会触发 session.close()），不弹任何确认框。"""
+        window = self.preview_window
+        self.preview_window = None
+        if window is not None:
+            try:
+                if getattr(window, "_error_code", None) is None:
+                    self._preview_view_settings = window.plot_settings()
+                window.close()
+            except RuntimeError:  # C++ 对象已销毁
+                pass
+
+    @staticmethod
+    def _selection_keys(selection: dict | None) -> list[str]:
+        """把 ``selected`` 按用户勾选顺序展开成 ``ch{ch}/{msg}/{sig}`` 列表。"""
+        keys: list[str] = []
+        for channel, messages in (selection or {}).items():
+            if not isinstance(messages, dict):
+                continue
+            for message, signals in messages.items():
+                for signal in (signals or []):
+                    keys.append(f"ch{channel}/{message}/{signal}")
+        return list(dict.fromkeys(keys))
+
+    def _preview_session_config(self, selection: dict, time_format: str) -> dict:
+        """``open_plot_session`` 的 config（§1.4）。缓存目录稳定，便于跨进程命中。"""
+        cache_dir = Path(tempfile.gettempdir()) / "fblf_preview_cache"
+        return {
+            "blf_paths": [entry.path for entry in self.entries],
+            "dbc_by_channel": self._merged_dbc_map(),
+            "selected": selection,
+            "time_format": time_format,
+            "temp_dir": tempfile.gettempdir(),
+            "cache_dir": str(cache_dir),
+            "cache_budget_mb": int(self.preview_cache_budget_mb),
+        }
+
+    def _launch_preview_session_worker(self) -> None:
+        """A4：打开会话在 Worker 线程里做，带确定进度（progress_cb）。"""
+        selection = self._plot_selection or {}
+        time_format = self._plot_time_format or self._current_time_format()
+        config = self._preview_session_config(selection, time_format)
+        initial_keys = self._selection_keys(selection)[:3]
+        self._begin_determinate("正在打开预览会话（缓存命中则秒开）…")
+        self.lbl_status.setText("正在打开预览会话…")
+        self.statusBar().showMessage(
+            "正在准备帧缓存（首次建缓存有确定进度；已缓存则直接命中）…")
+        self.plot_worker = Worker("session", config=config,
+                                  initial_keys=initial_keys, parent=self)
+        self._spawn(self.plot_worker, self._on_plot_progress,
+                    self._on_plot_ok, self._on_plot_failed, self._on_plot_thread_done)
+        self._refresh_action_state()
 
     def start_export_html(self, selection: dict | None = None) -> None:
         """工具栏 / 右键「📤 导出 HTML 报告」：先让用户选文件名，再在 Worker 里取数并落盘。"""
@@ -2234,8 +2400,8 @@ class MainWindow(QMainWindow):
         self._launch_series_worker()
 
     def _launch_series_worker(self) -> None:
-        """把 ``series_for_plot`` 丢进 Worker 线程（主线程取数会卡死界面）。"""
-        buckets = 2000  # §A1：默认 2000；预览窗已存在时取画布宽度像素级。
+        """``series_for_plot`` 的一次性取数 Worker（HTML 报告 / 不建缓存的降级预览）。"""
+        buckets = 2000
         if self.preview_window is not None:
             try:
                 buckets = max(100, min(20000, int(self.preview_window.canvas.width())))
@@ -2253,9 +2419,42 @@ class MainWindow(QMainWindow):
         self._refresh_action_state()
 
     def _on_plot_progress(self, payload: dict) -> None:
-        """``series_for_plot`` 无 ``progress_cb``：只在不确定态里刷新文案。"""
+        """预览会话用确定进度；``series_for_plot`` 无 progress_cb，只刷新文案。"""
+        if self._plot_action == "preview":
+            self._on_preview_progress(payload)
+            return
         label = str(payload.get("message") or "正在抽稀…")
         self.lbl_progress_status.setText(f"正在准备画图数据… {label}")
+
+    def _on_preview_progress(self, payload: dict) -> None:
+        """A4 / §2：``open_plot_session`` 的 progress_cb → 文件级确定进度条。"""
+        message = str(payload.get("message") or "正在准备帧缓存…")
+        done = int(payload.get("done") or 0)
+        total = int(payload.get("total") or 0)
+        frames = int(payload.get("frames_done") or 0)
+        file_path = payload.get("file")
+        pv = self._pv
+        if total > 0:
+            pv["active"] = True
+            pv["busy"] = False
+            pv["finished"] = False
+            pv["done"], pv["total"], pv["frames"] = done, total, frames
+            if file_path:
+                pv["file"] = str(file_path)
+            value = 100 if done >= total else int(round(100.0 * done / total))
+            value = max(self.progress_bar.value(), max(0, min(100, value)))
+            pv["value"] = value
+            name = os.path.basename(str(file_path)) if file_path else ""
+            pv["label_override"] = (f"准备预览缓存 · {name}" if name
+                                    else "准备预览缓存")
+            pv["meta_override"] = f"文件 {done}/{total} · 本文件已扫 {frames:,} 帧"
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(value)
+            self._render_progress()
+            self.lbl_status.setText(f"准备预览缓存… ({done}/{total})")
+            self.statusBar().showMessage(f"准备预览缓存… {message}")
+            if file_path:
+                self._set_file_status(str(file_path), STATUS_PARSING)
 
     def _finish_plot_ok(self, text: str) -> None:
         """画图 / 报告成功：进度区绿色完成行。"""
@@ -2306,11 +2505,27 @@ class MainWindow(QMainWindow):
         }
 
     def _on_plot_ok(self, report: dict) -> None:
+        action = self._plot_action
+        if (isinstance(report, dict) and report.get("session") is not None
+                and action != "preview"):
+            # 会话打开完成时用户已经把预览窗关掉：释放句柄，不重开窗口。
+            try:
+                report["session"].close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._progress_idle()
+            return
+        if action == "preview":
+            if isinstance(report, dict) and report.get("session") is not None:
+                self._open_preview_session(report)
+            else:
+                self._finish_plot_failed("打开预览会话失败：内核返回为空")
+            return
         if not isinstance(report, dict) or not report.get("ok"):
-            self._finish_plot_failed("取数失败：series_for_plot 返回 ok=False")
+            self._finish_plot_failed("取数失败：内核返回 ok=False")
             return
         time_format = self._plot_time_format or self._current_time_format()
-        if self._plot_action == "export":
+        if action == "export":
             meta = self._collect_plot_meta(time_format)
             out_path = self._plot_out_path or report_builder.default_report_name()
             result = report_builder.generate_report(report, meta, out_path)
@@ -2322,13 +2537,18 @@ class MainWindow(QMainWindow):
                 f"✓ 报告已导出：{os.path.basename(str(result.get('path')))}（{size_text}）")
             self.lbl_status.setText(f"HTML 报告：{result.get('path')}（{size_text}）")
             self.statusBar().showMessage(f"离线自包含报告已生成：{result.get('path')}")
-        elif self._plot_action == "preview":
-            self._open_preview_window(report)
+        elif action == "preview_static":
+            self._open_static_preview(report)
         else:
             # 预览窗在取数期间被用户关掉：丢弃结果，不无端重开窗口。
             self._progress_idle()
 
     def _on_plot_failed(self, message: str) -> None:
+        if self._plot_action == "preview" and (
+                "CACHE_BUDGET_EXCEEDED" in str(message)
+                or getattr(self.plot_worker, "error_code", None) == "CACHE_BUDGET_EXCEEDED"):
+            self._open_preview_cache_error(str(message))
+            return
         self._finish_plot_failed(message)
 
     def _on_plot_thread_done(self) -> None:
@@ -2338,46 +2558,177 @@ class MainWindow(QMainWindow):
         self._plot_action = None
         self._refresh_action_state()
 
-    def _open_preview_window(self, report: dict) -> None:
-        """首次创建 / 复用预览窗口，并把最新取数结果灌进去。"""
+    # ------------------------------------------------- 预览窗生命周期 ----
+    def _wire_preview_signals(self, window: PreviewWindow) -> None:
+        """预览窗口的关闭 / 设置 / F1 三个动作统一接到主窗。"""
+        window.closed.connect(self._on_preview_closed)
+        window.settings_changed.connect(self._on_preview_settings_changed)
+        window.budget_retry_requested.connect(self._on_preview_budget_retry)
+        window.reduce_selection_requested.connect(self._on_preview_reduce_selection)
+        window.no_cache_requested.connect(self._on_preview_no_cache)
+
+    @staticmethod
+    def _clean_core_message(message: str) -> str:
+        text = str(message or "")
+        for prefix in ("CoreError: ", "ValueError: "):
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+        return text.strip()
+
+    def _open_preview_session(self, result: dict) -> None:
+        """A1/A4：把 Worker 打开的 PlotSession 交给预览窗口（窗口持有会话）。"""
+        session = result.get("session")
+        config = dict(result.get("config") or {})
+        info = dict(result.get("info") or {})
+        if session is None:
+            self._finish_plot_failed("打开预览会话失败：session 为空")
+            return
+        budget = int(config.get("cache_budget_mb") or self.preview_cache_budget_mb)
+        time_format = str(config.get("time_format") or self._current_time_format())
+        view_settings = dict(self._preview_view_settings)
+        if not self._preview_settings_from_preset:
+            # 非预设场景：只恢复模式 / 颜色 / 线型；可见性按 E4 从勾选顺序重新取前 3。
+            view_settings = {key: value for key, value in view_settings.items()
+                             if key not in ("visible", "order")}
+        try:
+            window = PreviewWindow(
+                session, info=info, stats=result.get("stats") or [], config=config,
+                initial_keys=result.get("initial_keys") or [],
+                time_format=time_format, time_format_choices=TIME_FORMAT_CHOICES,
+                cache_budget_mb=budget, format_meta=result.get("format_meta") or {},
+                view_settings=view_settings, parent=None)
+        except Exception as exc:  # noqa: BLE001 - 构造失败必须释放会话句柄
+            try:
+                session.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._finish_plot_failed(f"预览窗口构造失败：{type(exc).__name__}: {exc}")
+            return
+        self._wire_preview_signals(window)
+        self.preview_window = window
+        self._last_preview_config = config
+        self._preview_view_settings = window.plot_settings()
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        count = len(window.canvas.keys())
+        hit = "缓存命中" if info.get("cache_hit") else "已建缓存"
+        self._finish_plot_ok(f"✓ 预览就绪：{count} 个信号 · {hit} · "
+                             f"首屏可见 {window.canvas.visible_count()} 条")
+        self.statusBar().showMessage(
+            f"预览窗口已打开（{count} 个信号；缩放/平移/切口径不再重新解码）")
+
+    def _open_static_preview(self, report: dict) -> None:
+        """F1「不建缓存继续（较慢）」：一次性 ``series_for_plot`` 的降级预览。"""
         time_format = self._plot_time_format or self._current_time_format()
         window = self.preview_window
-        if window is None:
-            window = PreviewWindow(report, time_format=time_format,
-                                   time_format_choices=TIME_FORMAT_CHOICES,
-                                   on_refetch=self._refetch_preview, parent=None)
-            window.closed.connect(self._on_preview_closed)
-            self.preview_window = window
+        if window is not None and getattr(window, "_session", None) is None:
+            window.set_static_data(report, time_format=time_format)
         else:
-            window.set_plot_data(report, time_format=time_format)
+            if window is not None:
+                self._close_preview_window()
+            window = PreviewWindow(
+                static_data=report, time_format=time_format,
+                time_format_choices=TIME_FORMAT_CHOICES,
+                cache_budget_mb=self.preview_cache_budget_mb,
+                view_settings=({key: value for key, value in self._preview_view_settings.items()
+                                if key not in ("visible", "order")}
+                               if not self._preview_settings_from_preset
+                               else self._preview_view_settings),
+                on_refetch=self._refetch_preview, parent=None)
+            self._wire_preview_signals(window)
+            self.preview_window = window
+        self._preview_view_settings = window.plot_settings()
         window.show()
         window.raise_()
         window.activateWindow()
         series = report.get("series") or []
         total = sum(int(item.get("count", 0) or 0) for item in series)
         buckets = int(report.get("buckets") or 0)
-        self._finish_plot_ok(f"✓ 预览就绪：{len(series)} 个信号 · {total:,} 个原始点 · "
-                             f"已抽稀为 {buckets} 桶（min/max 包络，不丢峰）")
-        self.statusBar().showMessage(f"预览窗口已打开（{len(series)} 个信号，已抽稀）")
+        self._finish_plot_ok(f"✓ 降级预览就绪（未建缓存）：{len(series)} 个信号 · "
+                             f"{total:,} 个原始点 · {buckets} 桶")
+        self.statusBar().showMessage("降级预览：未建帧缓存，缩放/平移仍可用；"
+                                     "切换时间口径需要重新抽稀")
+
+    def _open_preview_cache_error(self, message: str) -> None:
+        """F1：``CACHE_BUDGET_EXCEEDED`` 在预览窗口内显示内联横幅，不弹模态错误框。"""
+        self._close_preview_window()
+        window = PreviewWindow(
+            error_message=self._clean_core_message(message),
+            error_code="CACHE_BUDGET_EXCEEDED",
+            time_format=self._plot_time_format or self._current_time_format(),
+            time_format_choices=TIME_FORMAT_CHOICES,
+            cache_budget_mb=self.preview_cache_budget_mb, parent=None)
+        self._wire_preview_signals(window)
+        self.preview_window = window
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        self._finish_plot_failed("预览缓存预算不足（已在预览窗口内联提示，未弹窗）")
+        self.lbl_status.setText("缓存预算不足：请在预览窗口选择「提高上限 / 减少报文 / 不建缓存」")
+
+    # ------------------------------------------------- F1 三个动作 ----
+    def _on_preview_budget_retry(self, budget: int) -> None:
+        """F1-1：提高上限并重试（预算来自预览窗口里的设置对话框）。"""
+        self.preview_cache_budget_mb = int(budget)
+        self._close_preview_window()
+        if not self._plot_selection:
+            self.statusBar().showMessage("预览上下文已丢失，请重新点「📈 预览」")
+            return
+        self._plot_action = "preview"
+        self._launch_preview_session_worker()
+
+    def _on_preview_reduce_selection(self) -> None:
+        """F1-2：只预览更少报文——回到主窗口，让用户减少勾选。"""
+        self._close_preview_window()
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        self.statusBar().showMessage(
+            "请在主窗口减少勾选的报文 / 信号，然后重新点「📈 预览」")
+        self.lbl_status.setText("请减少勾选的报文 / 信号后重新预览")
+
+    def _on_preview_no_cache(self) -> None:
+        """F1-3：不建缓存继续（较慢）——一次性 ``series_for_plot`` 降级预览。"""
+        self._close_preview_window()
+        if not self._plot_selection:
+            self.statusBar().showMessage("预览上下文已丢失，请重新点「📈 预览」")
+            return
+        self._plot_action = "preview_static"
+        self._plot_time_format = self._plot_time_format or self._current_time_format()
+        self._launch_series_worker()
+
+    def _on_preview_settings_changed(self, settings: dict) -> None:
+        """模式 / 颜色 / 线型 / 可见性变化：主窗记住；保存预设时写进 JSON。"""
+        if isinstance(settings, dict):
+            self._preview_view_settings = dict(settings)
 
     def _refetch_preview(self, time_format: str) -> None:
-        """预览窗里改时间口径 → 重新走 Worker 取数（不是前端换算）。"""
+        """降级预览才需要：切口径 → 重新走 ``series_for_plot``（会话模式不走这里）。"""
         if self.plot_worker is not None and self.plot_worker.isRunning():
             self.statusBar().showMessage("取数进行中，请稍候再切换时间格式")
             return
         if not self._plot_selection:
             self.statusBar().showMessage("预览上下文已丢失，请重新点「📈 预览」")
             return
-        self._plot_action = "preview"
+        self._plot_action = "preview_static"
         self._plot_time_format = time_format
         self._launch_series_worker()
 
     def _on_preview_closed(self) -> None:
+        """预览窗关闭：会话已在 closeEvent 里 ``session.close()``；保留最近上下文。"""
+        window = self.preview_window
+        if window is not None:
+            try:
+                if getattr(window, "_error_code", None) is None:
+                    self._preview_view_settings = window.plot_settings()
+                    self._last_preview_config = dict(window._config or {})  # noqa: SLF001
+            except RuntimeError:  # C++ 对象已销毁
+                pass
         self.preview_window = None
-        # 若关闭时刚好在重新取数，丢弃这次结果（避免窗口被关掉后又自己弹回来）。
-        if self._plot_action == "preview":
+        # 若关闭时恰好有 Worker 在开新一轮会话，丢弃结果，避免窗口自己弹回来。
+        if self._plot_action in ("preview", "preview_static"):
             self._plot_action = None
-            self._plot_selection = None
 
     # ------------------------------------------------------ 拖拽/关闭 ------
     def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt 命名
@@ -3135,16 +3486,84 @@ def run_selftest_progress() -> int:
     return 0
 
 
-def run_selftest_plot() -> int:
-    """``--selftest-plot``：Step 16 画图 / 离线 HTML 报告的无人值守端到端验证。
+def _write_bulk_dbc(path: Path, message_specs: list[tuple[int, str]],
+                    per_message: int) -> int:
+    """生成一个含 ``len(message_specs) * per_message`` 个 1-bit 信号的临时 DBC。
 
-    * 用 ``fixtures/multi_channel.blf`` + ``fixtures/demo.dbc`` 构造主窗（offscreen）；
-    * 调 ``series_for_plot`` → 断言 ``series`` 非空、每信号 ``len(t) <= buckets``；
-    * 构造预览控件、``resize(1200, 600)``、``grab()`` 一次（离屏渲染不崩）；
-    * 生成 HTML 报告到临时目录 → 断言文件存在、体积 < 8MB、无外部 src/href/fetch、
-      含 ``echarts`` 标识与 ≥3 个信号名；
-    * 成功打印 ``PLOT_OK series=.. buckets=.. html_bytes=.. png_bytes=..`` 返回 0；
-      失败打印 ``PLOT_FAIL ...`` 返回 2；内核 / 夹具缺失打印 ``PLOT_SKIP ...`` 返回 0。
+    ``multi_channel.blf`` 只有 3 个报文 ID；把 96 个信号平铺到 3 个报文上即可
+    验证三态复选框的 96/96 口径，不需要新夹具。
+    """
+    lines = ['VERSION ""', "", "NS_ :", "", "BS_:", "", "BU_: ECU", ""]
+    count = 0
+    for message_id, message_name in message_specs:
+        lines.append(f"BO_ {message_id} {message_name}: 8 ECU")
+        prefix = "".join(ch for ch in message_name if ch.isalnum()) or "S"
+        for index in range(per_message):
+            start_bit = (index * 2) % 64
+            lines.append(f' SG_ {prefix}_{index} : {start_bit}|1@1+ (1,0) [0|1] "" ECU')
+            count += 1
+        lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return count
+
+
+def _percentile(values: list[float], fraction: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = int(round((len(ordered) - 1) * fraction))
+    return float(ordered[max(0, min(len(ordered) - 1, index))])
+
+
+def _render_canvas_ms(canvas, width: int | None = None, height: int | None = None,
+                      *, region: bool = False) -> float:
+    """离屏渲染画布一帧，返回毫秒（自检用；不修改任何控件状态）。
+
+    ``region=True`` 时只渲染左上角 ``width×height`` 区域，等价于滚动视口里
+    实际会重绘的那一块（车道多行时用它证明绘制量与总行数无关）。
+    """
+    from PySide6.QtCore import QPoint, QRect
+    from PySide6.QtGui import QColor, QImage, QPainter
+
+    w = int(width or max(1, canvas.width()))
+    h = int(height or max(1, canvas.height()))
+    image = QImage(w, h, QImage.Format.Format_ARGB32)
+    image.fill(QColor("#1E1E24"))
+    started = time.perf_counter()
+    painter = QPainter(image)
+    if region:
+        canvas.render(painter, QPoint(0, 0), QRect(0, 0, w, h))
+    else:
+        canvas.render(painter, QPoint(0, 0))
+    painter.end()
+    return (time.perf_counter() - started) * 1000.0
+
+
+def _destroy_widget(widget) -> None:
+    """显式销毁独立 QWidget（预览窗 / 错误横幅窗），避免关闭顺序导致段错误。"""
+    if widget is None:
+        return
+    try:
+        widget.close()
+        widget.deleteLater()
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
+    except RuntimeError:
+        pass
+
+
+def run_selftest_plot() -> int:
+    """``--selftest-plot``：Step 18 预览重写的无人值守验收。
+
+    断言（全部真跑，失败打印 ``PLOT_FAIL`` 并返回 2）：
+
+    * ``multi_channel.blf`` + ``demo.dbc`` 开的 PlotSession 能构造预览窗口（offscreen）；
+    * 三种显示模式各切一次 + 时间口径 4 种各切一次，``view()`` 调用次数不增加；
+    * 三态复选框：96/96 → Checked；0/96 → Unchecked；1/96 → PartiallyChecked；
+    * 每信号可见点数 ≤ 2 × 画布宽度；
+    * 离屏渲染一帧 ≤ 30 ms（打印实测）；
+    * ``CACHE_BUDGET_EXCEEDED`` 错误窗有内联横幅 + 三个动作按钮（无模态弹窗）。
     """
     if core is None:
         print("PLOT_SKIP no_kernel")
@@ -3160,75 +3579,356 @@ def run_selftest_plot() -> int:
     if app is None:
         print("PLOT_FAIL no_qapplication")
         return 2
-    window: MainWindow | None = None
-    preview: PreviewWindow | None = None
-    try:
-        buckets = 2000
-        window = MainWindow()
-        window.quiet_dialogs = True
-        _setup_scan_tree(window, str(blf_path), {1: str(dbc_path), 2: str(dbc_path)})
-        selection = window.build_selection()
-        if not selection:
-            raise AssertionError("主窗未勾选到任何信号")
-        config = window._series_config(selection, "relative_s", buckets)
-        plot_data = core.series_for_plot(config)
-        series = plot_data.get("series") or []
-        if not series:
-            raise AssertionError("series 为空")
-        for item in series:
-            if len(item.get("t") or []) > buckets:
-                raise AssertionError(
-                    f"信号 {item.get('signal')} 桶数 {len(item.get('t') or [])} > {buckets}")
 
-        # 预览控件离屏渲染（QWidget.paintEvent，必须不崩）。
-        preview = PreviewWindow(plot_data, time_format="relative_s",
-                                time_format_choices=TIME_FORMAT_CHOICES)
-        preview.resize(1200, 600)
+    temp_root = Path(tempfile.mkdtemp(prefix="fblf_plot_selftest_"))
+    os.environ["FBLF_CONFIG_DIR"] = str(temp_root / "configs")
+    session = bulk_session = None
+    preview = bulk_preview = error_window = None
+    try:
+        config = {
+            "blf_paths": [str(blf_path)],
+            "dbc_by_channel": {1: str(dbc_path), 2: str(dbc_path)},
+            "selected": {"1": {"VehSpd": ["Spd", "SpdValid"],
+                               "BattTemp": ["Temp1", "Temp2"]},
+                         "2": {"Insulation": ["Res"]}},
+            "time_format": "relative_s",
+            "temp_dir": str(temp_root),
+            "cache_dir": str(temp_root / "cache"),
+            "cache_budget_mb": 200,
+        }
+        # 0) A4：打开会话必须在 Worker 线程里带确定进度（progress_cb）。
+        progress_config = dict(config)
+        progress_config["cache_dir"] = str(temp_root / "progress_cache")
+        progress_config["selected"] = {"1": {"VehSpd": ["Spd"]}}
+        progress_events: list[dict] = []
+        progress_result: dict = {}
+        progress_worker = Worker("session", config=progress_config,
+                                 initial_keys=["ch1/VehSpd/Spd"])
+        progress_worker.progress.connect(lambda p: progress_events.append(dict(p)))
+        progress_worker.finished_ok.connect(lambda r: progress_result.update(r))
+        progress_worker.failed.connect(lambda m: progress_result.update({"failed": m}))
+        progress_worker.start()
+        deadline = time.time() + 20
+        while time.time() < deadline and not progress_result:
+            app.processEvents()
+            time.sleep(0.01)
+        if not progress_worker.wait(5000):
+            raise AssertionError("会话进度 Worker 未在 5s 内结束")
+        progress_worker.deleteLater()
+        if progress_result.get("failed"):
+            raise AssertionError(f"会话进度自检失败：{progress_result['failed']}")
+        if progress_result.get("session") is not None:
+            progress_result["session"].close()
+        if not progress_events:
+            raise AssertionError("open_plot_session 没有发出 progress_cb")
+        if not all(int(item.get("done") or 0) <= int(item.get("total") or 0)
+                   for item in progress_events):
+            raise AssertionError(f"进度非确定：{progress_events!r}")
+        if int(progress_events[-1].get("done") or 0) != int(
+                progress_events[-1].get("total") or 0):
+            raise AssertionError(f"进度未停在 100%：{progress_events[-1]!r}")
+        progress_frames = max(int(item.get("frames_done") or 0)
+                              for item in progress_events)
+
+        session = core.open_plot_session(config)
+        info = session.info()
+        # 只看本次 selected 里已缓存的 5 条真实信号（ch1 四条 + ch2 Insulation）。
+        keys = [str(item.get("key")) for item in (info.get("signals") or [])
+                if item.get("cached")]
+        if len(keys) < 3:
+            raise AssertionError(f"夹具信号不足：{keys}")
+        keys = keys[:5]
+        session.add_signals(keys)
+        stats = session.stats(keys)
+
+        preview = PreviewWindow(
+            session, info=info, stats=stats, config=config, initial_keys=keys,
+            time_format="relative_s", time_format_choices=TIME_FORMAT_CHOICES,
+            cache_budget_mb=200)
+        preview.resize(1200, 700)
         preview.show()
         app.processEvents()
-        pixmap = preview.grab()
-        if pixmap.isNull() or pixmap.width() <= 0:
-            raise AssertionError("预览控件 grab 返回空 pixmap")
-        png_dir = Path(tempfile.mkdtemp(prefix="fblf_plot_png_"))
-        png_path = png_dir / "preview.png"
-        if not pixmap.save(str(png_path), "PNG"):
-            raise AssertionError("预览 PNG 保存失败")
-        png_bytes = png_path.stat().st_size
+        # 让「窗口变化 → 实际宽度精化」那一拍落地，再开始统计 view() 次数。
+        time.sleep(0.08)
+        app.processEvents()
+        if preview.canvas.visible_count() > 3:
+            raise AssertionError(f"首屏可见 {preview.canvas.visible_count()} 条 > 3")
 
-        # 离线 HTML 报告（同一份 series_for_plot 数据，不为 HTML 再算一遍）。
-        report_dir = Path(tempfile.mkdtemp(prefix="fblf_plot_html_"))
-        out_path = report_dir / report_builder.default_report_name()
-        meta = window._collect_plot_meta("relative_s")
-        result = report_builder.generate_report(plot_data, meta, out_path)
-        if not result.get("ok"):
-            raise AssertionError(f"报告生成失败：{result.get('error')}")
-        if not out_path.is_file():
-            raise AssertionError("报告文件不存在")
-        html_bytes = int(result.get("bytes") or out_path.stat().st_size)
-        if html_bytes >= 8 * 1024 * 1024:
-            raise AssertionError(f"报告体积 {html_bytes} >= 8MB")
-        text = out_path.read_text(encoding="utf-8")
-        if not report_builder.is_self_contained(text):
-            raise AssertionError("报告包含指向 http(s) 的 src/href/fetch 外部引用")
-        if "echarts" not in text.lower():
-            raise AssertionError("报告缺少 echarts 标识")
-        names = {str(item.get("signal")) for item in series}
-        present = sum(1 for name in names if name and name in text)
-        if present < 3:
-            raise AssertionError(f"报告只含 {present} 个信号名（要求 >=3）")
+        # 1) 三种模式 + 4 种时间口径：不得取数。
+        calls_before = preview.canvas.view_call_count
+        for mode in ("multi_axis", "single_axis", "lanes"):
+            preview.apply_mode(mode)
+            app.processEvents()
+        for fmt in ("relative_ms", "absolute", "unix_s", "relative_s"):
+            preview.apply_time_format(fmt)
+            app.processEvents()
+        calls_after = preview.canvas.view_call_count
+        if calls_after != calls_before:
+            raise AssertionError(
+                f"切模式/口径触发了 view()：{calls_before} → {calls_after}")
+
+        # 1b) 十字线移动只重绘，不得取数（A2）。
+        from PySide6.QtCore import QPointF
+
+        preview.canvas._hover_t = preview.canvas._view[0] + 0.01  # noqa: SLF001
+        preview.canvas._hover_pos = QPointF(200, 200)  # noqa: SLF001
+        preview.canvas.update()
+        app.processEvents()
+        if preview.canvas.view_call_count != calls_after:
+            raise AssertionError("十字线移动触发了 view()")
+
+        # 2) 三态：全选 / 全不选 / 只勾 1 条（96/96 用临时 96 信号 DBC 验证）。
+        preview.select_all()
+        app.processEvents()
+        if preview.canvas.visible_count() != len(keys):
+            raise AssertionError("全选后可见数不匹配")
+        preview.select_none()
+        app.processEvents()
+        if preview.panel.check_state() != Qt.CheckState.Unchecked:
+            raise AssertionError("全不选后复选框不是 Unchecked")
+
+        # 3) 可见点数 ≤ 2 × width_px 每信号。
+        preview.select_all()
+        app.processEvents()
+        width = max(1, preview.canvas.width())
+        for key, points in preview.visible_points().items():
+            if points > 2 * width:
+                raise AssertionError(f"{key} 可见点数 {points} > 2×{width}")
+        max_points = max(preview.visible_points().values() or [0])
+
+        # 4) 离屏渲染一帧 ≤ 30 ms。
+        render_ms = _render_canvas_ms(preview.canvas)
+        if render_ms > 30.0:
+            raise AssertionError(f"离屏渲染 {render_ms:.2f} ms > 30 ms")
+
+        # 5) 96/96：临时 DBC 把 96 个信号平铺到夹具的 3 个报文 ID 上。
+        bulk_dbc = temp_root / "bulk96.dbc"
+        bulk_count = _write_bulk_dbc(
+            bulk_dbc, [(291, "BulkA"), (418, "BulkB"), (512, "BulkC")], 32)
+        bulk_config = {
+            "blf_paths": [str(blf_path)],
+            "dbc_by_channel": {1: str(bulk_dbc), 2: str(bulk_dbc)},
+            "selected": {
+                "1": {"BulkA": [f"BulkA_{i}" for i in range(32)],
+                      "BulkB": [f"BulkB_{i}" for i in range(32)]},
+                "2": {"BulkC": [f"BulkC_{i}" for i in range(32)]},
+            },
+            "time_format": "relative_s",
+            "temp_dir": str(temp_root / "bulk_temp"),
+            "cache_dir": str(temp_root / "bulk_cache"),
+            "cache_budget_mb": 200,
+        }
+        bulk_session = core.open_plot_session(bulk_config)
+        bulk_info = bulk_session.info()
+        wanted_bulk: set[str] = set()
+        for channel, messages in bulk_config["selected"].items():
+            for message, signals in messages.items():
+                for signal in signals:
+                    wanted_bulk.add(f"ch{channel}/{message}/{signal}")
+        bulk_keys = [str(item.get("key")) for item in (bulk_info.get("signals") or [])
+                     if str(item.get("key")) in wanted_bulk]
+        if len(bulk_keys) != bulk_count:
+            raise AssertionError(f"临时 DBC 选中信号数 {len(bulk_keys)} != {bulk_count}")
+        bulk_session.add_signals(bulk_keys)
+        bulk_stats = bulk_session.stats(bulk_keys)
+        bulk_preview = PreviewWindow(
+            bulk_session, info=bulk_info, stats=bulk_stats, config=bulk_config,
+            initial_keys=bulk_keys, time_format="relative_s",
+            time_format_choices=TIME_FORMAT_CHOICES, cache_budget_mb=200)
+        bulk_preview.resize(1000, 600)
+        bulk_preview.show()
+        app.processEvents()
+        bulk_preview.select_all()
+        app.processEvents()
+        if bulk_preview.panel.checked_count() != 96:
+            raise AssertionError(f"全选 {bulk_preview.panel.checked_count()}/96")
+        if bulk_preview.panel.check_state() != Qt.CheckState.Checked:
+            raise AssertionError("全选后复选框不是 Checked")
+        if "96/96" not in bulk_preview.panel.chk_all.text():
+            raise AssertionError(f"全选文案={bulk_preview.panel.chk_all.text()!r}")
+        tri_text = bulk_preview.panel.chk_all.text()
+        bulk_preview.select_none()
+        app.processEvents()
+        if bulk_preview.panel.check_state() != Qt.CheckState.Unchecked:
+            raise AssertionError("96 全不选后复选框不是 Unchecked")
+        bulk_preview.set_signal_visible(bulk_keys[0], True)
+        app.processEvents()
+        if bulk_preview.panel.check_state() != Qt.CheckState.PartiallyChecked:
+            raise AssertionError("只勾 1 条后复选框不是 PartiallyChecked")
+        # 96 条全选后只重绘视口（~13 行）也应该 ≤30ms，绘制量与总行数无关。
+        bulk_preview.select_all()
+        app.processEvents()
+        viewport = bulk_preview.scroll.viewport().size()
+        render96_ms = _render_canvas_ms(
+            bulk_preview.canvas, viewport.width(), viewport.height(), region=True)
+        if render96_ms > 30.0:
+            raise AssertionError(f"96 车道视口渲染 {render96_ms:.2f} ms > 30 ms")
+
+        # 6) F1：缓存超额内联横幅 + 三个动作按钮（绝不是 QMessageBox）。
+        error_window = PreviewWindow(
+            error_message="CACHE_BUDGET_EXCEEDED: 需要 900 MiB，上限 200 MiB；"
+                          "可选：①提高上限 ②减少所选报文 ③不建缓存继续",
+            error_code="CACHE_BUDGET_EXCEEDED", cache_budget_mb=200,
+            time_format="relative_s", time_format_choices=TIME_FORMAT_CHOICES)
+        error_window.resize(960, 320)
+        error_window.show()
+        app.processEvents()
+        if not error_window.banner.isVisible():
+            raise AssertionError("缓存超额时内联横幅未显示")
+        texts = (error_window.btn_raise.text(), error_window.btn_reduce.text(),
+                 error_window.btn_nocache.text())
+        if texts != ("提高上限并重试", "只预览更少报文", "不建缓存继续（较慢）"):
+            raise AssertionError(f"F1 动作按钮文案={texts!r}")
+
+        # 7) 口径切换的 p95（E2 ≤16ms；会话模式不取数）。
+        fmt_samples: list[float] = []
+        for index in range(20):
+            fmt = "relative_ms" if index % 2 == 0 else "relative_s"
+            started = time.perf_counter()
+            preview.apply_time_format(fmt)
+            fmt_samples.append((time.perf_counter() - started) * 1000.0)
+        fmt_p95 = _percentile(fmt_samples, 0.95)
+        if fmt_p95 > 16.0:
+            raise AssertionError(f"set_time_format p95={fmt_p95:.2f} ms > 16 ms")
     except Exception as exc:  # noqa: BLE001 - 自检要把任何异常变成可 grep 的失败行
         print(f"PLOT_FAIL {type(exc).__name__}: {exc}")
         return 2
     finally:
-        if preview is not None:
+        _destroy_widget(error_window)
+        _destroy_widget(bulk_preview)
+        _destroy_widget(preview)
+        if bulk_session is not None:
             try:
-                preview.close()
-            except RuntimeError:
+                bulk_session.close()
+            except Exception:  # noqa: BLE001
                 pass
-        if window is not None:
-            _destroy_window(window)
-    print(f"PLOT_OK series={len(series)} buckets={plot_data.get('buckets')} "
-          f"html_bytes={html_bytes} png_bytes={png_bytes}")
+        if session is not None:
+            try:
+                session.close()
+            except Exception:  # noqa: BLE001
+                pass
+    print(f"PLOT_OK series={len(keys)} modes=3 time_formats=4 "
+          f"view_calls_mode_fmt=0 tri=96/96 ({tri_text}) "
+          f"progress_events={len(progress_events)} progress_frames={progress_frames} "
+          f"max_points_per_signal={max_points} width={width} "
+          f"render_ms={render_ms:.2f} render96_viewport_ms={render96_ms:.2f} "
+          f"fmt_switch_p95_ms={fmt_p95:.3f} f1_buttons=3")
+    return 0
+
+
+def run_selftest_plot_perf() -> int:
+    """``--selftest-plot-perf``：8 个 7MB 切片上的缩放/平移单帧与切口径实测。
+
+    * 单帧耗时 = 粗粒度 ``view(..., 400)`` + 一次离屏 paint（拖拽期间的真实路径）；
+    * 打印 p50/p95；``set_time_format`` 20 次的 p95；成功打印 ``PLOT_PERF`` 返回 0。
+    """
+    if core is None:
+        print("PLOT_PERF_SKIP no_kernel")
+        return 0
+    root = Path(__file__).resolve().parent.parent
+    source = (root / "fixtures" / "bench_large.blf").resolve()
+    dbc = (root / "fixtures" / "bench.dbc").resolve()
+    if not source.is_file() or not dbc.is_file():
+        print("PLOT_PERF_SKIP no_fixture")
+        return 0
+    app = QApplication.instance()
+    if app is None:
+        print("PLOT_PERF_FAIL no_qapplication")
+        return 2
+    temp_root = Path(tempfile.mkdtemp(prefix="fblf_plot_perf_"))
+    os.environ["FBLF_CONFIG_DIR"] = str(temp_root / "configs")
+    session = preview = None
+    try:
+        slices: list[str] = []
+        for index in range(8):
+            target = temp_root / f"slice_{index}.blf"
+            shutil.copyfile(source, target)
+            slices.append(str(target))
+        config = {
+            "blf_paths": slices,
+            "dbc_by_channel": {1: str(dbc), 2: str(dbc), 3: str(dbc)},
+            "selected": {},
+            "time_format": "relative_s",
+            "temp_dir": str(temp_root / "temp"),
+            "cache_dir": str(temp_root / "cache"),
+            "cache_budget_mb": 1024,
+        }
+        opened = time.perf_counter()
+        session = core.open_plot_session(config)
+        open_ms = (time.perf_counter() - opened) * 1000.0
+        info = session.info()
+        keys = [str(item.get("key")) for item in (info.get("signals") or [])
+                if item.get("cached")][:3]
+        if not keys:
+            raise AssertionError("性能夹具没有已缓存信号")
+        session.add_signals(keys)
+        stats = session.stats(keys)
+        preview = PreviewWindow(
+            session, info=info, stats=stats, config=config, initial_keys=keys,
+            time_format="relative_s", time_format_choices=TIME_FORMAT_CHOICES,
+            cache_budget_mb=1024)
+        preview.resize(1200, 700)
+        preview.show()
+        app.processEvents()
+        canvas = preview.canvas
+
+        frame_samples: list[float] = []
+        for index in range(50):
+            factor = 0.8 if index % 2 == 0 else 1.25
+            started = time.perf_counter()
+            canvas.zoom_at(factor, canvas.width() * 0.6, fetch=True, coarse=True)
+            _render_canvas_ms(canvas)
+            frame_samples.append((time.perf_counter() - started) * 1000.0)
+        for index in range(50):
+            delta = 12.0 if index % 2 == 0 else -12.0
+            started = time.perf_counter()
+            canvas.pan_pixels(delta, fetch=True, coarse=True)
+            _render_canvas_ms(canvas)
+            frame_samples.append((time.perf_counter() - started) * 1000.0)
+
+        fmt_samples: list[float] = []
+        for index in range(20):
+            fmt = "relative_ms" if index % 2 == 0 else "relative_s"
+            started = time.perf_counter()
+            preview.apply_time_format(fmt)
+            fmt_samples.append((time.perf_counter() - started) * 1000.0)
+        p50 = _percentile(frame_samples, 0.50)
+        p95 = _percentile(frame_samples, 0.95)
+        fmt_p95 = _percentile(fmt_samples, 0.95)
+        if fmt_p95 > 16.0:
+            raise AssertionError(f"set_time_format p95={fmt_p95:.2f} ms > 16 ms")
+
+        # 关掉首次会话再开一次：同 key 的缓存命中应远低于 300 ms（A4）。
+        _destroy_widget(preview)
+        preview = None
+        if session is not None:
+            session.close()
+            session = None
+        cache_started = time.perf_counter()
+        session = core.open_plot_session(config)
+        cache_open_ms = (time.perf_counter() - cache_started) * 1000.0
+        second_info = session.info()
+        cache_hit_second = bool(second_info.get("cache_hit"))
+        if not cache_hit_second:
+            raise AssertionError("第二次 open_plot_session 未命中磁盘缓存")
+        if cache_open_ms > 300.0:
+            raise AssertionError(f"缓存命中打开 {cache_open_ms:.1f} ms > 300 ms")
+    except Exception as exc:  # noqa: BLE001
+        print(f"PLOT_PERF_FAIL {type(exc).__name__}: {exc}")
+        return 2
+    finally:
+        _destroy_widget(preview)
+        if session is not None:
+            try:
+                session.close()
+            except Exception:  # noqa: BLE001
+                pass
+        shutil.rmtree(temp_root, ignore_errors=True)
+    print(f"PLOT_PERF slices=8 frame_n={len(frame_samples)} p50_ms={p50:.3f} "
+          f"p95_ms={p95:.3f} fmt_n={len(fmt_samples)} fmt_p95_ms={fmt_p95:.3f} "
+          f"signals={len(info.get('signals') or [])} cached_keys={len(keys)} "
+          f"open_ms={open_ms:.1f} cache_hit={bool(info.get('cache_hit'))} "
+          f"cache_open_ms={cache_open_ms:.1f} cache_hit_second={cache_hit_second}")
     return 0
 
 
@@ -3338,6 +4038,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
     parse_test = "--selftest-parse" in args[1:]
     fill_test = "--selftest-fill" in args[1:]
     plot_test = "--selftest-plot" in args[1:]
+    plot_perf = "--selftest-plot-perf" in args[1:]
     dump_target = _dump_target(args[1:])
     app = QApplication.instance() or QApplication(args)
     app.setApplicationName("Fast BLF Converter")
@@ -3354,6 +4055,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
         return run_selftest_progress()
     if parse_test:
         return run_selftest_parse()
+    if plot_perf:
+        return run_selftest_plot_perf()
     if plot_test:
         return run_selftest_plot()
     if deep:
