@@ -25,7 +25,7 @@
 ## 契约（照抄实现，不得擅自改语义；详见 `docs/INTERFACE.md` §1.1 与 §5 第 12/13 条）
 
 ### `fill_policy: str`
-* 取值 `"none"` / `"hold"` / `"linear"`；其他值 → 报 `CONFIG_INVALID`（错误消息要人话，附上收到的值）。
+* 取值 `"none"` / `"hold"` / `"linear"`；其他值 → 报 `BAD_CONFIG`（错误消息要人话，附上收到的值）。
 * **未显式给出时按路径取默认**（关键，不许搞错）：
   * 重采样网格路径（`resample_hz != None`）→ `hold`
   * 保持原始时序的宽表（`split_by_message == false`、`resample_hz == None`）→ `none`（= 现状 `ffill=false`）
@@ -35,7 +35,7 @@
 * **`linear` 必须在 `warnings` 里报**：`已对 {n} 个信号做线性插值（可能包含从未采样过的中间值）`。
 
 ### `ffill_max_gap_ms: float | None`
-* 默认 `None` = 不限制。仅 `hold` 生效；给了就必须 > 0，否则 `CONFIG_INVALID`。
+* 默认 `None` = 不限制。仅 `hold` 生效；给了就必须 > 0，否则 `BAD_CONFIG`。
 * 语义：某行往前找最近的真实采样，若 `行时间 - 真实采样时间 > ffill_max_gap_ms/1000` 秒 → **该行置空**
   （不再保持）。行首（第一个真实采样之前）本来就无值可保持 → 一律保持为空，不受本参数影响。
 * 受影响行数**按信号**计入 `warnings`：

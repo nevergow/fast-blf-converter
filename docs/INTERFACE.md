@@ -105,7 +105,7 @@ config 字段（在 `convert` 的 config 之上）：
 | `dbc_by_channel` | `dict[int, str]` | 同 `convert` |
 | `selected` | `dict[str, dict[str, list[str]]]` | 同 `convert`（只处理选中的信号） |
 | `time_format` | `str` | 时间轴口径，与导出口径**完全一致**的取值（`relative_s`/`relative_ms`/`absolute`/`unix_s`）。**但返回的 `t` 永远是 float 秒**：`relative_s`→相对秒、`relative_ms`→**秒**（不要返回毫秒，避免两处口径打架）、`unix_s`→epoch 秒、`absolute`→**相对秒**（0 = 全局最早时间戳），同时必须给出 `t_min_str`/`t_max_str`（`YYYY-MM-DD HH:MM:SS.ffffff`，BLF 头墙钟，不换时区）与刻度标签数组（见下） |
-| `buckets` | `int` | 抽稀桶数（屏幕像素宽度量级）。默认 `2000`，允许 `100..20000`，越界报 `BAD_CONFIG`（错误码以 §4 的稳定清单为准：本文件曾误写为 `CONFIG_INVALID`，已更正） |
+| `buckets` | `int` | 抽稀桶数（屏幕像素宽度量级）。默认 `2000`，允许 `100..20000`，越界报 `BAD_CONFIG`（错误码以 §4 的稳定清单为准：本文件曾误写为 `BAD_CONFIG`，已更正） |
 | `temp_dir` | `str` | 临时目录（复用 convert 语义） |
 
 返回值：
@@ -190,7 +190,7 @@ sess = fast_blf_core.open_plot_session(config, progress_cb=None)   # -> PlotSess
 | `time_format` | `str` | 初始时间口径（后续可用 `set_time_format` 零成本切换） |
 | `temp_dir` | `str` | 临时目录（缓存默认放这里） |
 | `cache_dir` | `str \| None` | 帧缓存目录，默认 `<temp_dir>/fblf_frames` |
-| `cache_budget_mb` | `int` | 缓存磁盘上限（MiB），**默认 200**，允许 `32..8192`；越界报 `CONFIG_INVALID` |
+| `cache_budget_mb` | `int` | 缓存磁盘上限（MiB），**默认 200**，允许 `32..8192`；越界报 `BAD_CONFIG` |
 
 ### 缓存规则（决定 UX 成败）
 
@@ -291,7 +291,10 @@ pub fn export(shards: &[PathBuf], opts: &ExportOptions,
 pub struct CoreError { pub code: String, pub message: String, pub detail: Option<String> }
 ```
 - 映射为 Python 异常 `fast_blf_core.CoreError`，`str(e)` == `"{code}: {message}"`。
-- 稳定错误码：`BLF_OPEN`、`BLF_PARSE`、`DBC_PARSE`、`NO_DBC_FOR_CHANNEL`、`EMPTY_RESULT`、`DISK_FULL`、`EXPORT_FAILED`、`BAD_CONFIG`。
+- 稳定错误码（**以此清单为准，新增必须在本文登记**）：
+  `BLF_OPEN`、`BLF_PARSE`、`DBC_PARSE`、`NO_DBC_FOR_CHANNEL`、`EMPTY_RESULT`、`DISK_FULL`、
+  `EXPORT_FAILED`、`EXPORT_INTERNAL`、`BAD_CONFIG`、**`CACHE_BUDGET_EXCEEDED`**（v0.4.0，见 §1.4）。
+- **配置取值越界/非法一律 `BAD_CONFIG`**（不存在 `BAD_CONFIG` 这个码，历史任务书里若出现请按本清单纠正）。
 
 ## 5. 硬约束（违反即验收不通过）
 

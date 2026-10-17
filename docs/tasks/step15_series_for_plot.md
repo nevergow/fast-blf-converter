@@ -21,7 +21,7 @@ fast_blf_core.series_for_plot(config: dict) -> dict
 ```
 
 config：`blf_paths`（list[str]）、`dbc_by_channel`（dict[int,str]）、`selected`（同 convert）、
-`time_format`（str）、`buckets`（int，默认 2000，允许 100..20000，越界报 `CONFIG_INVALID`）、`temp_dir`（str，可不用）。
+`time_format`（str）、`buckets`（int，默认 2000，允许 100..20000，越界报 `BAD_CONFIG`）、`temp_dir`（str，可不用）。
 
 返回（字段名逐字一致）：
 ```python
@@ -78,7 +78,7 @@ config：`blf_paths`（list[str]）、`dbc_by_channel`（dict[int,str]）、`sel
 2. **空桶跳过**：稀疏信号在多个桶里无采样 → 三数组长度 = 非空桶数，且 `t` 与真实有值的桶中心一致
 3. **min/max 包络不丢峰**：构造一个"桶内只有一个极端尖峰"的序列，断言该桶 `max` 就是尖峰（**这是本步的红线**）
 4. `count`/`vmin`/`vmax`/`first`/`last` = 全量原始数据口径（构造已知序列，逐个断言）
-5. `buckets` 参数边界：=1、> 采样点数、=100、=20000；越界（99 / 20001）报 `CONFIG_INVALID`
+5. `buckets` 参数边界：=1、> 采样点数、=100、=20000；越界（99 / 20001）报 `BAD_CONFIG`
 6. `time_format` 四种口径下 `t` 的关系（`relative_ms` 的值必须是 `relative_s` 的 1000 倍再除以 1000 后一致等）
 
 ### 集成测试（`tests/e2e_synthetic.rs`）
