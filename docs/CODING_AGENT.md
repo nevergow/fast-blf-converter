@@ -1,50 +1,48 @@
-# 编码代理约定（本项目）
+# 编码代理约定（本项目）— 与 SOUL.md / skill `dsh-coding-delegation` 对齐
 
-## 谁写代码
+> **权威来源**：`~/.hermes/SOUL.md`「代码任务分工」+ skill `dsh-coding-delegation`（派活前必读）。
+> 本文只是本项目落地的简表；**冲突以 SOUL.md 与 skill 为准**。
 
-**默认：Pi CLI**（`pi` v1.3.0，`deepseek-flash` = DeepSeek-V4.1-Flash）。
-理由（2026-10-17 决定，Neil 指出）：
+## 分工（Neil 2026-10-16 定调）
 
-1. **成本**：简单任务 ≈ ¥0.003–0.005/次；DSH headless 一个 step ≈ ¥1–3。
-2. **可中途纠偏**：Pi 的 RPC 模式支持 `steer` / `follow_up`，agent 跑着也能改方向；
-   DSH headless **做不到**——只能杀掉重来。本项目历史上真的因为这点白烧过整轮
-   （契约自相矛盾那次、Step 6a 钻 lldb 兔子洞那次）。
+| 任务形状 | 执行者 | 依据 |
+|---|---|---|
+| 外部副作用（发版/发消息/改线上配置） | **我自己** | 不可逆 |
+| 只读侦察（改哪、为什么坏、真实 API 名） | **Pi 只读**（`--tools read,grep,find,ls`） | 便宜、可 steer |
+| 单点实现（**1–2 文件**、验收命令明确） | **Pi**（`pi -p` 或 `pi_rpc.py` 常驻可 `steer`） | 跑偏 30 秒能纠回 |
+| 长链 / 跨模块 / 需设计权衡（**3+ 文件**） | **DSH headless** | 能撑长任务、有沙箱；**无中途 steer**，任务书要更窄 |
+| 纯机械批处理（重命名/批量替换） | **脚本（0 token）** | 不叫 agent |
 
-**DSH headless 仅在这些情况保留**：需要它特有的长会话/插件行为时；或者 Pi 在同一类任务上
-连续两次跑偏（用 `steer` 纠正无效）后作为备选。
+**沙箱方向相反**：DSH = workspace-write（cwd 即边界）；Pi = YOLO（**只能在 git 干净仓库里跑**，验收前必须看全 diff）。
 
-## 调用方式
+## 七步生命周期（每个可验收切片）
 
-```bash
-set -a; source ~/.hermes/.env; set +a          # Hermes 的 shell 不自动加载 key
-export PI_SKIP_VERSION_CHECK=1
-# 一次性任务（推荐：任务书从 stdin 喂进去）
-pi --no-session -p - < docs/tasks/<step>.md    # 或 pi --no-session -p "$(cat docs/tasks/<step>.md)"
-# 常驻会话（需要中途 steer 时）
-python3 ~/.hermes/scripts/pi_rpc.py start --name blf --workdir <repo> --no-session
-python3 ~/.hermes/scripts/pi_rpc.py send  --name blf "<task>"
-python3 ~/.hermes/scripts/pi_rpc.py steer --name blf "改用方案 B"
-```
+1. 我写任务书（背景/不变量/硬边界/必须贴真实输出/验收命令），先自查无互斥要求
+2. **侦察（Pi 只读）**：定位改动点与真实 API 名 → 改动点清单
+   —— ⚠️ 本项目的两次返工（`24/80` vs `17/73` 字节口径矛盾、`CONFIG_INVALID` vs `BAD_CONFIG`）都是**跳过这步**造成的
+3. 按上表选执行者实现
+4. 执行者自证：真实命令输出 + 一句 note
+5. **我独立验收**：跑测试/产物/**像用户一样走真实交互路径的探针**/看 diff
+6. **我提交**（执行者不提交），CI 兜底
+7. 清场：kill 残留进程/探针并 `ps` 复查
 
-注意：本机 **没有 `timeout` 命令**（macOS），要用纯 shell 计时 + `kill -0` 判定。
+## 成本与错峰（会直接反映在余额上）
 
-## 流程（不变）
+* 派重活前先跑 `~/.hermes/scripts/ds_price_window.py --short`。
+* **北京工作日 9–12、14–18 为峰时（双倍价）**：要挪到 18:00 后或周末，**先问 Neil，不自动排队**。
+* 基准：DSH 一个 step ≈ ¥1–3（峰时翻倍）；Pi 单点改动 ≈ ¥0.2–1。
+* 结论：**能 Pi 就 Pi**；只有 3+ 文件的跨模块长链才上 DSH。
 
-1. **先改契约**：`docs/INTERFACE.md`（冻结口径），再写任务书 `docs/tasks/stepNN_*.md`
-   —— 任务书里必须写死：只能改哪些文件、逐条要求、**自检命令与输出要求**、禁止事项。
-2. 派给 Pi，跑完看它自报。
-3. **主会话独立验收**（不采信执行者自述）：
-   * 自己写探针（`/tmp/probe_*.py`），**走真实入口**，不走内部捷径；
-   * 至少一个"独立第二路径对账"（例如 `stats()` 对 `convert` 导出的 CSV）；
-   * 硬指标实测（延迟/内存/包络不丢峰），不达标就回退。
-4. 全量回归：`cargo test` + `tests/acceptance.py` + 全部 `--selftest*`。
-5. 提交 → 推送 → CI 出 Windows 包 → 取件核验（sha256/结构）→ 发 Release。
+## 派活登记与观测
 
-## 血泪教训（已在 CI/脚本里固化）
+* 派 DSH/Pi 一律用包装器登记，图上才是真父子关系：
+  `python3 ~/.hermes/scripts/af_dispatch.py --kind dsh|pi --label "Step NN" --task <任务书> -- <真实命令>`
+* 事后查看：`~/.hermes/scripts/worker_runs.py [show|follow] <KEY>`；看板 `worker_dashboard.py --style pixel`。
 
-* `maturin develop` 会装到 **anaconda** 而非 `.venv` → 用 `scripts/dev_install.sh`（含 `libpython` 断言）。
-* 裸 `cargo build` 不带 `extension-module` → import 阶段 SIGSEGV。
-* `maturin build` 默认 **debug** profile，要 `--release`。
-* 窗口化 exe 在 Windows 上**不产出 stdout** → 冻结态自检只警告不阻塞（诊断信息仍要打印）。
-* 探针走内部捷径会误报（例：只写树节点不写 `dbc_by_channel` → 转换报 `EMPTY_RESULT`）。
-* 契约与任务书口径必须一致，否则执行者会卡在两者之间空转。
+## 本机环境坑（已固化进脚本）
+
+* `maturin develop` 会装进 **anaconda** 而非 `.venv` → 用 `scripts/dev_install.sh`（含 `libpython` 断言）。
+* 裸 `cargo build` 不带 `extension-module` → import 阶段 SIGSEGV；`maturin build` 默认 debug，要 `--release`。
+* 窗口化 exe 在 Windows 上**不产出 stdout** → 冻结态自检只警告不阻塞，但诊断必须先打印。
+* 本机**没有 `timeout` 命令**（macOS）。
+* 探针必须走真实入口（历史教训：只写树节点不写 `dbc_by_channel` → 误报 `EMPTY_RESULT`）。
