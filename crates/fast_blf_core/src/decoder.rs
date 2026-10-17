@@ -266,6 +266,20 @@ impl SignalPlan {
     }
 }
 
+/// Step 17：从一帧字节解出**单个信号**的纯函数。
+///
+/// 只有位提取与线性换算，无全局状态、无 I/O；帧缓存 / 包络金字塔复用同一条解码路径，
+/// 保证“缓存解码 == 直接解码”。`data` 只取前 `dlc.min(data.len())` 字节，避免把
+/// 缓存里的零填充误当成真实数据。
+pub fn decode_signal_bytes(
+    signal: &SignalPlan,
+    dlc: u8,
+    data: &[u8],
+) -> Result<f64, CoreError> {
+    let len = (dlc as usize).min(data.len());
+    signal.decode(&data[..len])
+}
+
 /// 一个已编译的报文：`channel` 恒为 1-based，`frame_id` 恒为归一化 raw id。
 #[derive(Debug, Clone, PartialEq)]
 pub struct MessagePlan {

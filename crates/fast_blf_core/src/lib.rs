@@ -21,15 +21,22 @@ mod dbc_norm;
 mod decoder;
 mod error;
 mod exporter;
+pub mod frame_cache;
+pub mod plot_session;
 mod series;
 
 pub use bit_slice::{decode_physical, extract_bits, ByteOrder};
 pub use dbc_norm::{normalize_dbc_bytes, NormOutcome};
 pub use decoder::{
-    process_file, read_file_timing, sanitize_identifier, scan_file, table_name, DecodePlan,
-    FileScan, FileStat, FileTiming, GlobalMin, MessagePlan, Progress, Selection, ShardRef,
-    ShardSink, SignalPlan, TableKey, TableShards, WallClock, BAD_TIME_HEADER,
+    decode_signal_bytes, process_file, read_file_timing, sanitize_identifier, scan_file, table_name,
+    DecodePlan, FileScan, FileStat, FileTiming, GlobalMin, MessagePlan, Progress, Selection,
+    ShardRef, ShardSink, SignalPlan, TableKey, TableShards, WallClock, BAD_TIME_HEADER,
 };
+pub use frame_cache::{
+    read_record_at, read_timestamp_at, CacheMeta, CacheOpen, CacheOptions, CachedMessageMeta,
+    CachedRecord, CACHE_BUDGET_EXCEEDED, CACHE_FORMAT_VERSION, CLASSIC_STRIDE, FD_STRIDE,
+};
+pub use plot_session::PlotSession;
 pub use error::{
     CoreError, BAD_CONFIG, BLF_OPEN, BLF_PARSE, DBC_PARSE, DISK_FULL, EMPTY_RESULT, EXPORT_FAILED,
     EXPORT_INTERNAL, NO_DBC_FOR_CHANNEL,
@@ -1004,12 +1011,80 @@ pub fn series_for_plot<'py>(
     Ok(result)
 }
 
+/// v0.4.0：打开一个帧缓存会话（契约 `docs/INTERFACE.md` §1.4）。
+///
+/// config 字段：`blf_paths` / `dbc_by_channel` / `selected` / `time_format` /
+/// `temp_dir` / `cache_dir` / `cache_budget_mb`。重活全程 `py.detach()`，进度回调复用
+/// [`ProgressThrottle`]（`phase=1`、`stage="cache"`、文件维度 done/total、frames_done）。
+#[pyfunction]
+#[pyo3(signature = (config, progress_cb=None))]
+pub fn open_plot_session(
+    py: Python<'_>,
+    config: &Bound<'_, PyDict>,
+    progress_cb: Option<Py<PyAny>>,
+) -> PyResult<PlotSession> {
+    let blf_paths: Vec<String> = config_required(config, "blf_paths")?;
+    let dbc_raw: HashMap<u32, String> = config_required(config, "dbc_by_channel")?;
+    let selected_raw: HashMap<String, HashMap<String, Vec<String>>> =
+        config_required(config, "selected")?;
+    let time_format_raw: String =
+        config_optional(config, "time_format", "relative_s".to_string())?;
+    let time_format = TimeFormat::parse(&time_format_raw).ok_or_else(|| {
+        CoreError::bad_config(format!(
+            "config 字段 `time_format` 非法：`{time_format_raw}`（合法值：{}）",
+            TimeFormat::VALID.join(" / ")
+        ))
+    })?;
+    let temp_dir: Option<String> = config_optional(config, "temp_dir", None)?;
+    let cache_dir: Option<String> = config_optional(config, "cache_dir", None)?;
+    let cache_budget_mb: u64 =
+        config_optional(config, "cache_budget_mb", frame_cache::DEFAULT_CACHE_BUDGET_MB)?;
+
+    let mut dbc_map: BTreeMap<u32, PathBuf> = BTreeMap::new();
+    for (channel, path) in dbc_raw {
+        dbc_map.insert(channel, PathBuf::from(path));
+    }
+    let mut selection = Selection::default();
+    for (channel_text, messages) in selected_raw {
+        let channel: u32 = channel_text.parse().map_err(|_| {
+            CoreError::bad_config(format!("`selected` 的通道号 `{channel_text}` 不是合法整数"))
+        })?;
+        selection.channels.insert(channel, messages);
+    }
+
+    let cache_dir = match cache_dir {
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        _ => match temp_dir {
+            Some(temp) if !temp.is_empty() => PathBuf::from(temp).join("fblf_frames"),
+            _ => std::env::temp_dir().join("fblf_frames"),
+        },
+    };
+    let paths: Vec<PathBuf> = blf_paths.iter().map(PathBuf::from).collect();
+    let throttle = Arc::new(ProgressThrottle::new(progress_cb, paths.len() as u64));
+    let session_config = plot_session::SessionConfig {
+        blf_paths: paths,
+        dbc_by_channel: dbc_map,
+        selection,
+        time_format,
+        cache_dir,
+        cache_budget_mb,
+    };
+    let session = py.detach(move || {
+        let emit = move |payload: Progress| {
+            throttle.emit_decode(payload);
+        };
+        plot_session::open_session(session_config, &emit)
+    })?;
+    Ok(session)
+}
+
 #[pymodule]
 fn fast_blf_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(scan, m)?)?;
     m.add_function(wrap_pyfunction!(convert, m)?)?;
     m.add_function(wrap_pyfunction!(series_for_plot, m)?)?;
+    m.add_function(wrap_pyfunction!(open_plot_session, m)?)?;
     m.add("CoreError", m.py().get_type::<CoreErrorPy>())?;
     Ok(())
 }

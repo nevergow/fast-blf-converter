@@ -276,3 +276,29 @@ SYSTEMTIME 的 8 个 u16 顺序（由 `timestamp_to_systemtime()` 的返回顺�
 
 用途：v0.3 起「导出 HTML 报告」把该文件**内嵌**进单个 `.html`（报告必须离线可开、可直接发同事）。
 规则：构建期不联网；升级须先校验 sha256 并同步本表与 `gui/assets/NOTICE.txt`。
+
+## 9. 开发期安装 Python 扩展（两个会让人误判的坑，已实测）
+
+一律用 `./scripts/dev_install.sh [release|debug]`，不要手敲 maturin/cargo。
+
+### 坑 1：`maturin develop` 会把产物装进 **anaconda**，而不是本仓库的 `.venv`
+* 现象：编译明明成功，`import fast_blf_core` 里却**看不到新加的 API**（`dir()` 里没有）。
+* 原因：本机 `.cargo/config.toml` 的 `PYO3_PYTHON=/opt/anaconda3/bin/python3`；
+  maturin 1.15 按该解释器安装，`.venv` 里那份**旧 .so 继续生效**（venv 的 site-packages 优先）。
+* 判定：比较两处 `.so` 的 mtime/大小
+  （`.venv/lib/python3.12/site-packages/fast_blf_core/*.so` vs
+  `/opt/anaconda3/lib/python3.12/site-packages/fast_blf_core/*.so`）。
+* 正解：构建后**显式覆盖** venv 里那份（脚本已做），并断言 `hasattr(core, "新函数")`。
+
+### 坑 2：裸 `cargo build` 不启用 `extension-module` → **import 阶段 SIGSEGV**
+* 现象：`import fast_blf_core` 直接 `Fatal Python error: Segmentation fault`，
+  faulthandler 指向 `importlib ... create_module`（模块初始化），与业务代码无关。
+* 原因：`pyproject.toml` 的 `[tool.maturin] features = ["extension-module"]` **只有 maturin 会加**；
+  裸 `cargo build` 不带该特性 → pyo3 链接 `libpython3.12.dylib`
+  → 进程里出现两套 Python 运行时 → 崩溃。
+* 判定：`otool -L <dylib> | grep -i libpython`，**必须没有输出**。
+* 正解：`cargo build --release -p fast_blf_core --features extension-module`（脚本已固化该断言）。
+
+> 另注：本机 `maturin build` 默认走 **dev(debug) profile**（输出会写 `Finished dev profile`），
+> 要 release 必须显式 `--release`。debug 版 `.so` 约 201 MB、release 约 121 MB，
+> 用体积也能一眼判断装的是哪一个。

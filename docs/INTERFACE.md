@@ -202,17 +202,25 @@ sess = fast_blf_core.open_plot_session(config, progress_cb=None)   # -> PlotSess
   * stride 由该报文首帧的 `is_fd` 决定；固定 stride 是二分查找与 `read_at` 随机访问的前提
 * 随机读取**不用 mmap、不加依赖**：`std::os::unix::fs::FileExt::read_at` /
   `std::os::windows::fs::FileExt::seek_read`（OS page cache 已足够快）。
-* 缓存键 = `blf_paths`（绝对路径 + size + mtime）+ DBC 内容哈希 + **报文集合** + 内核版本；
-  命中即**秒开**（必须实现，不得每次重建）。
-* **预算控制**：估算体积 > `cache_budget_mb` 时**不得静默退化**——必须返回 `CACHE_BUDGET_EXCEEDED`，
-  且错误消息给出：需要多少 MiB、上限多少、三个可选动作（提高上限 / 减少所选报文 / 不建缓存继续但较慢）。
+* 缓存键 = `CACHE_FORMAT_VERSION` + `blf_paths`（按路径排序的绝对路径 + size + mtime）+ DBC 内容哈希。
+  **键与"用户选了哪些报文"无关**——报文段在同一个 key 目录里**按需累积**。
+  理由：若键含报文集合，用户勾一个新信号再开预览就会整份重建（实测 187 MB 重建 3~5 s），
+  这正是用户明确反感的"重新加载"。
+* `open` 的语义：**立即返回**。已存在的段立刻可用；缺失的段转后台预取（`prefetch_status()` 可查），
+  **禁止**在 `open` 里同步等缺失段建完。`cache_hit=true` 仅当"本次需要的段全部已存在"。
+* **预算控制（两件事分开）**：
+  * **估算闸门**：本次**新增需要**的字节估算 > `cache_budget_mb` → `CACHE_BUDGET_EXCEEDED`，错误消息给出
+    需要多少 MiB、上限多少、三个可选动作（提高上限 / 减少所选报文 / 不建缓存继续但较慢）。
+    已存在的段**不计入**本次估算。
+  * **目录上限**：`cache_dir` 总字节超 `cache_budget_mb` → 按 `meta.json` 的 `created_at` 做 LRU，
+    删**其它** key（绝不删当前 key），删掉的字节数回报为 `evicted_bytes`。
 * 未被缓存的报文：`add_signals` 时进入**后台增量预取**（有进度、不冻结界面、可继续看已有信号）。
 
 ### 方法
 
 | 方法 | 返回 | 说明 |
 |---|---|---|
-| `info()` | `{t_min, t_max, t_min_str, t_max_str, files, cache_bytes, cache_hit, signals:[{channel,message,signal,unit,cached}]}` | 打开后立刻可用 |
+| `info()` | `{t_min, t_max, t_min_str, t_max_str, files, cache_bytes, cache_hit, evicted_bytes, signals:[{channel,message,signal,unit,cached,**key**}]}` | 打开后立刻可用；`key` = `"ch{channel}/{message}/{signal}"`，与 `statistics/add_signals/remove_signals` 入参完全一致 |
 | `set_time_format(fmt)` | `None` | **纯显示层**，零解码、零 I/O（≤16 ms） |
 | `add_signals(items)` | `{added:int, pending:int}` | 已缓存的立即生效；未缓存的转后台预取 |
 | `remove_signals(items)` | `{removed:int}` | 只影响绘制与统计 |

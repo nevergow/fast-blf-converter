@@ -3706,3 +3706,925 @@ fn step15_series_bench_huge_perf() {
 }
 
 
+
+// ---------------------------------------------------------------------------
+// Step 17：帧缓存 + PlotSession
+// ---------------------------------------------------------------------------
+
+const STEP17_DBC: &str = r#"VERSION ""
+
+BO_ 256 MsgA: 8 Vector__XXX
+ SG_ A : 0|16@1+ (1,0) [0|65535] "" Vector__XXX
+
+BO_ 512 MsgB: 8 Vector__XXX
+ SG_ B : 0|16@1+ (1,0) [0|65535] "" Vector__XXX
+"#;
+
+const STEP17_FRAMES: u32 = 60_000;
+const STEP17_SPIKE_FRAME: u32 = 30_000;
+const STEP17_SPIKE_VALUE: u16 = 65_000;
+
+/// 生成 Step 17 合成现场：Ch1 MsgA 每 1ms 一帧（A 的波形 + 单个尖峰），
+/// 同一时刻每 4 帧插一帧 Ch1 MsgB。返回 `(blf, dbc)`。
+fn write_step17_fixture(dir: &Path) -> (PathBuf, PathBuf) {
+    let blf = dir.join("step17.blf");
+    let dbc = dir.join("step17.dbc");
+    std::fs::write(&dbc, STEP17_DBC).expect("写入 Step 17 DBC");
+
+    let mut writer = blf_asc::BlfWriter::create(&blf).expect("创建 Step 17 BLF");
+    for i in 0..STEP17_FRAMES {
+        let timestamp = i as f64 * 0.001;
+        let value = if i == STEP17_SPIKE_FRAME {
+            STEP17_SPIKE_VALUE
+        } else {
+            ((i.wrapping_mul(37)) % 1_000) as u16
+        };
+        let mut data = vec![0u8; 8];
+        data[0..2].copy_from_slice(&value.to_le_bytes());
+        push_msg(&mut writer, 0, 0x100, timestamp, data);
+
+        if i % 4 == 0 {
+            let b = ((i / 4) % 1_000) as u16;
+            let mut data = vec![0u8; 8];
+            data[0..2].copy_from_slice(&b.to_le_bytes());
+            push_msg(&mut writer, 0, 0x200, timestamp, data);
+        }
+    }
+    writer.finish().expect("完成 Step 17 BLF");
+    (blf, dbc)
+}
+
+/// 组装 `open_plot_session` 的 config。
+fn step17_config<'py>(
+    py: Python<'py>,
+    blf: &Path,
+    dbc: &Path,
+    selected: Option<(&str, &str)>,
+    cache_dir: &Path,
+    budget_mb: u64,
+    time_format: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    let config = PyDict::new(py);
+    config.set_item("blf_paths", vec![blf.to_string_lossy().to_string()])?;
+    let mut dbc_map = HashMap::new();
+    dbc_map.insert(1u32, dbc.to_string_lossy().to_string());
+    config.set_item("dbc_by_channel", dbc_map)?;
+    let selected_map: HashMap<String, HashMap<String, Vec<String>>> = match selected {
+        Some((message, signal)) => {
+            let mut per_channel = HashMap::new();
+            per_channel.insert(message.to_string(), vec![signal.to_string()]);
+            let mut all = HashMap::new();
+            all.insert("1".to_string(), per_channel);
+            all
+        }
+        None => HashMap::new(),
+    };
+    config.set_item("selected", selected_map)?;
+    config.set_item("time_format", time_format)?;
+    config.set_item("temp_dir", cache_dir.to_string_lossy().to_string())?;
+    config.set_item("cache_dir", cache_dir.to_string_lossy().to_string())?;
+    config.set_item("cache_budget_mb", budget_mb)?;
+    Ok(config)
+}
+
+/// `view()` 的 Rust 侧投影。
+struct Step17View {
+    t: Vec<f64>,
+    series: BTreeMap<String, (Vec<f64>, Vec<f64>, Vec<f64>)>,
+}
+
+fn step17_view(dict: &Bound<'_, PyDict>) -> PyResult<Step17View> {
+    let t = dict
+        .get_item("t")?
+        .expect("view 必须含 t")
+        .cast_into::<PyList>()?
+        .iter()
+        .map(|item| item.extract::<f64>())
+        .collect::<PyResult<Vec<_>>>()?;
+    let mut series = BTreeMap::new();
+    for item in dict
+        .get_item("series")?
+        .expect("view 必须含 series")
+        .cast_into::<PyList>()?
+        .iter()
+    {
+        let dict = item.cast_into::<PyDict>()?;
+        let key: String = dict.get_item("key")?.unwrap().extract()?;
+        let list = |name: &str| -> PyResult<Vec<f64>> {
+            dict.get_item(name)?
+                .expect("series 元素缺字段")
+                .cast_into::<PyList>()?
+                .iter()
+                .map(|value| value.extract::<f64>())
+                .collect()
+        };
+        series.insert(key, (list("min")?, list("max")?, list("mean")?));
+    }
+    Ok(Step17View { t, series })
+}
+
+fn step17_cache_key_dir(cache_dir: &Path) -> PathBuf {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(cache_dir)
+        .expect("读取缓存目录")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    assert_eq!(dirs.len(), 1, "应恰好一个缓存 key 目录：{dirs:?}");
+    dirs.remove(0)
+}
+
+/// 直接逐帧解码 MsgA 的 `A` 信号（独立于缓存）。
+fn step17_direct_samples(blf: &Path, dbc: &Path) -> Vec<(f64, f64)> {
+    let mut dbc_map = BTreeMap::new();
+    dbc_map.insert(1u32, dbc.to_path_buf());
+    let plan = DecodePlan::build(&dbc_map, &Selection::default()).expect("构建直接解码计划");
+    let message = plan.lookup(1, 0x100).expect("MsgA 计划");
+    let signal = message
+        .signals
+        .iter()
+        .find(|signal| signal.name == "A")
+        .expect("A 信号");
+    let mut reader = blf_asc::BlfReader::open(blf).expect("打开 BLF 手算");
+    let mut out = Vec::new();
+    for frame in reader.by_ref() {
+        let channel = frame.channel as u32 + 1;
+        let frame_id = frame.arbitration_id.0 | if frame.is_extended_id { 1 << 31 } else { 0 };
+        if channel == 1 && frame_id == 0x100 {
+            let value = signal.decode(frame.data.as_slice()).expect("手算解码 A");
+            out.push((frame.timestamp, value));
+        }
+    }
+    out
+}
+
+/// 1）缓存一致性：缓存段逐帧解码 == 直接 BLF 解码，1e-12。
+#[test]
+fn step17_cache_matches_direct_decode_byte_for_byte() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc) = write_step17_fixture(dir.path());
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        let config = step17_config(py, &blf, &dbc, None, &cache_dir, 200, "relative_s")?;
+        let session = fast_blf_core::open_plot_session(py, &config, None)?;
+        let keys = ["ch1/MsgA/A", "ch1/MsgB/B"];
+        let added = session.add_signals(py, PyList::new(py, keys)?.as_any())?;
+        assert_eq!(added.get_item("added")?.unwrap().extract::<u64>()?, 2);
+
+        let key_dir = step17_cache_key_dir(&cache_dir);
+        let meta = fast_blf_core::frame_cache::read_meta(&key_dir).expect("读取 meta");
+        let message = meta.message(1, 0x100).expect("meta 应含 MsgA");
+        assert_eq!(message.stride, 17, "MsgA 是经典 CAN，stride=17");
+        assert_eq!(message.frames, STEP17_FRAMES as u64);
+
+        let mut dbc_map = BTreeMap::new();
+        dbc_map.insert(1u32, dbc.clone());
+        let plan = DecodePlan::build(&dbc_map, &Selection::default()).expect("构建计划");
+        let signal = plan
+            .lookup(1, 0x100)
+            .and_then(|message| message.signals.iter().find(|signal| signal.name == "A"))
+            .expect("A 信号计划");
+
+        let mut cached = Vec::new();
+        for index in 0..message.frames {
+            let record = fast_blf_core::frame_cache::read_record_at(&key_dir, message, index)?;
+            cached.push(fast_blf_core::decode_signal_bytes(
+                signal,
+                record.dlc,
+                &record.payload[..record.data_len],
+            )?);
+        }
+        let direct: Vec<f64> = step17_direct_samples(&blf, &dbc)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(cached.len(), direct.len(), "缓存帧数必须与直接解码一致");
+        for (index, (left, right)) in cached.iter().zip(direct.iter()).enumerate() {
+            assert!(
+                (left - right).abs() <= 1e-12,
+                "第 {index} 帧 cache={left} direct={right}"
+            );
+        }
+        println!(
+            "STEP17_CACHE_CONSISTENCY ok frames={} stride={} cache_bytes={}",
+            cached.len(),
+            message.stride,
+            meta.cache_bytes
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// 2）缓存命中：第二次 open 必须 `cache_hit=true`，且不重新写帧缓存。
+#[test]
+fn step17_second_open_hits_cache() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc) = write_step17_fixture(dir.path());
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        let config = step17_config(py, &blf, &dbc, None, &cache_dir, 200, "relative_s")?;
+        let first_started = std::time::Instant::now();
+        let first = fast_blf_core::open_plot_session(py, &config, None)?;
+        let first_elapsed = first_started.elapsed();
+        let first_info = first.info(py)?;
+        assert!(!first_info.get_item("cache_hit")?.unwrap().extract::<bool>()?);
+
+        let second_started = std::time::Instant::now();
+        let second = fast_blf_core::open_plot_session(py, &config, None)?;
+        let second_elapsed = second_started.elapsed();
+        let second_info = second.info(py)?;
+        assert!(
+            second_info.get_item("cache_hit")?.unwrap().extract::<bool>()?,
+            "第二次 open 必须命中缓存"
+        );
+        let first_bytes: u64 = first_info
+            .get_item("cache_bytes")?
+            .unwrap()
+            .extract()?;
+        let second_bytes: u64 = second_info
+            .get_item("cache_bytes")?
+            .unwrap()
+            .extract()?;
+        assert_eq!(first_bytes, second_bytes);
+        println!(
+            "STEP17_CACHE_HIT first={:.3}ms second={:.3}ms cache_bytes={}",
+            first_elapsed.as_secs_f64() * 1000.0,
+            second_elapsed.as_secs_f64() * 1000.0,
+            second_bytes
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// 3）预算拒绝：187MB 场景 + 32 MiB 上限 → `CACHE_BUDGET_EXCEEDED`，消息含三个动作。
+#[test]
+#[ignore = "需要扫描 187MB bench_huge.blf；用 --ignored --nocapture 单独运行"]
+fn step17_budget_rejects_bench_huge() {
+    let fixtures = repo_fixtures_dir();
+    let huge = fixtures.join("bench_huge.blf");
+    let dbc = fixtures.join("bench.dbc");
+    if !huge.exists() {
+        println!("STEP17_BUDGET_SKIP bench_huge.blf 不存在");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("临时目录");
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        let config = PyDict::new(py);
+        config.set_item("blf_paths", vec![huge.to_string_lossy().to_string()])?;
+        let mut dbc_map = HashMap::new();
+        for channel in [1u32, 2, 3] {
+            dbc_map.insert(channel, dbc.to_string_lossy().to_string());
+        }
+        config.set_item("dbc_by_channel", dbc_map)?;
+        config.set_item(
+            "selected",
+            HashMap::<String, HashMap<String, Vec<String>>>::new(),
+        )?;
+        config.set_item("time_format", "relative_s")?;
+        config.set_item("temp_dir", cache_dir.to_string_lossy().to_string())?;
+        config.set_item("cache_dir", cache_dir.to_string_lossy().to_string())?;
+        config.set_item("cache_budget_mb", 32u64)?;
+        let err = match fast_blf_core::open_plot_session(py, &config, None) {
+            Ok(_) => panic!("32 MiB 预算必须拒绝 187MB 场景"),
+            Err(err) => err,
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("CACHE_BUDGET_EXCEEDED"),
+            "错误码不对：{text}"
+        );
+        assert!(text.contains("需要 "), "缺少需要多少 MiB：{text}");
+        assert!(text.contains("上限 32 MiB"), "缺少上限：{text}");
+        assert!(text.contains("①提高上限(cache_budget_mb)"), "{text}");
+        assert!(text.contains("②减少所选报文"), "{text}");
+        assert!(text.contains("③不建缓存继续但较慢"), "{text}");
+        println!("STEP17_BUDGET_REJECT ok {text}");
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// 4）包络正确性（红线）：随机 200 个窗口，逐时间桶与暴力逐帧 min/max 比对；
+/// 并构造“窗口内只有一个尖峰”，断言尖峰进入包络。
+#[test]
+fn step17_envelope_matches_brute_force_per_bucket() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc) = write_step17_fixture(dir.path());
+    let cache_dir = dir.path().join("cache");
+    let samples = step17_direct_samples(&blf, &dbc);
+    assert_eq!(samples.len(), STEP17_FRAMES as usize);
+
+    with_python(|py| -> PyResult<()> {
+        let config = step17_config(py, &blf, &dbc, None, &cache_dir, 200, "relative_s")?;
+        let session = fast_blf_core::open_plot_session(py, &config, None)?;
+        session.add_signals(py, PyList::new(py, ["ch1/MsgA/A"])?.as_any())?;
+
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        let width = 200usize;
+        for round in 0..200 {
+            let start = next() * 55.0;
+            let span = 0.001 + next() * 4.0;
+            let t0 = start;
+            let t1 = (start + span).min(59.999);
+            if t1 <= t0 {
+                continue;
+            }
+            let view = step17_view(&session.view(py, t0, t1, width)?)?;
+            let Some((mins, maxs, _)) = view.series.get("ch1/MsgA/A") else {
+                panic!("第 {round} 轮缺 MsgA/A 曲线");
+            };
+            let bucket_span = (t1 - t0) / width as f64;
+            let mut brute: Vec<(f64, f64)> = Vec::new();
+            for bucket in 0..width {
+                let bucket_start = t0 + bucket_span * bucket as f64;
+                let bucket_next = t0 + bucket_span * (bucket + 1) as f64;
+                let mut min = f64::INFINITY;
+                let mut max = f64::NEG_INFINITY;
+                for &(t, value) in &samples {
+                    let inside = if bucket + 1 == width {
+                        t >= bucket_start && t <= bucket_next
+                    } else {
+                        t >= bucket_start && t < bucket_next
+                    };
+                    if inside {
+                        min = min.min(value);
+                        max = max.max(value);
+                    }
+                }
+                if min.is_finite() && max.is_finite() {
+                    brute.push((min, max));
+                }
+            }
+            assert_eq!(
+                mins.len(),
+                brute.len(),
+                "第 {round} 轮桶数不一致（view={} brute={}）",
+                mins.len(),
+                brute.len()
+            );
+            assert_eq!(view.t.len(), brute.len());
+            for (index, ((min, max), (brute_min, brute_max))) in
+                mins.iter().zip(maxs.iter()).zip(brute.iter()).enumerate()
+            {
+                let tolerance = 1e-5 * brute_min.abs().max(1.0);
+                assert!(
+                    (min - brute_min).abs() <= tolerance,
+                    "第 {round} 轮桶 {index} min: view={min} brute={brute_min}"
+                );
+                let tolerance = 1e-5 * brute_max.abs().max(1.0);
+                assert!(
+                    (max - brute_max).abs() <= tolerance,
+                    "第 {round} 轮桶 {index} max: view={max} brute={brute_max}"
+                );
+                assert!(min <= max, "包络 min 必须 ≤ max");
+            }
+        }
+
+        // 窗口内只有一个尖峰。
+        let spike_t = STEP17_SPIKE_FRAME as f64 * 0.001;
+        let view = step17_view(&session.view(py, spike_t - 0.01, spike_t + 0.01, 200)?)?;
+        let (_, maxs, _) = view.series.get("ch1/MsgA/A").expect("尖峰窗口缺曲线");
+        let peak = maxs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            peak >= STEP17_SPIKE_VALUE as f64 - 1e-5,
+            "尖峰必须进入包络，实际 max={peak}"
+        );
+        println!(
+            "STEP17_ENVELOPE ok windows=200 width={width} spike_peak={peak}"
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// 5）金字塔层选择 + 点数上限：200/800/2000 px 都 ≤2×width。
+#[test]
+fn step17_view_point_counts_are_bounded_by_width() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc) = write_step17_fixture(dir.path());
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        let config = step17_config(py, &blf, &dbc, None, &cache_dir, 200, "relative_s")?;
+        let session = fast_blf_core::open_plot_session(py, &config, None)?;
+        session.add_signals(py, PyList::new(py, ["ch1/MsgA/A"])?.as_any())?;
+        for width in [200usize, 800, 2000] {
+            let view = step17_view(&session.view(py, 0.0, 59.999, width)?)?;
+            let (mins, maxs, means) = view.series.get("ch1/MsgA/A").expect("缺曲线");
+            assert_eq!(mins.len(), maxs.len());
+            assert_eq!(mins.len(), means.len());
+            assert!(
+                mins.len() <= 2 * width,
+                "width={width} 返回 {} 点，超过 2×width",
+                mins.len()
+            );
+            assert_eq!(view.t.len(), mins.len(), "t 与包络数组必须等长");
+            println!(
+                "STEP17_POINT_COUNT width={width} points={} truncated={}",
+                mins.len(),
+                view.t.len()
+            );
+        }
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// 6）时间口径零成本：set_time_format 只改显示层；min/max 数组完全一致且 ≤16ms。
+#[test]
+fn step17_set_time_format_is_zero_cost_and_keeps_min_max() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc) = write_step17_fixture(dir.path());
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        let config = step17_config(py, &blf, &dbc, None, &cache_dir, 200, "relative_s")?;
+        let session = fast_blf_core::open_plot_session(py, &config, None)?;
+        session.add_signals(py, PyList::new(py, ["ch1/MsgA/A"])?.as_any())?;
+        let before = step17_view(&session.view(py, 0.0, 59.999, 500)?)?;
+        let started = std::time::Instant::now();
+        session.set_time_format("absolute")?;
+        let elapsed = started.elapsed();
+        let after = step17_view(&session.view(py, 0.0, 59.999, 500)?)?;
+        assert!(
+            elapsed.as_millis() <= 16,
+            "set_time_format 耗时 {:?}，超过 16ms",
+            elapsed
+        );
+        assert_eq!(before.t, after.t);
+        let a = before.series.get("ch1/MsgA/A").expect("before 缺曲线");
+        let b = after.series.get("ch1/MsgA/A").expect("after 缺曲线");
+        assert_eq!(a.0, b.0, "min 数组必须完全一致");
+        assert_eq!(a.1, b.1, "max 数组必须完全一致");
+        let info = session.info(py)?;
+        // 该合成 BLF 的头部墙钟为 0（BlfWriter 默认），absolute 字符串允许为 None；
+        // 真正有墙钟的夹具在 step17_timefmt_absolute_info 里单独断言。
+        let t_min_str = info
+            .get_item("t_min_str")?
+            .and_then(|value| value.extract::<String>().ok());
+        println!(
+            "STEP17_TIMEFORMAT ok set_time_format={:.3}ms points={} t_min_str={t_min_str:?}",
+            elapsed.as_secs_f64() * 1000.0,
+            a.0.len()
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// 6b）`absolute` 口径的 info 必须给出 BLF 头墙钟字符串（用 timefmt 夹具）。
+#[test]
+fn step17_timefmt_absolute_info() {
+    let fixtures = repo_fixtures_dir();
+    let blf = fixtures.join("timefmt.blf");
+    let dbc = fixtures.join("timefmt.dbc");
+    if !blf.exists() || !dbc.exists() {
+        println!("STEP17_TIMEFMT_SKIP 缺少 timefmt 夹具");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("临时目录");
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        let config = step17_config(py, &blf, &dbc, None, &cache_dir, 200, "absolute")?;
+        let session = fast_blf_core::open_plot_session(py, &config, None)?;
+        let info = session.info(py)?;
+        let t_min_str: String = info
+            .get_item("t_min_str")?
+            .expect("absolute 必须给 t_min_str")
+            .extract()?;
+        let t_max_str: String = info
+            .get_item("t_max_str")?
+            .expect("absolute 必须给 t_max_str")
+            .extract()?;
+        assert_eq!(t_min_str, "2025-10-16 14:10:00.123456");
+        assert_eq!(t_max_str, "2025-10-16 14:10:01.123456");
+        println!("STEP17_TIMEFMT_ABSOLUTE ok {t_min_str} -> {t_max_str}");
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// 7）增量预取：初始只缓存 MsgA；add MsgB 后 pending>0，后台完成后 view 能出 B。
+#[test]
+fn step17_incremental_prefetch_makes_new_message_available() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc) = write_step17_fixture(dir.path());
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        let config = step17_config(
+            py,
+            &blf,
+            &dbc,
+            Some(("MsgA", "A")),
+            &cache_dir,
+            200,
+            "relative_s",
+        )?;
+        let session = fast_blf_core::open_plot_session(py, &config, None)?;
+        let a = session.add_signals(py, PyList::new(py, ["ch1/MsgA/A"])?.as_any())?;
+        assert_eq!(a.get_item("pending")?.unwrap().extract::<u64>()?, 0);
+        let b = session.add_signals(py, PyList::new(py, ["ch1/MsgB/B"])?.as_any())?;
+        let pending: u64 = b.get_item("pending")?.unwrap().extract()?;
+        assert!(pending > 0, "未缓存报文必须返回 pending>0");
+
+        let mut waited_ms = 0u64;
+        loop {
+            let status = session.prefetch_status(py)?;
+            let busy: bool = status.get_item("busy")?.unwrap().extract()?;
+            if !busy {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            waited_ms += 10;
+            assert!(waited_ms < 10_000, "后台预取超时");
+        }
+
+        let info = session.info(py)?;
+        let signals = info
+            .get_item("signals")?
+            .expect("info 必须含 signals")
+            .cast_into::<PyList>()?;
+        let mut b_cached = false;
+        for item in signals.iter() {
+            let dict = item.cast_into::<PyDict>()?;
+            let message: String = dict.get_item("message")?.unwrap().extract()?;
+            if message == "MsgB" {
+                b_cached = dict.get_item("cached")?.unwrap().extract()?;
+            }
+        }
+        assert!(b_cached, "预取完成后 info 应把 MsgB 标为 cached");
+
+        let view = step17_view(&session.view(py, 0.0, 59.999, 500)?)?;
+        let b_series = view.series.get("ch1/MsgB/B").expect("预取后 view 应含 B");
+        assert!(!b_series.0.is_empty(), "预取后 B 的包络不能为空");
+        println!(
+            "STEP17_PREFETCH ok pending={pending} waited={waited_ms}ms b_points={}",
+            b_series.0.len()
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// 性能自证（`--ignored`）：
+/// `cargo test --release -p fast_blf_core --test e2e_synthetic -- --ignored --nocapture step17_plot_session_perf`
+#[test]
+#[ignore = "性能自证：需 release + 187MB bench_huge，手动 --ignored --nocapture"]
+fn step17_plot_session_perf() {
+    let fixtures = repo_fixtures_dir();
+    let huge = fixtures.join("bench_huge.blf");
+    let large = fixtures.join("bench_large.blf");
+    let blf = if huge.exists() { huge } else { large };
+    let dbc = fixtures.join("bench.dbc");
+    assert!(blf.exists(), "缺少 bench_huge.blf / bench_large.blf");
+    assert!(dbc.exists(), "缺少 bench.dbc");
+    let source_bytes = std::fs::metadata(&blf).map(|meta| meta.len()).unwrap_or(0);
+    let dir = tempfile::tempdir().expect("临时目录");
+    let cache_dir = dir.path().join("cache");
+    with_python(|py| -> PyResult<()> {
+        let config = PyDict::new(py);
+        config.set_item("blf_paths", vec![blf.to_string_lossy().to_string()])?;
+        let mut dbc_map = HashMap::new();
+        for channel in [1u32, 2, 3] {
+            dbc_map.insert(channel, dbc.to_string_lossy().to_string());
+        }
+        config.set_item("dbc_by_channel", dbc_map)?;
+        config.set_item(
+            "selected",
+            HashMap::<String, HashMap<String, Vec<String>>>::new(),
+        )?;
+        config.set_item("time_format", "relative_s")?;
+        config.set_item("temp_dir", cache_dir.to_string_lossy().to_string())?;
+        config.set_item("cache_dir", cache_dir.to_string_lossy().to_string())?;
+        config.set_item("cache_budget_mb", 200u64)?;
+
+        let first_started = std::time::Instant::now();
+        let first = fast_blf_core::open_plot_session(py, &config, None)?;
+        let first_elapsed = first_started.elapsed();
+        let info = first.info(py)?;
+        let cache_bytes: u64 = info.get_item("cache_bytes")?.unwrap().extract()?;
+        let cache_hit: bool = info.get_item("cache_hit")?.unwrap().extract()?;
+        assert!(!cache_hit, "首次 open 不能是 cache_hit");
+        let t_max: f64 = info.get_item("t_max")?.unwrap().extract()?;
+
+        let second_started = std::time::Instant::now();
+        let second = fast_blf_core::open_plot_session(py, &config, None)?;
+        let second_elapsed = second_started.elapsed();
+        let second_info = second.info(py)?;
+        let second_hit: bool = second_info.get_item("cache_hit")?.unwrap().extract()?;
+        assert!(second_hit, "第二次 open 必须 cache_hit=true");
+
+        // 8 条已缓存信号（同一报文）；测 add_signals 与金字塔内存。
+        let keys: Vec<String> = (0..8).map(|index| format!("ch1/MSG_100/Sig{index}")).collect();
+        let add_started = std::time::Instant::now();
+        let added = second.add_signals(py, PyList::new(py, &keys)?.as_any())?;
+        let add_elapsed = add_started.elapsed();
+        assert_eq!(added.get_item("pending")?.unwrap().extract::<u64>()?, 0);
+        let info_after = second.info(py)?;
+        let pyramid_bytes: u64 = info_after
+            .get_item("pyramid_bytes")?
+            .unwrap()
+            .extract()?;
+        // bench_huge 的 MSG_100 每信号 200_000 个采样点（per_channel_id 1:256 = 200000）。
+        let per_signal_samples: u64 = 200_000;
+
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        let mut durations: Vec<f64> = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let a = next() * t_max.max(0.001);
+            let b = next() * t_max.max(0.001);
+            let (t0, t1) = if a <= b { (a, b) } else { (b, a) };
+            let started = std::time::Instant::now();
+            let view = second.view(py, t0, t1, 2000)?;
+            durations.push(started.elapsed().as_secs_f64() * 1000.0);
+            let parsed = step17_view(&view)?;
+            assert!(!parsed.series.is_empty(), "性能窗口必须至少有一条曲线");
+        }
+        durations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let p50 = durations.get(durations.len() / 2).copied().unwrap_or(0.0);
+        let p95 = durations
+            .get((durations.len() as f64 * 0.95) as usize)
+            .copied()
+            .unwrap_or(0.0);
+        let max = durations.last().copied().unwrap_or(0.0);
+
+        let fmt_started = std::time::Instant::now();
+        second.set_time_format("absolute")?;
+        let fmt_elapsed = fmt_started.elapsed();
+
+        let ratio = if second_elapsed.as_secs_f64() > 0.0 {
+            first_elapsed.as_secs_f64() / second_elapsed.as_secs_f64()
+        } else {
+            f64::INFINITY
+        };
+        println!("=== Step 17 PlotSession 性能自证 ===");
+        println!(
+            "文件              : {} ({} 字节)",
+            blf.display(),
+            source_bytes
+        );
+        println!(
+            "首次 open 建缓存  : {:.3} ms, cache_bytes={} ({:.1} MiB), 缓存/源={:.3}",
+            first_elapsed.as_secs_f64() * 1000.0,
+            cache_bytes,
+            cache_bytes as f64 / (1024.0 * 1024.0),
+            if source_bytes == 0 {
+                0.0
+            } else {
+                cache_bytes as f64 / source_bytes as f64
+            }
+        );
+        println!(
+            "缓存命中二次 open : {:.3} ms (cache_hit={}), 首次/二次={:.1}×",
+            second_elapsed.as_secs_f64() * 1000.0,
+            second_hit,
+            ratio
+        );
+        println!(
+            "add_signals(8 条) : {:.3} ms, pyramid_bytes={} ({:.3} MiB), 每 1M 采样≈{:.3} MiB/信号",
+            add_elapsed.as_secs_f64() * 1000.0,
+            pyramid_bytes,
+            pyramid_bytes as f64 / (1024.0 * 1024.0),
+            pyramid_bytes as f64 / (8.0 * per_signal_samples as f64) * 1_000_000.0
+                / (1024.0 * 1024.0)
+        );
+        println!(
+            "100 次 view(2000px): p50={:.3} ms p95={:.3} ms max={:.3} ms",
+            p50, p95, max
+        );
+        println!(
+            "set_time_format   : {:.3} ms",
+            fmt_elapsed.as_secs_f64() * 1000.0
+        );
+
+        assert!(
+            second_elapsed.as_millis() <= 300,
+            "缓存命中 open 必须 ≤300ms，实际 {:?}",
+            second_elapsed
+        );
+        assert!(p95 <= 30.0, "view p95 必须 ≤30ms，实际 {p95:.3}ms");
+        assert!(
+            add_elapsed.as_millis() <= 100,
+            "已缓存 add_signals 必须 ≤100ms，实际 {:?}",
+            add_elapsed
+        );
+        assert!(
+            fmt_elapsed.as_millis() <= 16,
+            "set_time_format 必须 ≤16ms，实际 {:?}",
+            fmt_elapsed
+        );
+        assert!(ratio >= 10.0, "首次/二次 open 必须 ≥10×，实际 {ratio:.1}×");
+        Ok(())
+    })
+    .expect("性能自证断言失败");
+}
+
+/// 8）建缓存进度：phase=1、stage="cache"、done/total 文件维度、frames_done 单调。
+#[test]
+fn step17_cache_progress_uses_cache_stage_and_monotonic_frames() {
+    use std::sync::Mutex;
+
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc) = write_step17_fixture(dir.path());
+    let cache_dir = dir.path().join("cache");
+    let mut dbc_map = BTreeMap::new();
+    dbc_map.insert(1u32, dbc);
+    let config = fast_blf_core::plot_session::SessionConfig {
+        blf_paths: vec![blf],
+        dbc_by_channel: dbc_map,
+        selection: Selection::default(),
+        time_format: fast_blf_core::TimeFormat::RelativeS,
+        cache_dir,
+        cache_budget_mb: 200,
+    };
+    let events: Mutex<Vec<Progress>> = Mutex::new(Vec::new());
+    let session =
+        fast_blf_core::plot_session::open_session(config, &|payload: Progress| {
+            events.lock().expect("进度事件锁").push(payload);
+        })
+        .expect("打开会话");
+    drop(session);
+
+    let events = events.into_inner().expect("取出进度事件");
+    assert!(!events.is_empty(), "建缓存必须产生进度事件");
+    let mut previous_frames = 0u64;
+    for (index, event) in events.iter().enumerate() {
+        assert_eq!(event.phase, 1, "第 {index} 个事件 phase 错误：{event:?}");
+        assert_eq!(
+            event.stage, "cache",
+            "第 {index} 个事件 stage 必须是 cache：{event:?}"
+        );
+        assert!(event.done <= event.total, "done > total：{event:?}");
+        assert!(
+            event.frames_done >= previous_frames,
+            "frames_done 必须单调：{event:?}"
+        );
+        previous_frames = event.frames_done;
+    }
+    let last = events.last().expect("至少一个事件");
+    assert_eq!(last.done, 1, "文件完成时 done 必须为 1");
+    assert_eq!(last.total, 1, "文件维度 total 必须为 1");
+    assert!(last.frames_done >= STEP17_FRAMES as u64);
+    println!(
+        "STEP17_CACHE_PROGRESS ok events={} frames_done={}",
+        events.len(),
+        last.frames_done
+    );
+}
+
+/// 9）CAN FD 段：报文首帧经典、后续出现 FD 时按 73 字节段写入，值仍逐帧一致。
+#[test]
+fn step17_fd_message_uses_73_byte_stride_and_round_trips() {
+    let fixtures = repo_fixtures_dir();
+    let blf = fixtures.join("multi_channel.blf");
+    let dbc = fixtures.join("demo.dbc");
+    assert!(blf.exists() && dbc.exists(), "缺少 multi_channel 夹具");
+    let dir = tempfile::tempdir().expect("临时目录");
+    let cache_dir = dir.path().join("cache");
+
+    let mut dbc_map = BTreeMap::new();
+    dbc_map.insert(2u32, dbc.clone());
+    let mut per_channel = HashMap::new();
+    per_channel.insert("Insulation".to_string(), Vec::<String>::new());
+    let mut selection = Selection::default();
+    selection.channels.insert(2, per_channel);
+
+    let config = fast_blf_core::plot_session::SessionConfig {
+        blf_paths: vec![blf.clone()],
+        dbc_by_channel: dbc_map.clone(),
+        selection: selection.clone(),
+        time_format: fast_blf_core::TimeFormat::RelativeS,
+        cache_dir: cache_dir.clone(),
+        cache_budget_mb: 200,
+    };
+    let session = fast_blf_core::plot_session::open_session(config, &|_p| {}).expect("打开会话");
+    drop(session);
+
+    let key_dir = step17_cache_key_dir(&cache_dir);
+    let meta = fast_blf_core::frame_cache::read_meta(&key_dir).expect("读取 meta");
+    let message = meta.message(2, 0x200).expect("meta 应含 Insulation");
+    assert_eq!(message.stride, 73, "出现 FD 帧后必须用 73 字节段");
+    assert!(message.is_fd);
+    assert_eq!(message.frames, 5);
+
+    let plan = DecodePlan::build(&dbc_map, &selection).expect("构建计划");
+    let signal = plan
+        .lookup(2, 0x200)
+        .and_then(|message| message.signals.iter().find(|signal| signal.name == "Res"))
+        .expect("Res 信号");
+    let mut cached = Vec::new();
+    for index in 0..message.frames {
+        let record = fast_blf_core::frame_cache::read_record_at(&key_dir, message, index)
+            .expect("读取 FD 缓存记录");
+        cached.push(
+            fast_blf_core::decode_signal_bytes(
+                signal,
+                record.dlc,
+                &record.payload[..record.data_len],
+            )
+            .expect("解码 FD 缓存记录"),
+        );
+    }
+    let mut direct = Vec::new();
+    let mut reader = blf_asc::BlfReader::open(&blf).expect("打开 BLF");
+    for frame in reader.by_ref() {
+        let channel = frame.channel as u32 + 1;
+        let frame_id = frame.arbitration_id.0 | if frame.is_extended_id { 1 << 31 } else { 0 };
+        if channel == 2 && frame_id == 0x200 {
+            direct.push(signal.decode(frame.data.as_slice()).expect("直接解码 FD 帧"));
+        }
+    }
+    assert_eq!(cached, direct, "FD 段逐帧值必须与直接解码一致");
+    println!(
+        "STEP17_FD ok stride={} frames={} values={:?}",
+        message.stride, message.frames, cached
+    );
+}
+
+/// 10）stats 用全量 f64 原始数据；remove_signals 只影响绘制。
+#[test]
+fn step17_stats_are_full_precision_and_remove_stops_drawing() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc) = write_step17_fixture(dir.path());
+    let cache_dir = dir.path().join("cache");
+    let samples = step17_direct_samples(&blf, &dbc);
+    let direct_count = samples.len() as u64;
+    let direct_min = samples
+        .iter()
+        .map(|(_, value)| *value)
+        .fold(f64::INFINITY, f64::min);
+    let direct_max = samples
+        .iter()
+        .map(|(_, value)| *value)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let direct_sum: f64 = samples.iter().map(|(_, value)| *value).sum();
+
+    with_python(|py| -> PyResult<()> {
+        let config = step17_config(py, &blf, &dbc, None, &cache_dir, 200, "relative_s")?;
+        let session = fast_blf_core::open_plot_session(py, &config, None)?;
+        session.add_signals(py, PyList::new(py, ["ch1/MsgA/A"])?.as_any())?;
+        let stats = session.stats(py, PyList::new(py, ["ch1/MsgA/A"])?.as_any())?;
+        let dict = stats.get_item(0)?.cast_into::<PyDict>()?;
+        let count: u64 = dict.get_item("count")?.unwrap().extract()?;
+        let vmin: f64 = dict.get_item("vmin")?.unwrap().extract()?;
+        let vmax: f64 = dict.get_item("vmax")?.unwrap().extract()?;
+        let mean: f64 = dict.get_item("mean")?.unwrap().extract()?;
+        assert_eq!(count, direct_count);
+        assert_eq!(vmin, direct_min);
+        assert_eq!(vmax, direct_max);
+        assert!((mean - direct_sum / direct_count as f64).abs() <= 1e-12);
+
+        let removed = session.remove_signals(py, PyList::new(py, ["ch1/MsgA/A"])?.as_any())?;
+        assert_eq!(removed.get_item("removed")?.unwrap().extract::<u64>()?, 1);
+        let view = step17_view(&session.view(py, 0.0, 59.999, 500)?)?;
+        assert!(view.series.is_empty(), "移除后不应再绘制该信号");
+        println!(
+            "STEP17_STATS ok count={count} vmin={vmin} vmax={vmax} mean={mean} removed={removed:?}"
+        );
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
+
+/// 11）export_html：单文件、离线自包含、≤8 MiB。
+#[test]
+fn step17_export_html_is_self_contained() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let (blf, dbc) = write_step17_fixture(dir.path());
+    let cache_dir = dir.path().join("cache");
+    let html = dir.path().join("report.html");
+    with_python(|py| -> PyResult<()> {
+        let config = step17_config(py, &blf, &dbc, None, &cache_dir, 200, "relative_s")?;
+        let session = fast_blf_core::open_plot_session(py, &config, None)?;
+        session.add_signals(py, PyList::new(py, ["ch1/MsgA/A"])?.as_any())?;
+        let result = session.export_html(py, html.to_string_lossy().as_ref(), "Step 17 测试报告")?;
+        let ok: bool = result.get_item("ok")?.unwrap().extract()?;
+        let bytes: u64 = result.get_item("bytes")?.unwrap().extract()?;
+        assert!(ok);
+        assert!(bytes > 0);
+        assert!(bytes <= 8 * 1024 * 1024);
+        let text = std::fs::read_to_string(&html).expect("读取 HTML");
+        assert!(text.starts_with("<!DOCTYPE html>"));
+        assert!(text.contains("<script>"));
+        assert!(text.contains("Step 17 测试报告"));
+        assert!(!text.contains("http://"), "HTML 不得引用 CDN");
+        assert!(!text.contains("https://"), "HTML 不得引用 CDN");
+        assert_eq!(text.len() as u64, bytes);
+        println!("STEP17_EXPORT_HTML ok bytes={bytes}");
+        Ok(())
+    })
+    .expect("Python 侧断言失败");
+}
