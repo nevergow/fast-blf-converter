@@ -220,13 +220,13 @@ sess = fast_blf_core.open_plot_session(config, progress_cb=None)   # -> PlotSess
 
 | 方法 | 返回 | 说明 |
 |---|---|---|
-| `info()` | `{t_min, t_max, t_min_str, t_max_str, files, cache_bytes, cache_hit, evicted_bytes, signals:[{channel,message,signal,unit,cached,**key**}]}` | 打开后立刻可用；`key` = `"ch{channel}/{message}/{signal}"`，与 `statistics/add_signals/remove_signals` 入参完全一致 |
+| `info()` | `{t_min, t_max, t_min_str, t_max_str, files, cache_bytes, cache_hit, evicted_bytes, prefetch_busy, pyramid_bytes, pyramid_budget_bytes, warnings:[str], signals:[{channel,message,signal,unit,cached,**key**}]}` | 打开后立刻可用；`key` = `"ch{channel}/{message}/{signal}"`，与 `statistics/add_signals/remove_signals` 入参完全一致。`pyramid_bytes` 是当前常驻金字塔字节数（受 `pyramid_budget_bytes` 限，默认 256 MiB，超限按 LRU 淘汰并计入 `warnings`） |
 | `set_time_format(fmt)` | `None` | **纯显示层**，零解码、零 I/O（≤16 ms） |
 | `add_signals(items)` | `{added:int, pending:int}` | 已缓存的立即生效；未缓存的转后台预取 |
 | `remove_signals(items)` | `{removed:int}` | 只影响绘制与统计 |
 | `prefetch_status()` | `{busy, done, total, message}` | 供界面显示 |
-| `view(t0, t1, width_px)` | `{t:[float], series:[{key, min:[], max:[], mean:[]}], truncated:bool}` | **只返回该窗口**的 min/max 包络，每信号点数 ≤ `2*width_px`，桶数由 `width_px` 决定 |
-| `stats(keys)` | `[{key, count, vmin, vmax, mean, first, last}]` | 全量原始数据口径 |
+| `view(t0, t1, width_px)` | `{t:[float], series:[{key, min:[], max:[], mean:[]}], truncated:bool}` | **只返回该窗口**的 min/max 包络，每信号点数 ≤ `2*width_px`，桶数由 `width_px` 决定。`truncated` **只表示真正缺数据**（后台预取未完成或读盘/解码出错），"信号本身稀疏"不算截断 |
+| `stats(keys)` | `[{key, count, vmin, vmax, mean, first, last, pending}]` | 全量原始数据口径。**未知 key → `BAD_CONFIG` 并点名**；已知但尚未就绪 → `count=0, pending=true` 占位，**绝不静默少返回**（调用方可按位置对齐） |
 | `export_html(path, title)` | `{ok, bytes}` | 复用缓存，秒级；单文件离线可开 |
 | `close()` | `None` | 释放句柄；缓存文件保留供下次复用（受预算 LRU 管理） |
 
