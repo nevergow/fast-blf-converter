@@ -13,6 +13,7 @@
 """
 
 from pathlib import Path
+import sys
 
 # ------------------------------------------------------------------ 路径定位 --
 # ``SPECPATH`` 由 PyInstaller 在执行 spec 前注入。不同版本/调用方式下它可能是
@@ -72,6 +73,15 @@ a = Analysis(
 pyz = PYZ(a.pure)
 
 
+# ---------------------------------------------------------------------- 图标 --
+# exe 资源图标（Windows 任务栏/资源管理器显示的那一张）。源图只有 gui/assets/icon.png，
+# .ico 由 scripts/make_icons.py 生成并随仓库提交，打包期只做引用、不做转换（不引入 Pillow）。
+# macOS 的 onedir 产物不是 .app，Dock 图标由 gui/main.py 的 apply_app_icon() 在运行时设，
+# 因此这里只在 Windows 上给 icon=（其他平台传 .ico 会被 PyInstaller 警告或忽略）。
+_ICON_ICO = ROOT / "packaging" / "icon.ico"
+_EXE_ICON = str(_ICON_ICO) if sys.platform == "win32" and _ICON_ICO.is_file() else None
+
+
 # ------------------------------------------------------------------ 可执行体 --
 exe = EXE(
     pyz,
@@ -89,6 +99,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=_EXE_ICON,  # Windows exe 图标；其他平台为 None（详见上面「图标」一节）
 )
 
 

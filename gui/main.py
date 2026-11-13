@@ -36,8 +36,8 @@ from PySide6.QtCore import (
     QModelIndex, QObject, QSortFilterProxyModel, QThread, QTimer, Qt, QUrl, Signal,
 )
 from PySide6.QtGui import (
-    QAction, QColor, QDesktopServices, QFont, QFontDatabase, QPixmap, QStandardItem,
-    QStandardItemModel,
+    QAction, QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QPixmap,
+    QStandardItem, QStandardItemModel,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
@@ -203,6 +203,44 @@ def resolve_theme_path() -> Path:
 
 
 THEME_PATH = resolve_theme_path()
+
+
+def resolve_icon_path() -> Path:
+    """定位窗口图标 ``gui/assets/icon.png``：``FBLF_ICON`` 环境变量 > 资源根下 ``gui/assets``。
+
+    与 :func:`resolve_theme_path` 共用 :func:`_resource_roots`：spec 的 ``datas`` 把
+    ``gui/assets`` 原样放进产物的 ``gui/assets``，所以开发态与冻结态的**相对路径一致**，
+    不需要分支。``gui/assets/icon.png`` 由 ``scripts/make_icons.py`` 从设计稿生成，是
+    唯一图标源（.ico / .icns 是同一次生成的派生物）。
+    """
+    override = os.environ.get("FBLF_ICON")
+    candidates: list[Path] = []
+    if override:
+        candidates.append(Path(override).expanduser())
+    for root in _resource_roots():
+        candidates.append(root / "gui" / "assets" / "icon.png")  # spec datas 目标目录
+        candidates.append(root / "assets" / "icon.png")         # 扁平布局兜底
+    for path in candidates:
+        if path.is_file():
+            return path
+    return candidates[0]
+
+
+ICON_PATH = resolve_icon_path()
+
+
+def apply_app_icon(app: QApplication) -> bool:
+    """设应用图标（窗口 / 任务栏 / macOS Dock 都取这一份），返回是否加载成功。
+
+    图标缺失只记日志不抛：它影响观感不影响功能，绝不该拦住启动。
+    """
+    icon = QIcon(str(ICON_PATH))
+    if icon.isNull():
+        logger.warning("[GUI] 未能加载窗口图标 %s（不影响启动）", ICON_PATH)
+        return False
+    app.setWindowIcon(icon)
+    logger.info("[GUI] 窗口图标已加载：%s", ICON_PATH)
+    return True
 
 
 # ------------------------------------------------------------------- 小工具 --
@@ -4626,9 +4664,13 @@ def _main_impl(argv: list[str] | None = None) -> int:
     plot_perf = "--selftest-plot-perf" in args[1:]
     dump_target = _dump_target(args[1:])
     app = QApplication.instance() or QApplication(args)
+    # QApplication.instance() 的静态返回类型是 QCoreApplication|QApplication，收窄一次，
+    # 后面 setWindowIcon / setStyleSheet 这类 QApplication 专有 API 的类型检查才干净。
+    assert isinstance(app, QApplication), "QApplication 构造失败"
     app.setApplicationName("Fast BLF Converter")
     app.setApplicationDisplayName("Fast BLF Converter")
     app.setStyle("Fusion")
+    apply_app_icon(app)  # 窗口 / 任务栏 / Dock 图标（gui/assets/icon.png）
     font = _ui_font()
     font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias); app.setFont(font)
     load_theme(app)

@@ -94,6 +94,7 @@ jobs:
           $dir = "dist\FastBLFConverter"
           if (-not (Test-Path "$dir\FastBLFConverter.exe")) { throw "产物里没有 exe" }
           if (-not (Test-Path "$dir\_internal\gui\theme.qss")) { throw "主题资源未打进包（_internal/gui/theme.qss 缺失）" }
+          if (-not (Test-Path "$dir\_internal\gui\assets\icon.png")) { throw "图标资源未打进包（_internal/gui/assets/icon.png 缺失）" }
           $out = Join-Path $env:TEMP "selftest.out"
           $err = Join-Path $env:TEMP "selftest.err"
           $p = Start-Process -FilePath "$dir\FastBLFConverter.exe" -ArgumentList "--selftest" `
