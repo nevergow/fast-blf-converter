@@ -268,21 +268,6 @@ build_windows_portable.bat
 ## 变更历史
 
 <details>
-<summary><b>v0.4.2</b> —— 应用图标接入（窗口 / 任务栏 / exe）+ README 改版；无功能改动</summary>
-
-## v0.4.2 更新（应用图标 + README 改版）
-
-> 完整说明见 [`docs/releases/v0.4.2.md`](docs/releases/v0.4.2.md)。
-
-* **程序图标接入**：图标源 `gui/assets/icon.png` 由 `scripts/make_icons.py` 派生出运行期图标、
-  Windows exe 资源（16→256 共 7 档）与 macOS icns；≤32px 用「以红色 FBC 块为中心的紧凑裁切」
-* **README 重写**：一句话定义 → 术语白话解释 → 痛点对照表 → 三步用起来 → 常见问题 → 已知限制，
-  技术章节整体后移，四个历史版本的说明原文折叠保留
-* 命令行参数、`scan()` / `convert()` 契约、配置预设、DBC 绑定方式**无任何变化**
-
-</details>
-
-<details>
 <summary><b>v0.4.1</b> —— 修掉「转到 70% 静默闪退」；预览缩放/读数重做；日志落盘</summary>
 
 ## v0.4.1 更新（**修掉 70% 静默闪退** + 预览交互重做 + 日志落盘）
