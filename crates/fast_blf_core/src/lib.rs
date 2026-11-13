@@ -7,9 +7,10 @@
 //! 注意：本 crate 的 `extension-module` 是可选 feature，`cargo test` 不启用它。
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use pyo3::prelude::*;
@@ -42,9 +43,95 @@ pub use error::{
     EXPORT_INTERNAL, NO_DBC_FOR_CHANNEL,
 };
 pub use exporter::{
-    catch_export_panic, export, ExportFormat, ExportOptions, ExportPanicContext, ExportReport,
-    FillPolicy, TableResult, TimeFormat,
+    catch_export_panic, export, export_with_runtime, ExportFormat, ExportOptions,
+    ExportPanicContext, ExportReport, ExportRuntime, FillPolicy, TableResult, TimeFormat,
 };
+
+// ---------------------------------------------------------------------------
+// 导出日志 / panic 钩子
+// ---------------------------------------------------------------------------
+
+/// `log_path` 只设置一次（OnceLock）；`None` 时 hook 不写文件，只保留原 stderr 行为。
+static PANIC_LOG_PATH: OnceLock<String> = OnceLock::new();
+/// 全局 panic hook 只装一次，避免多次 import / 多次 convert 叠加。
+static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
+
+/// 追加一行带 ISO8601 时间戳的日志；任何 I/O 失败都静默忽略（日志不能反过来搞崩导出）。
+pub(crate) fn append_log_line(path: &Path, message: &str) {
+    use std::io::Write;
+    let line = format!(
+        "[{}] {message}\n",
+        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ")
+    );
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(line.as_bytes());
+        let _ = file.flush();
+    }
+}
+
+/// 记录 `log_path`（仅首次生效）并安装 panic hook。
+///
+/// hook 把 `thread / location / file / line / message` 追加进同一日志文件，然后
+/// 继续调用原 hook（stderr 行为不变）。未设置 `log_path` 时只走原 hook。
+fn configure_export_log(log_path: Option<&str>) {
+    if let Some(path) = log_path {
+        if !path.is_empty() {
+            let _ = PANIC_LOG_PATH.set(path.to_string());
+        }
+    }
+    if PANIC_HOOK_INSTALLED.set(()).is_err() {
+        return;
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(path) = PANIC_LOG_PATH.get() {
+            let thread = std::thread::current()
+                .name()
+                .unwrap_or("<unnamed>")
+                .to_string();
+            let (file, line, column) = info
+                .location()
+                .map(|location| {
+                    (
+                        location.file().to_string(),
+                        location.line().to_string(),
+                        location.column().to_string(),
+                    )
+                })
+                .unwrap_or_else(|| ("<unknown>".to_string(), "0".to_string(), "0".to_string()));
+            let message = panic_payload_text(info.payload());
+            append_log_line(
+                Path::new(path),
+                &format!(
+                    "panic thread={thread} location={file}:{line}:{column} \
+                     file={file} line={line} message={message}"
+                ),
+            );
+        }
+        previous(info);
+    }));
+}
+
+/// 从 panic payload 取出可读文本（截断到 500 字符，避免日志爆量）。
+fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String {
+    let raw = if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "(非字符串 panic payload)".to_string()
+    };
+    const MAX_CHARS: usize = 500;
+    if raw.chars().count() > MAX_CHARS {
+        raw.chars().take(MAX_CHARS).collect::<String>() + "…（已截断）"
+    } else {
+        raw
+    }
+}
 
 // Python 侧异常类名必须是 `CoreError`（见 INTERFACE.md §4），但 Rust 结构体已占用该名字，
 // 故 PyO3 异常类型取名 `CoreErrorPy`，注册时用字符串 "CoreError" 暴露给 Python。
@@ -77,6 +164,8 @@ pub struct ProgressThrottle {
     last_phase: AtomicU8,
     /// 回调异常等非致命告警，任务结束后并入 `warnings`。
     warnings: Mutex<Vec<String>>,
+    /// 用户取消标志：回调抛"取消"类异常时置位，phase 2 在行块边界检查。
+    cancel: Arc<AtomicBool>,
     /// 已完成的文件数（phase 1）。
     files_done: AtomicU64,
     /// 文件总数（phase 1）。
@@ -91,9 +180,15 @@ impl ProgressThrottle {
             last_emit: Mutex::new(None),
             last_phase: AtomicU8::new(0),
             warnings: Mutex::new(Vec::new()),
+            cancel: Arc::new(AtomicBool::new(false)),
             files_done: AtomicU64::new(0),
             files_total,
         }
+    }
+
+    /// 取消标志（共享给 exporter，在 phase 2 行块边界检查）。
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel)
     }
 
     /// 解码/扫描热路径事件：先做文件维度映射，再按 50ms 节流。
@@ -197,10 +292,16 @@ impl ProgressThrottle {
             Ok(())
         });
         if let Err(err) = called {
+            let message = format!("进度回调异常（已忽略）：{err}");
+            let lowered = message.to_ascii_lowercase();
+            if lowered.contains("cancel") || message.contains("取消") {
+                // 用户取消：置位 AtomicBool，phase 2 在行块边界中止并返回"已取消"。
+                self.cancel.store(true, Ordering::SeqCst);
+            }
             self.warnings
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
-                .push(format!("进度回调异常（已忽略）：{err}"));
+                .push(message);
         }
     }
 }
@@ -581,6 +682,9 @@ pub fn convert<'py>(
     let temp_dir: String = config_required(config, "temp_dir")?;
     let excel_row_limit: u64 = config_optional(config, "excel_row_limit", 1_000_000)?;
     let memory_budget_mb: u64 = config_optional(config, "memory_budget_mb", 1536)?;
+    // 新增可选字段：缺省 None → 不写任何日志，行为与旧版完全一致。
+    let log_path_raw: Option<String> = config_optional(config, "log_path", None)?;
+    configure_export_log(log_path_raw.as_deref());
     // Step 14：填充策略与最大保持时长。
     // `fill_policy` 未显式给出时按路径取默认；`ffill` 是兼容别名（true ⇔ 显式 hold）。
     let fill_policy_raw: Option<String> = config_optional(config, "fill_policy", None)?;
@@ -763,6 +867,8 @@ pub fn convert<'py>(
         let warnings: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
         // Phase 1：rayon 并行解码；工作线程在解码循环内部直接发进度（不再 no-op）。
+        // 每个文件单独 catch_unwind：panic 记日志并落进 errors[]，绝不让 PyO3 看到
+        // `PanicException` 穿透整个 convert。
         let results: Vec<Result<FileStat, CoreError>> = paths
             .par_iter()
             .map(|path| {
@@ -770,7 +876,27 @@ pub fn convert<'py>(
                 let emit = move |payload: Progress| {
                     throttle.emit_decode(payload);
                 };
-                process_file(path, &plan, &sink, mem_budget, &emit)
+                match catch_unwind(AssertUnwindSafe(|| {
+                    process_file(path, &plan, &sink, mem_budget, &emit)
+                })) {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        let text = panic_payload_text(payload.as_ref());
+                        if let Some(log_path) = PANIC_LOG_PATH.get() {
+                            append_log_line(
+                                Path::new(log_path),
+                                &format!(
+                                    "phase1 panic file={} message={text}",
+                                    path.display()
+                                ),
+                            );
+                        }
+                        Err(CoreError::export_internal(format!(
+                            "解码阶段 panic（{}）：{text}",
+                            path.display()
+                        )))
+                    }
+                }
             })
             .collect();
 
@@ -819,7 +945,12 @@ pub fn convert<'py>(
         // 全局限在解码期原子统计完成，这里回填后交给 exporter，绝不在导出期重算。
         let mut export_opts = opts.clone();
         export_opts.global_min = sink.global_min();
-        let export_result = export(&tables, &export_opts, &export_emit);
+        let export_runtime = ExportRuntime {
+            memory_budget_mb,
+            log_path: log_path_raw.as_ref().map(PathBuf::from),
+            cancel: Some(throttle.cancel_flag()),
+        };
+        let export_result = export_with_runtime(&tables, &export_opts, &export_emit, &export_runtime);
 
         // 无论导出成功与否，只删自己写出的 *.parquet 分片，绝不 remove_dir_all。
         for shard in sink.shard_paths() {
@@ -1080,6 +1211,8 @@ pub fn open_plot_session(
 
 #[pymodule]
 fn fast_blf_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // A6：模块初始化即安装 panic hook；log_path 未配置时只保留原 stderr 行为。
+    configure_export_log(None);
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(scan, m)?)?;
     m.add_function(wrap_pyfunction!(convert, m)?)?;

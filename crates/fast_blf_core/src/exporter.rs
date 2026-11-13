@@ -44,9 +44,11 @@
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use chrono::DateTime;
 use polars::prelude::*;
@@ -54,6 +56,17 @@ use rust_xlsxwriter::{Workbook, Worksheet, XlsxError};
 
 use crate::decoder::{FileTiming, Progress, ShardRef, TableKey, TableShards, BAD_TIME_HEADER};
 use crate::error::{CoreError, EXPORT_INTERNAL};
+
+/// 重采样网格点数的硬上限（约 50 Hz 下 111 小时）。
+///
+/// 超过该值一律返回结构化 `BAD_CONFIG`，绝不把 `usize` 分配交给 allocator abort。
+pub const MAX_GRID_POINTS: usize = 20_000_000;
+
+/// 宽表重采样流式写出的行块大小：每块只持有 `CHUNK_ROWS × S` 个单元格。
+pub const CHUNK_ROWS: usize = 20_000;
+
+/// 预算闸门里每个网格单元的保守字节数（f64 列 + 临时值 / 位图余量）。
+const EST_BYTES_PER_CELL: u64 = 16;
 
 /// 实际落盘格式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +199,52 @@ pub struct ExportReport {
     pub total_rows: u64,
     pub tables: Vec<TableResult>,
     pub warnings: Vec<String>,
+}
+
+/// 导出运行期参数（`memory_budget_mb` / `log_path` / 取消标志）。
+///
+/// 这些参数不放进 [`ExportOptions`]，以保持既有 Rust 调用方（含集成测试）的
+/// 结构体字面量兼容；[`export`] 继续使用默认值，`lib.rs` 的 `convert` 走
+/// [`export_with_runtime`] 把 config 里的值透传进来。
+#[derive(Debug, Clone)]
+pub struct ExportRuntime {
+    /// phase 2 的内存预算（MB），语义与 phase 1 的 `memory_budget_mb` 一致。
+    pub memory_budget_mb: u64,
+    /// 给出时，phase 2 预检 / 错误会追加到该文件；`None` 完全不写日志。
+    pub log_path: Option<PathBuf>,
+    /// 用户取消标志（由 `ProgressThrottle` 在回调抛取消异常时置位）。
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+impl Default for ExportRuntime {
+    fn default() -> Self {
+        Self {
+            memory_budget_mb: 1536,
+            log_path: None,
+            cancel: None,
+        }
+    }
+}
+
+impl ExportRuntime {
+    /// 取消标志是否已置位。
+    fn is_cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+
+    /// 追加一行 phase 2 日志；`log_path = None` 时是空操作。
+    fn log(&self, message: &str) {
+        if let Some(path) = &self.log_path {
+            crate::append_log_line(path, message);
+        }
+    }
+}
+
+/// 取出取消检查的公共错误文案。
+fn cancelled_error() -> CoreError {
+    CoreError::export_failed("已取消：用户在导出阶段取消了任务")
 }
 
 /// `timestamp` 列改写器：把分片里的原始 epoch 秒按 `time_format` 口径换算。
@@ -411,6 +470,16 @@ pub fn export(
     opts: &ExportOptions,
     progress: &dyn Fn(Progress),
 ) -> Result<ExportReport, CoreError> {
+    export_with_runtime(tables, opts, progress, &ExportRuntime::default())
+}
+
+/// 同 [`export`]，但显式给出 phase 2 的内存预算 / 日志路径 / 取消标志。
+pub fn export_with_runtime(
+    tables: &BTreeMap<TableKey, TableShards>,
+    opts: &ExportOptions,
+    progress: &dyn Fn(Progress),
+    runtime: &ExportRuntime,
+) -> Result<ExportReport, CoreError> {
     let ctx = Mutex::new(ExportPanicContext::default());
     // 用一层进度包装记录 panic 现场；异常照旧透传给调用方。
     let recording = |event: Progress| {
@@ -419,7 +488,11 @@ pub fn export(
         }
         progress(event);
     };
-    catch_export_panic(&ctx, || export_inner(tables, opts, &recording))
+    let result = catch_export_panic(&ctx, || export_inner(tables, opts, &recording, runtime));
+    if let Err(err) = &result {
+        runtime.log(&format!("export phase2 ERROR {}: {}", err.code, err.message));
+    }
+    result
 }
 
 /// 导出主流程（不含 panic 兜底，便于把整段调用栈放进同一个 `catch_unwind`）。
@@ -427,6 +500,7 @@ fn export_inner(
     tables: &BTreeMap<TableKey, TableShards>,
     opts: &ExportOptions,
     progress: &dyn Fn(Progress),
+    runtime: &ExportRuntime,
 ) -> Result<ExportReport, CoreError> {
     if tables.is_empty() {
         return Err(CoreError::empty_result("没有任何命中解码计划的报文，无可导出内容"));
@@ -448,8 +522,20 @@ fn export_inner(
         ))
     })?;
 
-    // Excel 防呆：任一表（去重前的上界）行数超过上限即整体改走 CSV。
-    let max_rows = tables.values().map(|table| table.rows).max().unwrap_or(0);
+    // 时间口径改写器：absolute 的头部有效性在这里统一校验，绝不静默降级。
+    let transform = TimeTransform::new(opts)?;
+
+    // Excel 防呆：重采样宽表的合并后行数是网格点数 G（而不是去重前的分片行数）。
+    // G 的统计只走 lazy min/max，不 materialize 任何网格；算不出来时按超限处理，
+    // 先降级到 CSV，再由 phase 2 的预算 / 上限闸门给出结构化错误。
+    let max_rows = if !opts.split_by_message && opts.resample_hz.is_some() {
+        match resampled_grid_points(tables, opts, &transform) {
+            Ok(points) => points,
+            Err(_) => u64::MAX,
+        }
+    } else {
+        tables.values().map(|table| table.rows).max().unwrap_or(0)
+    };
     let mut format_used = opts.format;
     let mut downgraded = false;
     let mut downgrade_reason = None;
@@ -478,9 +564,6 @@ fn export_inner(
             .push("未重采样：宽表会因周期不同产生空值".to_string());
     }
 
-    // 时间口径改写器：absolute 的头部有效性在这里统一校验，绝不静默降级。
-    let transform = TimeTransform::new(opts)?;
-
     match (opts.split_by_message, format_used) {
         (true, ExportFormat::Xlsx) => {
             export_split_xlsx(tables, opts, &transform, progress, &mut report)?
@@ -489,11 +572,11 @@ fn export_inner(
             export_split_tabular(tables, format_used, opts, &transform, progress, &mut report)?
         }
         (false, ExportFormat::Xlsx) => {
-            export_wide_xlsx(tables, opts, &transform, progress, &mut report)?
+            export_wide_xlsx(tables, opts, &transform, progress, &mut report, runtime)?
         }
-        (false, _) => {
-            export_wide_tabular(tables, format_used, opts, &transform, progress, &mut report)?
-        }
+        (false, _) => export_wide_tabular(
+            tables, format_used, opts, &transform, progress, &mut report, runtime,
+        )?,
     }
 
     Ok(report)
@@ -514,7 +597,7 @@ fn prepare_split_table(
         None => Ok(df),
         Some(hz) => {
             let (t0, t1) = frame_time_bounds(&df)?;
-            let grid = resample_grid(t0, t1, hz);
+            let grid = resample_grid(t0, t1, hz)?;
             resample_frame(&df, &grid)
         }
     }
@@ -529,6 +612,7 @@ fn prepare_wide(
     opts: &ExportOptions,
     transform: &TimeTransform,
     progress: &dyn Fn(Progress),
+    runtime: &ExportRuntime,
 ) -> Result<(DataFrame, Vec<String>), CoreError> {
     let names = plan_wide_names(tables);
     match opts.resample_hz {
@@ -540,6 +624,7 @@ fn prepare_wide(
             progress,
             opts.fill_policy,
             hold_gap_seconds(opts),
+            runtime,
         ),
         None => {
             let wide = merge_wide(tables, transform, &names, progress)?;
@@ -582,22 +667,83 @@ fn hold_gap_seconds(opts: &ExportOptions) -> Option<f64> {
     }
 }
 
-/// 宽表重采样：全局网格 = 所有表时间戳区间的并集，步长 `1/hz`。
+/// phase 2 宽表重采样的预检结果（日志与预算闸门共用）。
+#[derive(Debug, Clone, Copy)]
+struct ResamplePreflight {
+    t0: f64,
+    t1: f64,
+    points: u64,
+    signals: u64,
+}
+
+/// 统计宽表重采样网格点数 G 与总信号列数 S，并在**任何大分配之前**做预算闸门。
 ///
-/// 第一遍只用 lazy `min/max` 求全局区间（不把数据读进内存），第二遍逐表合并、按
-/// `fill_policy` 落到同一网格后横向拼接；因为所有列共用同一个网格向量，`hold` 下
-/// 网格点之前（该信号尚无真实采样）为 `null`，其余点由最近真实采样保持。
-fn prepare_wide_resampled(
+/// * `chunked = true`（CSV/Parquet 流式路径）时，估算的是实际峰值：
+///   `min(G, CHUNK_ROWS) × S × 16`（当前行块的值 / 临时 / 位图）+ `G × 8`
+///   （时间戳与临时文件索引的保守余量）；
+/// * `chunked = false`（xlsx 仍一次性 materialize）时，估算整表 `G × S × 16`。
+///
+/// 日志行先于闸门写出：即使随后返回 `BAD_CONFIG`，磁盘上也有可复盘的预检记录。
+fn resample_preflight(
     tables: &BTreeMap<TableKey, TableShards>,
     hz: f64,
     transform: &TimeTransform,
-    names: &WideNames,
-    progress: &dyn Fn(Progress),
-    fill_policy: FillPolicy,
-    max_gap_s: Option<f64>,
-) -> Result<(DataFrame, Vec<String>), CoreError> {
-    let total = tables.len() as u64;
+    runtime: &ExportRuntime,
+    chunked: bool,
+) -> Result<ResamplePreflight, CoreError> {
+    let (t0, t1) = wide_time_bounds(tables, transform)?;
+    let points = grid_point_count(t0, t1, hz)?;
+    let signals: u64 = tables
+        .values()
+        .map(|table| table.signal_names.len() as u64)
+        .sum();
+    let chunk_cells = if chunked {
+        points.min(CHUNK_ROWS as u64)
+    } else {
+        points
+    };
+    let est_bytes = chunk_cells
+        .saturating_mul(signals)
+        .saturating_mul(EST_BYTES_PER_CELL)
+        .saturating_add(if chunked {
+            points.saturating_mul(std::mem::size_of::<f64>() as u64)
+        } else {
+            0
+        });
+    let budget_bytes = runtime.memory_budget_mb.saturating_mul(1024 * 1024);
+    let est_mb = est_bytes as f64 / (1024.0 * 1024.0);
+    let budget_mb = runtime.memory_budget_mb;
 
+    runtime.log(&format!(
+        "export phase2 wide-resample t0={t0} t1={t1} hz={hz} G={points} S={signals} \
+         est_mb={est_mb:.1} budget_mb={budget_mb} chunk_rows={CHUNK_ROWS}"
+    ));
+
+    if est_bytes > budget_bytes {
+        let duration_s = t1 - t0;
+        let ratio = budget_bytes as f64 / est_bytes.max(1) as f64;
+        let suggest_hz = (hz * ratio).max(0.1);
+        return Err(CoreError::bad_config(format!(
+            "重采样内存预算不足：t0={t0} t1={t1} duration_s={duration_s} hz={hz} \
+             G={points} S={signals} est_mb={est_mb:.1} budget_mb={budget_mb} \
+             chunk_rows={CHUNK_ROWS}；建议把重采样频率降到 {suggest_hz:.1} Hz 或更低，\
+             或改用拆表模式（split_by_message=true）"
+        )));
+    }
+
+    Ok(ResamplePreflight {
+        t0,
+        t1,
+        points,
+        signals,
+    })
+}
+
+/// 全局时间区间：所有表 lazy min/max 的并集（不 materialize 网格）。
+fn wide_time_bounds(
+    tables: &BTreeMap<TableKey, TableShards>,
+    transform: &TimeTransform,
+) -> Result<(f64, f64), CoreError> {
     let mut t0 = f64::INFINITY;
     let mut t1 = f64::NEG_INFINITY;
     for shards in tables.values() {
@@ -612,19 +758,51 @@ fn prepare_wide_resampled(
     if !t0.is_finite() || !t1.is_finite() {
         return Err(CoreError::empty_result("宽表没有任何时间戳，无法重采样"));
     }
-    let grid = resample_grid(t0, t1, hz);
+    Ok((t0, t1))
+}
+
+/// 宽表重采样合并后的行数 G；无法统计时返回 `None`（供 Excel 防呆降级）。
+fn resampled_grid_points(
+    tables: &BTreeMap<TableKey, TableShards>,
+    opts: &ExportOptions,
+    transform: &TimeTransform,
+) -> Result<u64, CoreError> {
+    let hz = opts
+        .resample_hz
+        .ok_or_else(|| CoreError::export_internal("未重采样时不应统计网格点数"))?;
+    let (t0, t1) = wide_time_bounds(tables, transform)?;
+    grid_point_count(t0, t1, hz)
+}
+
+/// xlsx 专用的一次性宽表重采样：全局网格 = 所有表时间戳区间的并集，步长 `1/hz`。
+///
+/// CSV/Parquet 走 [`export_wide_resampled_tabular`] 的流式分块路径；这里只服务
+/// 仍需要整张 DataFrame 的 xlsx（并在预算闸门里按整表 `G × S × 16` 估算）。
+fn prepare_wide_resampled(
+    tables: &BTreeMap<TableKey, TableShards>,
+    hz: f64,
+    transform: &TimeTransform,
+    names: &WideNames,
+    progress: &dyn Fn(Progress),
+    fill_policy: FillPolicy,
+    max_gap_s: Option<f64>,
+    runtime: &ExportRuntime,
+) -> Result<(DataFrame, Vec<String>), CoreError> {
+    let total = tables.len() as u64;
+
+    // xlsx 仍一次性 materialize，因此这里的预检按整表估算。
+    let preflight = resample_preflight(tables, hz, transform, runtime, false)?;
+    let grid = resample_grid(preflight.t0, preflight.t1, hz)?;
 
     let mut columns: Vec<Column> = Vec::new();
-    columns.push(Column::from(Series::from_vec(
-        "timestamp".into(),
-        grid.clone(),
-    )));
-
     let mut warnings: Vec<String> = names.warnings.clone();
     let mut linear_signals = 0u64;
     let mut gap_counts: Vec<(String, u64)> = Vec::new();
 
     for (idx, (key, shards)) in tables.iter().enumerate() {
+        if runtime.is_cancelled() {
+            return Err(cancelled_error());
+        }
         progress(Progress {
             phase: 2,
             stage: "merge".to_string(),
@@ -678,8 +856,14 @@ fn prepare_wide_resampled(
         max_gap_s.map(|gap| gap * 1000.0),
     ));
 
-    let wide = DataFrame::new_infer_height(columns)
-        .map_err(|err| CoreError::export_failed(format!("组装重采样宽表失败：{err}")))?;
+    let wide = DataFrame::new_infer_height({
+        columns.insert(
+            0,
+            Column::from(Series::from_vec("timestamp".into(), grid)),
+        );
+        columns
+    })
+    .map_err(|err| CoreError::export_failed(format!("组装重采样宽表失败：{err}")))?;
     Ok((wide, warnings))
 }
 
@@ -817,8 +1001,16 @@ fn export_wide_tabular(
     transform: &TimeTransform,
     progress: &dyn Fn(Progress),
     report: &mut ExportReport,
+    runtime: &ExportRuntime,
 ) -> Result<(), CoreError> {
-    let (wide, warnings) = prepare_wide(tables, opts, transform, progress)?;
+    // 重采样宽表走真正的流式分块路径：峰值只与 CHUNK_ROWS × S 有关。
+    if opts.resample_hz.is_some() {
+        return export_wide_resampled_tabular(
+            tables, format, opts, transform, progress, report, runtime,
+        );
+    }
+
+    let (wide, warnings) = prepare_wide(tables, opts, transform, progress, runtime)?;
     report.warnings.extend(warnings);
     let mut wide = transform.finalize(wide)?;
 
@@ -845,6 +1037,399 @@ fn export_wide_tabular(
     Ok(())
 }
 
+/// 临时值文件的 RAII 清理器（成功 / 失败都删）。
+struct TempValueFile {
+    path: PathBuf,
+}
+
+impl Drop for TempValueFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// 把一段 f64 按本机字节序写入（同一进程内写读，无需转码）。
+fn write_f64_slice(file: &mut File, values: &[f64]) -> Result<usize, CoreError> {
+    // SAFETY: `f64` 是无 padding 的 POD；`u8` 对齐要求为 1，按字节视图读取合法。
+    let bytes =
+        unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 8) };
+    file.write_all(bytes)
+        .map_err(|err| CoreError::export_failed(format!("写入重采样临时值文件失败：{err}")))?;
+    Ok(values.len() * 8)
+}
+
+/// 从临时值文件的 `offset` 处读取 `len` 个 f64。
+fn read_f64_slice(file: &mut File, offset: u64, len: usize) -> Result<Vec<f64>, CoreError> {
+    let mut values = vec![0.0_f64; len];
+    // SAFETY: 同上，已初始化的 f64 缓冲区按字节视图填充是合法的。
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(values.as_mut_ptr() as *mut u8, values.len() * 8)
+    };
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|err| CoreError::export_failed(format!("定位重采样临时值文件失败：{err}")))?;
+    file.read_exact(bytes)
+        .map_err(|err| CoreError::export_failed(format!("读取重采样临时值文件失败：{err}")))?;
+    Ok(values)
+}
+
+/// 宽表 + 重采样 + CSV/Parquet 的流式分块导出。
+///
+/// 峰值内存 ≈ `max(单表 merged, CHUNK_ROWS × S × 常数)`：
+/// 逐表 merge 后在**该表自己的信号列上**按 `CHUNK_ROWS` 行块重采样，把每个
+/// `(信号, 块)` 的 f64 值与 null 掩码追加进临时文件；最后按块读回 S 列、拼一个
+/// `CHUNK_ROWS` 行的 DataFrame 并增量写出。任何时刻都不持有 G 长度的中间数组，
+/// 也不需要把全部表的时间戳/信号值同时留在内存里。
+fn export_wide_resampled_tabular(
+    tables: &BTreeMap<TableKey, TableShards>,
+    format: ExportFormat,
+    opts: &ExportOptions,
+    transform: &TimeTransform,
+    progress: &dyn Fn(Progress),
+    report: &mut ExportReport,
+    runtime: &ExportRuntime,
+) -> Result<(), CoreError> {
+    let hz = opts
+        .resample_hz
+        .ok_or_else(|| CoreError::export_internal("流式重采样路径缺少 resample_hz"))?;
+    let names = plan_wide_names(tables);
+    let preflight = resample_preflight(tables, hz, transform, runtime, true)?;
+    let t0 = preflight.t0;
+    let points = preflight.points as usize;
+    let step = 1.0 / hz;
+    let max_gap_s = hold_gap_seconds(opts);
+    let chunk_count = points.div_ceil(CHUNK_ROWS);
+    let chunk_len = |chunk: usize| (points - chunk * CHUNK_ROWS).min(CHUNK_ROWS);
+
+    // 全局列计划：表按 BTreeMap 顺序，信号按 DBC 顺序；与旧实现逐项相同。
+    let mut global_finals: Vec<String> = Vec::with_capacity(preflight.signals as usize);
+    let mut column_labels: Vec<String> = Vec::with_capacity(preflight.signals as usize);
+    let mut bases: BTreeMap<TableKey, usize> = BTreeMap::new();
+    for (key, shards) in tables.iter() {
+        let finals = names.per_table.get(key).ok_or_else(|| {
+            CoreError::export_internal(format!("宽表列名规划缺少表 {}", shards.name))
+        })?;
+        bases.insert(key.clone(), global_finals.len());
+        global_finals.extend(finals.iter().cloned());
+        column_labels.extend(shards.signal_names.iter().map(|signal| {
+            format!("Ch{}/{}（信号 {}）", key.channel, key.message, signal)
+        }));
+    }
+    let total_signals = global_finals.len();
+    if total_signals != preflight.signals as usize {
+        return Err(CoreError::export_internal(format!(
+            "宽表列数不一致：计划 {total_signals}，预检 {}",
+            preflight.signals
+        )));
+    }
+
+    let (ext, effective) = match format {
+        ExportFormat::Parquet => ("parquet", ExportFormat::Parquet),
+        _ => ("csv", ExportFormat::Csv),
+    };
+    let out_path = opts.out_dir.join(format!("Merged_All_Signals.{ext}"));
+
+    // 两个临时文件：重采样后的 f64 值与 1 B/格的 null 掩码；RAII 保证退出时清理。
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let value_path = opts.out_dir.join(format!(".fblf_resample_values_{pid}_{unique}.f64"));
+    let mask_path = opts.out_dir.join(format!(".fblf_resample_masks_{pid}_{unique}.u8"));
+    let _value_guard = TempValueFile { path: value_path.clone() };
+    let _mask_guard = TempValueFile { path: mask_path.clone() };
+    let mut value_writer = File::create(&value_path).map_err(|err| {
+        CoreError::export_failed(format!(
+            "创建重采样临时值文件失败：{}（{err}）",
+            value_path.display()
+        ))
+    })?;
+    let mut mask_writer = File::create(&mask_path).map_err(|err| {
+        CoreError::export_failed(format!(
+            "创建重采样临时掩码文件失败：{}（{err}）",
+            mask_path.display()
+        ))
+    })?;
+    let mut value_offsets = vec![0u64; total_signals * chunk_count];
+    let mut mask_offsets = vec![0u64; total_signals * chunk_count];
+    let mut next_value_offset = 0u64;
+    let mut next_mask_offset = 0u64;
+
+    // ---------------- 第一遍：逐表 merge，逐 (信号, 行块) 重采样落临时文件 ----------------
+    let total_tables = tables.len() as u64;
+    for (idx, (key, shards)) in tables.iter().enumerate() {
+        if runtime.is_cancelled() {
+            return Err(cancelled_error());
+        }
+        progress(Progress {
+            phase: 2,
+            stage: "merge".to_string(),
+            done: idx as u64,
+            total: total_tables,
+            file: None,
+            frames_done: 0,
+            message: format!("重采样合并 {}", shards.name),
+        });
+
+        let df = merge_table(&shards.shards, transform)?;
+        let times = f64_column(&df, "timestamp")?;
+        let base = bases.get(key).copied().ok_or_else(|| {
+            CoreError::export_internal(format!("宽表列名规划缺少表 {}", shards.name))
+        })?;
+
+        for (signal_idx, signal) in shards.signal_names.iter().enumerate() {
+            let values = f64_column(&df, signal)?;
+            let column = base + signal_idx;
+            for chunk in 0..chunk_count {
+                if runtime.is_cancelled() {
+                    return Err(cancelled_error());
+                }
+                let start = chunk * CHUNK_ROWS;
+                let len = chunk_len(chunk);
+                let chunk_grid: Vec<f64> = (0..len)
+                    .map(|i| t0 + (start + i) as f64 * step)
+                    .collect();
+                let first_point = chunk_grid[0];
+                let last_point = chunk_grid[len - 1];
+                // 只取「块首前驱」到「块末后继」的样本切片；切片内的重采样结果
+                // 与整张 G 网格逐点相同（含 null 位置）。
+                let lo = times
+                    .partition_point(|&timestamp| timestamp <= first_point)
+                    .saturating_sub(1);
+                let hi = times
+                    .partition_point(|&timestamp| timestamp <= last_point)
+                    .saturating_add(1)
+                    .min(times.len());
+                let times_slice = &times[lo..hi];
+                let values_slice = &values[lo..hi];
+
+                let (resampled, nulls) = match opts.fill_policy {
+                    FillPolicy::Linear => {
+                        let resampled =
+                            resample_linear(times_slice, values_slice, &chunk_grid);
+                        (resampled, vec![false; len])
+                    }
+                    // `none` 在网格路径上无意义：由 lib.rs 归一成 `hold`，这里也按 hold 兜底。
+                    FillPolicy::None | FillPolicy::Hold => {
+                        let (resampled, nulls, _nulled) = resample_hold_masked(
+                            times_slice,
+                            values_slice,
+                            &chunk_grid,
+                            max_gap_s,
+                        );
+                        (resampled, nulls)
+                    }
+                };
+
+                let slot = column * chunk_count + chunk;
+                value_offsets[slot] = next_value_offset;
+                mask_offsets[slot] = next_mask_offset;
+                next_value_offset += write_f64_slice(&mut value_writer, &resampled)? as u64;
+                let mask_bytes: Vec<u8> =
+                    nulls.iter().map(|is_null| u8::from(*is_null)).collect();
+                mask_writer.write_all(&mask_bytes).map_err(|err| {
+                    CoreError::export_failed(format!("写入重采样临时掩码文件失败：{err}"))
+                })?;
+                next_mask_offset += mask_bytes.len() as u64;
+            }
+        }
+    }
+    value_writer
+        .flush()
+        .map_err(|err| CoreError::export_failed(format!("刷新重采样临时值文件失败：{err}")))?;
+    mask_writer
+        .flush()
+        .map_err(|err| CoreError::export_failed(format!("刷新重采样临时掩码文件失败：{err}")))?;
+    drop(value_writer);
+    drop(mask_writer);
+    let mut value_reader = File::open(&value_path).map_err(|err| {
+        CoreError::export_failed(format!(
+            "打开重采样临时值文件失败：{}（{err}）",
+            value_path.display()
+        ))
+    })?;
+    let mut mask_reader = File::open(&mask_path).map_err(|err| {
+        CoreError::export_failed(format!(
+            "打开重采样临时掩码文件失败：{}（{err}）",
+            mask_path.display()
+        ))
+    })?;
+
+    // ---------------- 第二遍：按行块读回 S 列、拼 DataFrame、增量写盘 ----------------
+    let mut gap_totals = vec![0u64; total_signals];
+    let mut csv_file: Option<File> = None;
+    let mut parquet = None;
+    let mut first_chunk = true;
+
+    for chunk in 0..chunk_count {
+        if runtime.is_cancelled() {
+            return Err(cancelled_error());
+        }
+        let start = chunk * CHUNK_ROWS;
+        let len = chunk_len(chunk);
+        let chunk_grid: Vec<f64> = (0..len)
+            .map(|i| t0 + (start + i) as f64 * step)
+            .collect();
+
+        progress(Progress {
+            phase: 2,
+            stage: "export".to_string(),
+            done: chunk as u64,
+            total: chunk_count as u64,
+            file: None,
+            frames_done: 0,
+            message: "导出 Merged_All_Signals".to_string(),
+        });
+
+        let mut columns: Vec<Column> = Vec::with_capacity(1 + total_signals);
+        for column in 0..total_signals {
+            let slot = column * chunk_count + chunk;
+            let values = read_f64_slice(&mut value_reader, value_offsets[slot], len)?;
+            let final_name = &global_finals[column];
+            match opts.fill_policy {
+                FillPolicy::Linear => {
+                    columns.push(Column::from(Series::from_vec(
+                        final_name.as_str().into(),
+                        values,
+                    )));
+                }
+                FillPolicy::None | FillPolicy::Hold => {
+                    let mut mask_bytes = vec![0u8; len];
+                    mask_reader
+                        .seek(SeekFrom::Start(mask_offsets[slot]))
+                        .map_err(|err| {
+                            CoreError::export_failed(format!(
+                                "定位重采样临时掩码文件失败：{err}"
+                            ))
+                        })?;
+                    mask_reader.read_exact(&mut mask_bytes).map_err(|err| {
+                        CoreError::export_failed(format!(
+                            "读取重采样临时掩码文件失败：{err}"
+                        ))
+                    })?;
+                    let mut nulled = 0u64;
+                    let ca: Float64Chunked = values
+                        .iter()
+                        .zip(mask_bytes.iter())
+                        .map(|(value, is_null)| {
+                            if *is_null == 0 {
+                                Some(*value)
+                            } else {
+                                nulled += 1;
+                                None
+                            }
+                        })
+                        .collect();
+                    gap_totals[column] += nulled;
+                    columns.push(Column::from(Series::new(
+                        final_name.as_str().into(),
+                        ca,
+                    )));
+                }
+            }
+        }
+
+        columns.insert(
+            0,
+            Column::from(Series::from_vec("timestamp".into(), chunk_grid)),
+        );
+        let chunk_df = DataFrame::new_infer_height(columns).map_err(|err| {
+            CoreError::export_failed(format!("组装第 {} 个重采样行块失败：{err}", chunk + 1))
+        })?;
+        let mut chunk_df = transform.finalize(chunk_df)?;
+
+        match effective {
+            ExportFormat::Parquet => {
+                if first_chunk {
+                    let file = File::create(&out_path).map_err(|err| {
+                        CoreError::export_failed(format!(
+                            "创建 Parquet 失败：{}（{err}）",
+                            out_path.display()
+                        ))
+                    })?;
+                    let schema = chunk_df.schema().clone();
+                    let batched = ParquetWriter::new(file)
+                        .with_compression(ParquetCompression::Zstd(Some(Default::default())))
+                        .batched(&schema)
+                        .map_err(|err| {
+                            CoreError::export_failed(format!(
+                                "创建 Parquet 分块写入器失败：{err}"
+                            ))
+                        })?;
+                    parquet = Some(batched);
+                }
+                parquet
+                    .as_mut()
+                    .ok_or_else(|| CoreError::export_internal("Parquet 写入器未初始化"))?
+                    .write_batch(&chunk_df)
+                    .map_err(|err| {
+                        CoreError::export_failed(format!(
+                            "写入 Parquet 行块失败：{}（{err}）",
+                            out_path.display()
+                        ))
+                    })?;
+            }
+            _ => {
+                if first_chunk {
+                    csv_file = Some(File::create(&out_path).map_err(|err| {
+                        CoreError::export_failed(format!(
+                            "创建 CSV 失败：{}（{err}）",
+                            out_path.display()
+                        ))
+                    })?);
+                }
+                let file = csv_file
+                    .as_mut()
+                    .ok_or_else(|| CoreError::export_internal("CSV 写入器未初始化"))?;
+                // 首块写表头，后续块只追加数据行；逐字节等价于一次性写出。
+                write_csv_chunk(file, &mut chunk_df, first_chunk, &out_path)?;
+            }
+        }
+
+        first_chunk = false;
+    }
+
+    if let Some(batched) = parquet {
+        batched.finish().map_err(|err| {
+            CoreError::export_failed(format!(
+                "收尾 Parquet 失败：{}（{err}）",
+                out_path.display()
+            ))
+        })?;
+    }
+
+    // ---------------- 汇总 warnings / report ----------------
+    let mut warnings = names.warnings.clone();
+    if opts.fill_policy == FillPolicy::Linear {
+        warnings.push(linear_fill_warning(preflight.signals));
+    } else {
+        let gap_counts: Vec<(String, u64)> = gap_totals
+            .iter()
+            .enumerate()
+            .filter_map(|(column, &nulled)| {
+                (nulled > 0).then(|| (column_labels[column].clone(), nulled))
+            })
+            .collect();
+        warnings.extend(format_gap_warnings(
+            &gap_counts,
+            max_gap_s.map(|gap| gap * 1000.0),
+        ));
+    }
+    report.warnings.extend(warnings);
+
+    let rows = points as u64;
+    report.total_rows = rows;
+    report.tables.push(TableResult {
+        name: "Merged_All_Signals".to_string(),
+        channel: None,
+        message: None,
+        rows,
+        path: out_path.to_string_lossy().to_string(),
+        sheet: None,
+    });
+    Ok(())
+}
+
 /// 宽表 + xlsx：单个 `Merged_All_Signals.xlsx` 单 Sheet（常量内存模式）。
 fn export_wide_xlsx(
     tables: &BTreeMap<TableKey, TableShards>,
@@ -852,8 +1437,9 @@ fn export_wide_xlsx(
     transform: &TimeTransform,
     progress: &dyn Fn(Progress),
     report: &mut ExportReport,
+    runtime: &ExportRuntime,
 ) -> Result<(), CoreError> {
-    let (wide, warnings) = prepare_wide(tables, opts, transform, progress)?;
+    let (wide, warnings) = prepare_wide(tables, opts, transform, progress, runtime)?;
     report.warnings.extend(warnings);
     let wide = transform.finalize(wide)?;
 
@@ -1258,15 +1844,60 @@ fn format_gap_ms(ms: f64) -> String {
 /// 浮点容差：`(t1-t0)*hz` 的理论整数值常因二进制舍入落到 `k - 1e-13`，直接用 `floor`
 /// 会少一个点。这里加一个相对 + 绝对双重容差后再取整，保证「取不超过 t1 的最大网格点」
 /// 的语义（偏差不超过 ±1 个点，与任务书给定的计算公式一致）。
-fn resample_grid(t0: f64, t1: f64, hz: f64) -> Vec<f64> {
-    if !t0.is_finite() || !t1.is_finite() || !hz.is_finite() || hz <= 0.0 || t1 < t0 {
-        return Vec::new();
-    }
+///
+/// 所有中间量都用 `is_finite` / 上限检查，绝不把饱和转换或 `usize` 回绕交给分配器。
+fn resample_grid(t0: f64, t1: f64, hz: f64) -> Result<Vec<f64>, CoreError> {
+    let points = grid_point_count(t0, t1, hz)? as usize;
     let step = 1.0 / hz;
-    let scaled = (t1 - t0) * hz;
+    Ok((0..points).map(|i| t0 + i as f64 * step).collect())
+}
+
+/// 计算网格点数 G（`u64`），`points == 0` / 非法输入 / 溢出 / 超硬上限一律 `BAD_CONFIG`。
+fn grid_point_count(t0: f64, t1: f64, hz: f64) -> Result<u64, CoreError> {
+    if !t0.is_finite() || !t1.is_finite() || !hz.is_finite() || hz <= 0.0 {
+        return Err(CoreError::bad_config(format!(
+            "无法生成重采样网格：t0={t0} t1={t1} hz={hz}（要求有限且 hz > 0）"
+        )));
+    }
+    if t1 < t0 {
+        return Err(CoreError::bad_config(format!(
+            "无法生成重采样网格：t1 < t0（t0={t0} t1={t1}）"
+        )));
+    }
+    let span = t1 - t0;
+    if !span.is_finite() {
+        return Err(CoreError::bad_config(format!(
+            "重采样时间跨度不是有限数：t0={t0} t1={t1}"
+        )));
+    }
+    let scaled = span * hz;
+    if !scaled.is_finite() {
+        return Err(CoreError::bad_config(format!(
+            "重采样网格点数溢出：duration_s={span} hz={hz}"
+        )));
+    }
     let tolerance = 1e-9_f64.max(scaled.abs() * 1e-12);
-    let points = ((scaled + tolerance).floor().max(0.0) as usize) + 1;
-    (0..points).map(|i| t0 + i as f64 * step).collect()
+    let floored = (scaled + tolerance).floor();
+    if !floored.is_finite() || floored < 0.0 {
+        return Err(CoreError::bad_config(format!(
+            "重采样网格点数非法：duration_s={span} hz={hz} scaled={scaled}"
+        )));
+    }
+    if floored >= MAX_GRID_POINTS as f64 {
+        let hours = (MAX_GRID_POINTS as f64 / hz) / 3600.0;
+        return Err(CoreError::bad_config(format!(
+            "重采样网格点数超过硬上限 {MAX_GRID_POINTS}（约 {hours:.1} 小时 @ {hz} Hz）：\
+             t0={t0} t1={t1} duration_s={span} hz={hz}；\
+             请降低重采样频率、缩短时间范围，或改用拆表模式（split_by_message=true）"
+        )));
+    }
+    let points = floored as u64 + 1;
+    if points == 0 {
+        return Err(CoreError::bad_config(format!(
+            "重采样网格点数为 0：t0={t0} t1={t1} hz={hz}"
+        )));
+    }
+    Ok(points)
 }
 
 /// 纯函数：把 `(times, values)`（按时间升序）对齐到 `grid` 上的线性插值结果。
@@ -1331,21 +1962,42 @@ pub fn resample_hold(
     grid: &[f64],
     max_gap_s: Option<f64>,
 ) -> (Vec<Option<f64>>, u64) {
+    let (resampled, nulls, nulled) = resample_hold_masked(times, values, grid, max_gap_s);
+    let out = resampled
+        .into_iter()
+        .zip(nulls)
+        .map(|(value, is_null)| if is_null { None } else { Some(value) })
+        .collect();
+    (out, nulled)
+}
+
+/// [`resample_hold`] 的零拷贝形态：返回 `(值列, null 掩码, 超限置空行数)`。
+///
+/// 值列是 `Vec<f64>`（8 B/格），null 单独用 `Vec<bool>`（1 B/格）表示，
+/// 供流式行块直接构造 nullable `Float64Chunked`，避免整块 `Vec<Option<f64>>`（16 B/格）
+/// 与 `Series` 的二次分配同时存在。
+pub fn resample_hold_masked(
+    times: &[f64],
+    values: &[f64],
+    grid: &[f64],
+    max_gap_s: Option<f64>,
+) -> (Vec<f64>, Vec<bool>, u64) {
     let len = times.len().min(values.len());
     if len == 0 || grid.is_empty() {
-        return (vec![None; grid.len()], 0);
+        return (vec![0.0; grid.len()], vec![true; grid.len()], 0);
     }
     let times = &times[..len];
     let values = &values[..len];
 
-    let mut out: Vec<Option<f64>> = Vec::with_capacity(grid.len());
+    let mut out: Vec<f64> = vec![0.0; grid.len()];
+    let mut nulls: Vec<bool> = vec![false; grid.len()];
     let mut nulled = 0u64;
-    for &point in grid {
+    for (slot, &point) in grid.iter().enumerate() {
         // 前 `idx` 个样本的时间 <= point。
         let idx = times.partition_point(|&t| t <= point);
         if idx == 0 {
             // point 早于首样本：无值可保持。
-            out.push(None);
+            nulls[slot] = true;
             continue;
         }
         let sample_time = times[idx - 1];
@@ -1353,13 +2005,13 @@ pub fn resample_hold(
             .map(|gap| point - sample_time > gap)
             .unwrap_or(false);
         if too_old {
-            out.push(None);
+            nulls[slot] = true;
             nulled += 1;
         } else {
-            out.push(Some(values[idx - 1]));
+            out[slot] = values[idx - 1];
         }
     }
-    (out, nulled)
+    (out, nulls, nulled)
 }
 
 /// 把一张表的全部信号列重采样到给定网格，返回 `timestamp = grid` 的新表。
@@ -1422,11 +2074,23 @@ fn write_table(
 
 /// Polars 多线程 CSV 写出：带表头、普通十进制（禁止科学计数法）。
 fn write_csv(df: &mut DataFrame, path: &Path) -> Result<(), CoreError> {
-    let file = File::create(path).map_err(|err| {
+    let mut file = File::create(path).map_err(|err| {
         CoreError::export_failed(format!("创建 CSV 失败：{}（{err}）", path.display()))
     })?;
-    CsvWriter::new(file)
-        .include_header(true)
+    write_csv_chunk(&mut file, df, true, path)
+}
+
+/// CSV 分块追加：`include_header = true` 写表头，后续块只追加数据行。
+///
+/// 行块首尾直接拼接，字节流与一次性 `CsvWriter::finish` 完全一致（逐字节 golden 验证）。
+fn write_csv_chunk(
+    file: &mut File,
+    df: &mut DataFrame,
+    include_header: bool,
+    path: &Path,
+) -> Result<(), CoreError> {
+    CsvWriter::new(&mut *file)
+        .include_header(include_header)
         .with_float_scientific(Some(false))
         .finish(df)
         .map_err(|err| {
