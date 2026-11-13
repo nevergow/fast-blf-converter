@@ -88,6 +88,9 @@ jobs:
         shell: pwsh
         run: |
           $env:QT_QPA_PLATFORM = "offscreen"
+          # 固定日志目录，顺便验收「窗口化 exe 也能把日志写下来」这个新能力
+          $env:FAST_BLF_LOG_DIR = Join-Path $env:TEMP "fblf_ci_logs"
+          Remove-Item $env:FAST_BLF_LOG_DIR -Recurse -Force -ErrorAction SilentlyContinue
           $dir = "dist\FastBLFConverter"
           if (-not (Test-Path "$dir\FastBLFConverter.exe")) { throw "产物里没有 exe" }
           if (-not (Test-Path "$dir\_internal\gui\theme.qss")) { throw "主题资源未打进包（_internal/gui/theme.qss 缺失）" }
@@ -99,11 +102,20 @@ jobs:
           # 无论是否超时都先打印已捕获的输出：超时也要留诊断信息，不能只有一句"挂死"
           $log = ((Get-Content $out -Raw) + "`n" + (Get-Content $err -Raw))
           Write-Host "exe 退出码: $($p.ExitCode)；按时退出: $finished"
-          Write-Host $log
+          Write-Host "---- stdout/stderr ----"; Write-Host $log
+          $logFile = Join-Path $env:FAST_BLF_LOG_DIR "gui.log"
+          if (Test-Path $logFile) { Write-Host "---- gui.log ----"; Get-Content $logFile }
           if (-not $finished) { $p.Kill(); throw "冻结态自检超时（>180 秒），疑似进程挂死；已强杀" }
           if ($p.ExitCode -ne 0) { throw "冻结态自检失败，exit=$($p.ExitCode)" }
-          if ($log -notmatch '\d+\.\d+\.\d+') { throw "自检输出里没有内核版本号，疑似 Rust 内核未加载" }
-          Write-Host "冻结态自检通过（exe 运行 + 内核加载 + 主题就位）"
+          if (-not (Test-Path $logFile)) {
+            throw "没有生成 gui.log（FAST_BLF_LOG_DIR=$env:FAST_BLF_LOG_DIR）：窗口化 exe 的日志落盘失效"
+          }
+          $logText = Get-Content $logFile -Raw
+          if (($log -notmatch 'SELFTEST_OK') -and ($logText -notmatch '内核就绪')) {
+            throw "自检既没有输出 SELFTEST_OK，日志里也没有内核就绪记录 —— stdout 与 gui.log 都是空的"
+          }
+          if (($log + $logText) -notmatch '\d+\.\d+\.\d+') { throw "自检输出与日志里都没有内核版本号，疑似 Rust 内核未加载" }
+          Write-Host "冻结态自检通过（exe 运行 + 内核加载 + 主题就位 + 日志落盘）"
 
       # 冻结态配置自检：验证 configs 预设的保存/加载/DBC 缺失处理在打包后确实可用。
       # 该自检自 Step 6c 起自给自足（不依赖 fixtures/），因此能在绿色包里真跑。

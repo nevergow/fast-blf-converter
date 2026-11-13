@@ -4656,6 +4656,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
     if not KERNEL_READY:
         print(f"[GUI] {KERNEL_MISSING_TEXT}")
     if selftest:
+        # 冻结态（console=False）下 stdout/stderr 可能是 None，但只要被重定向就仍然可写。
+        # 这里显式给出一条可 grep 的结论行：CI 与运维不能只依赖日志文件才能判断自检过没过。
+        _ver = core.version() if (KERNEL_READY and core is not None) else "—"
+        print(f"SELFTEST_OK version={_ver} kernel={'yes' if KERNEL_READY else 'no'}", flush=True)
         QTimer.singleShot(400, app.quit)
     else:
         window.lbl_status.setText("就绪：请添加 BLF 文件并在通道上右键添加 DBC，然后点「🔍 解析信号」"
