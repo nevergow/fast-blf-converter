@@ -345,3 +345,11 @@ build_windows_portable.bat
    在 Windows 上不产出 stdout，该自检无法汇报进度；且这一步里的进程在 runner 上不按时退出。
    现已改成**非阻塞 + 保留诊断**（超时只写警告并继续上传产物）。配置功能本身在开发态与本机打包态
    均已验证通过（`--selftest-config` → `CONFIG_OK`），**不影响用户路径**；根因待查。
+
+## 许可
+
+本项目以 **MIT License** 发布，见 [`LICENSE`](LICENSE)。
+
+随包分发的第三方资源：`gui/assets/echarts.min.js`（Apache ECharts 5.5.1，**Apache License 2.0**），
+文件头部 ASF 许可声明原样保留，溯源与校验值见 [`gui/assets/NOTICE.txt`](gui/assets/NOTICE.txt)。
+
