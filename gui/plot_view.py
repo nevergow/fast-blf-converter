@@ -2037,6 +2037,11 @@ class PlotCanvas(QWidget):
             self._refine_timer.stop()
             self._coarse = False
             self.fit_all()
+            # Qt 的默认实现会把双击转发成一次 mousePressEvent：那会让 _drag_anchor 被设上、
+            # 光标变抓手，并在随后的抬起里多触发一次 view() 取数。双击语义已由 fit_all 完成，
+            # 这里直接接受并返回，不再转发。
+            event.accept()
+            return
         super().mouseDoubleClickEvent(event)
 
     def leaveEvent(self, event) -> None:  # noqa: N802 - Qt 命名
