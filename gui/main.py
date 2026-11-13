@@ -101,7 +101,7 @@ TIME_FORMAT_TOOLTIP = (
     "相对时间以全部输入文件中最早的时间戳为 0")
 #: Step 14：填充方式（写入 config 的 ``fill_policy``，取值与 INTERFACE §1.1 一一对应）。
 FILL_CHOICES: list[tuple[str, str]] = [
-    ("阶梯保持（推荐）", "hold"),
+    ("阶梯保持", "hold"),
     ("线性插值", "linear"),
     ("不填充", "none"),
 ]
@@ -763,7 +763,7 @@ class MainWindow(QMainWindow):
 
     def _build_file_panel(self) -> QWidget:
         panel, layout = self._panel(self)
-        title = QLabel("BLF 文件列表（可拖拽 .blf 到此处）")
+        title = QLabel("BLF 文件列表")
         tune(title, objectName="hintLabel")
         layout.addWidget(title)
         self.file_tree = BlfFileTree(panel)
@@ -778,8 +778,7 @@ class MainWindow(QMainWindow):
 
     def _build_signal_panel(self) -> QWidget:
         panel, layout = self._panel(self)
-        title = QLabel("信号筛选（通道 → DBC → 报文 → 信号；在通道节点上右键添加 DBC，"
-                       "只有勾选的节点才会参与转换）")
+        title = QLabel("信号筛选")
         tune(title, objectName="hintLabel")
         # Step 19 D1/D3：标题行只保留一个三态复选框（删除原先的「全选当前过滤项 /
         # 一键清空」两个按钮）。语义与预览面板完全一致：部分/未选 → 全选；全选 → 全不选。
@@ -793,7 +792,7 @@ class MainWindow(QMainWindow):
         title_row.addWidget(self.chk_select_all, 0)
         layout.addLayout(title_row)
         self.search_edit = QLineEdit(panel)
-        tune(self.search_edit, placeholderText="🔍 搜索 DBC / 报文名 / 信号名（大小写不敏感的模糊匹配）", clearButtonEnabled=True)
+        tune(self.search_edit, placeholderText="🔍 搜索 DBC / 报文名 / 信号名", clearButtonEnabled=True)
         row = QHBoxLayout()
         row.addWidget(self.search_edit, 1)
         layout.addLayout(row)
@@ -812,10 +811,6 @@ class MainWindow(QMainWindow):
              contextMenuPolicy=Qt.ContextMenuPolicy.CustomContextMenu)
         self.signal_view.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.signal_view, 1)
-        tip = QLabel("提示：在通道节点上右键「📄 添加 DBC…」；DBC 节点只作展示不可勾选，"
-                     "通道勾选由其下所有报文聚合。")
-        tune(tip, objectName="hintLabel")
-        layout.addWidget(tip)
         return panel
 
     def _build_control_panel(self) -> QWidget:
@@ -825,7 +820,7 @@ class MainWindow(QMainWindow):
         panel.setLayout(outer)
         row = QHBoxLayout()
         row.setSpacing(14)
-        self.chk_split = QCheckBox("按报文周期拆分为独立时序子表 (推荐，彻底规避空值)")
+        self.chk_split = QCheckBox("按报文周期拆分为独立时序子表")
         self.chk_split.setChecked(True)
         row.addWidget(self.chk_split)
         row.addWidget(QLabel("重采样频率："))
@@ -851,7 +846,7 @@ class MainWindow(QMainWindow):
         tune(self.combo_fill, currentIndex=FILL_INDEX["hold"], toolTip=FILL_TOOLTIP)
         row.addWidget(self.combo_fill)
         row.addStretch(1)
-        self.btn_convert = QPushButton("🚀 启动多核极速转换")
+        self.btn_convert = QPushButton("🚀 开始转换")
         self.btn_convert.setObjectName("primaryButton")
         row.addWidget(self.btn_convert)
         outer.addLayout(row)
@@ -1635,7 +1630,7 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText(f"解析完成：{ok_count}/{len(self.entries)} 个文件可用")
         else:
             self.lbl_status.setText("解析完成（未添加 BLF，仅按 DBC 列出信号）")
-        self.statusBar().showMessage("解析完成，可在右侧勾选需要导出的信号")
+        self.statusBar().showMessage("解析完成")
 
     def _on_scan_failed(self, message: str) -> None:
         self._check_snapshot = None
@@ -1787,9 +1782,9 @@ class MainWindow(QMainWindow):
                 elif is_missing:
                     suffix = DBC_MISSING_SUFFIX
                 elif not dbc_path and observed:
-                    suffix = "（未绑定 DBC，显示原始 ID）"
+                    suffix = "（未绑定 DBC）"
                 elif not dbc_path:
-                    suffix = "（无帧观测，右键可添加 DBC）"
+                    suffix = "（无帧观测）"
                 else:
                     suffix = ""
                 if dbc_error:
@@ -1799,7 +1794,7 @@ class MainWindow(QMainWindow):
                 elif dbc_path:
                     tip = f"Ch{channel}\nDBC：{dbc_path}"
                 elif observed:
-                    tip = f"Ch{channel}\n未绑定 DBC，显示原始 ID"
+                    tip = f"Ch{channel}\n未绑定 DBC"
                 else:
                     tip = (f"Ch{channel}\n该通道在当前 BLF 中没有帧，或尚未添加 BLF；\n"
                            "添加 DBC 后点「🔍 解析信号」即可列出报文")
