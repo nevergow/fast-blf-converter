@@ -45,4 +45,7 @@
 * 裸 `cargo build` 不带 `extension-module` → import 阶段 SIGSEGV；`maturin build` 默认 debug，要 `--release`。
 * 窗口化 exe 在 Windows 上**不产出 stdout** → 冻结态自检只警告不阻塞，但诊断必须先打印。
 * 本机**没有 `timeout` 命令**（macOS）。
+* **`cargo test` 必须带 `DYLD_FALLBACK_LIBRARY_PATH=/opt/anaconda3/lib`**（`cargo test` 故意不启用
+  `extension-module`，因此会链接 `libpython3.12.dylib`；不设这个变量时测试二进制启动即 `SIGABRT`
+  `Library not loaded`，看起来像"测试全挂"）。`scripts/dev_install.sh` 里已内置该变量。
 * 探针必须走真实入口（历史教训：只写树节点不写 `dbc_by_channel` → 误报 `EMPTY_RESULT`）。

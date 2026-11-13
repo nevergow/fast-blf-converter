@@ -71,7 +71,8 @@ fast_blf_core.convert(config: dict, progress_cb: Callable[[dict], None] | None =
 | `out_dir` | `str` | 输出目录（不存在则创建） |
 | `temp_dir` | `str` | Parquet 分片临时目录（不存在则创建；结束前清空其内容） |
 | `excel_row_limit` | `int` | 默认 `1_000_000`；xlsx 模式超过即降级 |
-| `memory_budget_mb` | `int` | 默认 `1536`；分片缓冲达到该值即 flush 落盘 |
+| `memory_budget_mb` | `int` | 默认 `1536`。**两处生效**：① phase 1 分片缓冲达到该值即 flush 落盘；② **phase 2 宽表重采样的分配预算闸门**（v0.4.1）：估算峰值超过预算即返回 `BAD_CONFIG`，消息里给出 `t0/t1/duration_s/hz/G/S/est_mb/budget_mb` 与「降到多少 Hz」的建议，**绝不 abort** |
+| `log_path` | `str \| None` | **可选**，默认 `None`（= 不写日志文件，行为与旧版一致）。给出时内核把 phase 2 预检行（`export phase2 wide-resample t0=… G=… S=… est_mb=…`）、phase 2 错误行、以及 Rust `panic` 的 `location/message` 追加写进该文件 |
 | `ffill` | `bool` | **兼容别名**（Step 14 起，等价于 `fill_policy="hold"`），默认 `false`。仅在 `split_by_message == false` 且 `resample_hz == None`（保持原始时序）时生效：对 outer join 后的宽表做前向填充 |
 | `fill_policy` | `str` | 填充策略：`none`（不填充，留空）\| `hold`（阶梯保持/ZOH：把最近一次**真实采样**保持到下一拍，**不造新值**）\| `linear`（线性插值：**会在两个真实采样点之间造出从未采样过的数值**）。**未显式给出时按路径取默认**：重采样网格路径（`resample_hz != None`）= `hold`；保持原始时序的宽表 = `none`（即 `ffill=false` 的现状）。`ffill=true` 等价于显式指定 `hold`。拆表模式下不生效（同一报文内周期一致、不产生跨信号空值）；宽表-原时序与宽表-网格按上述默认生效。**状态/枚举/计数类信号必须用 `hold`**——线性插值会把档位 1→2 插成 1.5、把累加计数插成小数。`none` 在网格路径上无意义（网格点必须有值）→ 按 `hold` 处理并记 `warnings` |
 | `ffill_max_gap_ms` | `float \| None` | 默认 `None`。仅 `hold` 生效：某行往前超过该毫秒数找不到新采样时**不再保持**，该行置空——防止"通信中断/丢帧"被旧值掩盖成"一直正常"。受影响行数按信号计入 `warnings` |
@@ -309,6 +310,10 @@ pub struct CoreError { pub code: String, pub message: String, pub detail: Option
 1. **生产路径禁止 `unwrap()/expect()/panic!`**——panic 会 abort Python 进程。所有失败走 `Result`。
 2. `unsafe` 仅允许出现在 PyO3 宏生成处；手写 `unsafe` 需注释理由。
 3. 全进程内存峰值 < 2GB：按 `memory_budget_mb` 分片落 Parquet（Zstd），最后用 Polars Lazy 流式合并。
+   **宽表重采样（`split_by_message=false` + `resample_hz!=None`）的峰值必须与网格行数 `G` 解耦**（v0.4.1）：
+   按 `CHUNK_ROWS=20000` 行块两遍式流式导出（先按表/信号把行块重采样落临时文件，再逐块拼表增量写出），
+   任何时刻不持有 `G` 长度数组；`G` 另有硬上限 `MAX_GRID_POINTS=20_000_000`（50 Hz ≈ 111 小时），超限 `BAD_CONFIG`。
+   实测（2612 万帧 / 12800 s / 160 信号）：50 Hz（G=64 万）峰值 863 MB，200 Hz（G=256 万）793 MB —— 与 G 无关。
 4. **Excel 防呆**：`export_format=="xlsx"` 且任一待导出表行数 > `excel_row_limit` → 自动降级 CSV，`downgraded=true` + 人话原因，**不崩溃、不截断**。
 5. 零权限：不碰注册表、不写 `Program Files`/`System32`、不请求 UAC。
 6. 打包只允许 PyInstaller `--onedir`（禁止 `--onefile`）。
