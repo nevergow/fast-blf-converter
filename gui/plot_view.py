@@ -119,6 +119,69 @@ def _fmt_num(value, digits: int = 4) -> str:
     return text or "0"
 
 
+def _fmt_readout(value, lo, hi) -> str:
+    """读数条数值：按当前 Y 量程给 3~6 位有效数字。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if not math.isfinite(number):
+        return "—"
+    try:
+        span = float(hi) - float(lo)
+    except (TypeError, ValueError):
+        span = 0.0
+    if not (math.isfinite(span) and span > 0):
+        return _fmt_num(number, 4)
+    decimals = 3 - int(math.floor(math.log10(span)))
+    return _fmt_num(number, max(0, min(6, decimals)))
+
+
+def _nice_step(span: float, count: int) -> float:
+    """nice-number 步长：把 ``span`` 分成约 ``count`` 段时"好看"的刻度间隔。"""
+    try:
+        span = float(span)
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(span) or span <= 0:
+        return 1.0
+    raw = span / max(1, int(count) - 1)
+    if not (math.isfinite(raw) and raw > 0):
+        return 1.0
+    base = 10.0 ** math.floor(math.log10(raw))
+    for multiplier in (1.0, 2.0, 2.5, 5.0, 10.0):
+        if raw <= multiplier * base * (1.0 + 1e-9):
+            return multiplier * base
+    return 10.0 * base
+
+
+def _nice_ticks(lo: float, hi: float, count: int) -> tuple[list[float], int]:
+    """按量程自适应的刻度值 + 小数位（span 很小时不再出现 3 个相同标签）。"""
+    try:
+        lo, hi = float(lo), float(hi)
+    except (TypeError, ValueError):
+        return [0.0], 0
+    count = max(2, int(count))
+    if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
+        return [lo], 0
+    step = _nice_step(hi - lo, count)
+    decimals = max(0, min(9, -int(math.floor(math.log10(step)))))
+    ticks: list[float] = []
+    value = math.ceil(lo / step - 1e-9) * step
+    guard = 0
+    while value <= hi + step * 1e-6 and guard < 64:
+        if value >= lo - step * 1e-6:
+            ticks.append(0.0 if abs(value) < step * 1e-9 else value)
+        value += step
+        guard += 1
+    if len(ticks) < 2:
+        # 量程太窄 / 落在刻度间隙：退回等分，仍然按 span 给精度。
+        span = (hi - lo) / (count - 1)
+        ticks = [lo + span * index for index in range(count)]
+        decimals = max(0, min(9, -int(math.floor(math.log10(abs(span) or 1.0)))))
+    return ticks, decimals
+
+
 def _fmt_points(count: int) -> str:
     """``3.2k`` / ``1.2M`` 这类紧凑点数。"""
     count = int(max(0, count))
@@ -306,7 +369,7 @@ class SignalRow(QWidget):
         self.color_button = QPushButton(self)
         self.color_button.setObjectName("colorSwatch")
         self.color_button.setFixedSize(22, 18)
-        self.color_button.setToolTip("点击修改曲线颜色（QColorDialog）")
+        self.color_button.setToolTip("修改颜色")
         self.color_button.clicked.connect(lambda: self.color_clicked.emit(self.key))
         row.addWidget(self.color_button, 0)
 
@@ -334,9 +397,7 @@ class SignalRow(QWidget):
     def _tooltip(self) -> str:
         item = self._signal
         unit = (item.get("unit") or "").strip() or "无量纲"
-        cached = "已缓存" if item.get("cached") else "未缓存（勾选后后台加载）"
-        return (f"通道 Ch{item.get('channel', '?')} / {item.get('message', '?')}\n"
-                f"单位：{unit}\n缓存：{cached}\n右键：折线 / 阶梯 / 散点")
+        return f"通道 Ch{item.get('channel', '?')} · 单位：{unit}"
 
     def set_color(self, color: str) -> None:
         self.color_button.setStyleSheet(
@@ -407,7 +468,7 @@ class SignalPanel(QWidget):
 
         self.filter_edit = QLineEdit(self)
         self.filter_edit.setObjectName("plotFilter")
-        self.filter_edit.setPlaceholderText("按名字过滤…（不影响全选统计）")
+        self.filter_edit.setPlaceholderText("按名字过滤…")
         self.filter_edit.setClearButtonEnabled(True)
         self.filter_edit.textChanged.connect(self._apply_filter)
         outer.addWidget(self.filter_edit)
@@ -420,11 +481,6 @@ class SignalPanel(QWidget):
         self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._context_menu)
         outer.addWidget(self.list, 1)
-
-        self.hint = QLabel("行首勾选 = 显示/隐藏；色块改颜色；右键改线型", self)
-        self.hint.setObjectName("hintLabel")
-        self.hint.setWordWrap(True)
-        outer.addWidget(self.hint)
 
     # ----------------------------------------------------------- 构建 ----
     def set_signals(self, signals: list[dict], styles: dict[str, SeriesStyle],
@@ -594,9 +650,11 @@ class SignalPanel(QWidget):
 # 画布：纯自绘、只读缓存
 # ---------------------------------------------------------------------------
 class PlotCanvas(QWidget):
-    """min/max 包络自绘控件（三种模式 / 滚轮缩放 / 拖动平移 / 双击复位 / 十字线）。"""
+    """min/max 包络自绘控件（三种模式 / 滚轮缩放 / 拖动平移 / 框选放大 / 双击 FIT ALL）。"""
 
     view_refreshed = Signal()
+    #: 固定读数条：光标处的 ``t`` 与各轴数值（只读缓存，不取数）。
+    readout_changed = Signal(str)
 
     def __init__(self, parent: QWidget | None = None, *,
                  time_format: str = "relative_s") -> None:
@@ -635,6 +693,13 @@ class PlotCanvas(QWidget):
         self._drag_anchor: QPointF | None = None
         self._drag_view = [0.0, 1.0]
         self._plot_rect = QRectF()
+        # B：框选状态（与平移 anchor 互斥；框选期间绝不动 _view）。
+        self._select_anchor: QPointF | None = None
+        self._select_pos: QPointF | None = None
+        # A / D：Y 轴覆盖范围（key = series key）。只影响布局，不触发取数。
+        self._y_override: dict[str, tuple[float, float]] = {}
+        # E：读数条最后一次光标时间（鼠标离开后保留）。
+        self._readout_t: float | None = None
 
         self._geometry: dict[str, dict] = {}
         self._data_version = 0
@@ -725,6 +790,10 @@ class PlotCanvas(QWidget):
         self._apply_format_meta(format_meta)
         self._apply_session_range(self._info)
         self._set_initial_visible(initial_keys or self._keys)
+        self._y_override.clear()
+        self._readout_t = None
+        self._select_anchor = None
+        self._select_pos = None
         self._cache.clear()
         self._geometry.clear()
         self._data_version += 1
@@ -780,6 +849,10 @@ class PlotCanvas(QWidget):
             self._full[1] = self._full[0] + 1.0
         self._set_initial_window()
         self._set_initial_visible(self._keys)
+        self._y_override.clear()
+        self._readout_t = None
+        self._select_anchor = None
+        self._select_pos = None
         self._cache.clear()
         self._geometry.clear()
         self._data_version += 1
@@ -1025,6 +1098,122 @@ class PlotCanvas(QWidget):
         else:
             self.update()
 
+    # ------------------------------------------------- FIT / Y 覆盖 ----
+    def fit_x(self) -> None:
+        """FIT X：窗口回到全量；**不清** Y 覆盖。"""
+        self._view = [self._full[0], self._full[1]]
+        self._prune_view()
+        self._refine_timer.stop()
+        self._coarse = False
+        self._request_view(self._actual_width(), force=True)
+        self._publish_readout()
+
+    def fit_y(self) -> None:
+        """FIT Y：用当前窗口 ``_cache`` 求并集写 Y 覆盖，**不取数**。"""
+        applied = False
+        for keys in self._y_groups():
+            span = self._cache_span(keys)
+            if span is None:
+                ranges = [self._series_range(key) for key in keys]
+                span = (min(item[0] for item in ranges), max(item[1] for item in ranges))
+            lo, hi = float(span[0]), float(span[1])
+            if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
+                continue
+            for key in keys:
+                self._y_override[key] = (lo, hi)
+            applied = True
+        if applied:
+            self._invalidate_layout()
+            self._publish_readout()
+
+    def fit_all(self) -> None:
+        """FIT ALL：全量 X + 清掉所有 Y 覆盖（双击画布也走这里）。"""
+        self._y_override.clear()
+        self.fit_x()
+
+    def _y_groups(self) -> list[list[str]]:
+        """按当前 Y 轴分组返回 key（lanes 每车道一组，归一化轴不进组）。"""
+        if self._mode == "lanes":
+            return [[key] for key in self.visible_keys()]
+        if self._mode == "multi_axis":
+            axes, mapping = self._multi_axes()
+            groups: dict[int, list[str]] = {}
+            for key, index in mapping.items():
+                if index < len(axes) and axes[index].get("normalized"):
+                    continue
+                groups.setdefault(index, []).append(key)
+            return [groups[index] for index in sorted(groups)]
+        keys = self.visible_keys()
+        return [keys] if keys else []
+
+    def _cache_span(self, keys: list[str]) -> tuple[float, float] | None:
+        """当前窗口缓存里的 min/max 并集；常值信号用 pad 兜底，绝不显示 0..1。"""
+        lo: float | None = None
+        hi: float | None = None
+        for key in keys:
+            cache = self._cache.get(key)
+            if cache is None:
+                continue
+            for values in (cache.mins, cache.maxs):
+                for value in values:
+                    if not _finite(value):
+                        continue
+                    number = float(value)
+                    lo = number if lo is None else min(lo, number)
+                    hi = number if hi is None else max(hi, number)
+        if lo is None or hi is None:
+            return None
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            return None
+        if hi <= lo:
+            pad = max(1e-9, abs(lo) * 0.05)
+            return lo - pad, hi + pad
+        return lo, hi
+
+    def _override_range(self, key: str) -> tuple[float, float] | None:
+        value = self._y_override.get(key)
+        if not value:
+            return None
+        try:
+            lo, hi = float(value[0]), float(value[1])
+        except (TypeError, ValueError, IndexError):
+            return None
+        if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
+            return None
+        return lo, hi
+
+    def _zoom_y_axis(self, keys: list[str], factor: float, fraction: float) -> None:
+        """只改 Y 覆盖 + 重算布局：不调 ``_request_view``（不取数）。"""
+        keys = [key for key in keys if self._visible.get(key)]
+        if not keys:
+            return
+        fraction = max(0.0, min(1.0, float(fraction)))
+        full_lo = min(self._series_range(key)[0] for key in keys)
+        full_hi = max(self._series_range(key)[1] for key in keys)
+        full_span = full_hi - full_lo
+        if not (math.isfinite(full_span) and full_span > 0):
+            return
+        ranges = [self._override_range(key) or self._series_range(key) for key in keys]
+        lo = min(item[0] for item in ranges)
+        hi = max(item[1] for item in ranges)
+        span = hi - lo
+        if not (math.isfinite(span) and span > 0):
+            return
+        anchor = lo + fraction * span
+        new_span = span * float(factor)
+        new_span = max(full_span * MIN_SPAN_RATIO, min(full_span, new_span))
+        new_lo = anchor - fraction * new_span
+        # 贴边时整体回推，避免把数据推到画布外。
+        if new_lo < full_lo:
+            new_lo = full_lo
+        if new_lo + new_span > full_hi:
+            new_lo = full_hi - new_span
+        new_hi = new_lo + new_span
+        for key in keys:
+            self._y_override[key] = (new_lo, new_hi)
+        self._invalidate_layout()
+        self._publish_readout()
+
     def set_mode(self, mode: str) -> None:
         """B4：切模式 = 纯布局重算，**不取数**。"""
         if mode not in {value for _label, value in DISPLAY_MODES}:
@@ -1032,8 +1221,11 @@ class PlotCanvas(QWidget):
         if mode == self._mode:
             return
         self._mode = mode
+        # A：模式变了，旧 Y 覆盖的轴语义不再成立。
+        self._y_override.clear()
         self._update_min_height()
         self._invalidate_layout()
+        self._publish_readout()
 
     def set_time_format(self, time_format: str) -> float:
         """E2：切换时间口径 → ``session.set_time_format`` + 重绘，**不取数**。
@@ -1051,7 +1243,9 @@ class PlotCanvas(QWidget):
                 self._last_error = f"{type(exc).__name__}: {exc}"
                 return (time.perf_counter() - started) * 1000.0
         self._time_format = time_format
-        self.update()
+        # A：口径变了，Y 覆盖的时间窗口语义随之失效。
+        self._y_override.clear()
+        self._invalidate_layout()
         return (time.perf_counter() - started) * 1000.0
 
     def set_series_visible(self, key: str, visible: bool) -> None:
@@ -1183,6 +1377,45 @@ class PlotCanvas(QWidget):
                 return rect
         return None
 
+    def _time_axis_band(self) -> QRectF:
+        """X 轴带：车道模式时间轴在顶部，叠加模式在底部（约 24px）。"""
+        rect = self._time_rect()
+        if self._mode == "lanes":
+            return QRectF(rect.left(), max(0.0, rect.top() - 24.0), rect.width(),
+                          min(24.0, rect.top()))
+        return QRectF(rect.left(), rect.bottom(), rect.width(), 26.0)
+
+    def _y_axis_bands(self) -> list[tuple[str, list[str], QRectF]]:
+        """当前画出的每根 Y 轴：(axis id, 该轴对应的 key, 命中矩形)。
+
+        归一化轴（0–100%）不入列：它的语义不允许被 Y 覆盖 / 滚轮改写。
+        """
+        rect = self._time_rect()
+        bands: list[tuple[str, list[str], QRectF]] = []
+        if self._mode == "lanes":
+            for key, lane in self._lane_rects():
+                bands.append((key, [key],
+                              QRectF(0.0, lane.top(), LANE_LEFT, lane.height())))
+            return bands
+        if self._mode == "multi_axis":
+            axes, mapping = self._multi_axes()
+            groups: dict[int, list[str]] = {}
+            for key, index in mapping.items():
+                groups.setdefault(index, []).append(key)
+            for index, axis in enumerate(axes):
+                if axis.get("normalized"):
+                    continue
+                left = rect.left() - (index + 1) * AXIS_WIDTH
+                bands.append((f"axis:{index}", groups.get(index, []),
+                              QRectF(left, rect.top(), AXIS_WIDTH, rect.height())))
+            return bands
+        keys = self.visible_keys()
+        if keys:
+            bands.append(("axis:single", keys,
+                          QRectF(rect.left() - AXIS_WIDTH, rect.top(), AXIS_WIDTH,
+                                 rect.height())))
+        return bands
+
     def _series_range(self, key: str) -> tuple[float, float]:
         item = self._stats.get(key) or {}
         lo, hi = item.get("vmin"), item.get("vmax")
@@ -1213,9 +1446,16 @@ class PlotCanvas(QWidget):
         mapping: dict[str, int] = {}
         for unit in order[:4]:
             indexes = groups[unit]
-            ranges = [self._series_range(key) for key in indexes]
-            lo = min(value[0] for value in ranges)
-            hi = max(value[1] for value in ranges)
+            overrides = [self._override_range(key) for key in indexes]
+            overrides = [item for item in overrides if item is not None]
+            if overrides:
+                # A / D：Y 覆盖优先生效（求并集，多 key 同轴时不会互相吃掉）。
+                lo = min(item[0] for item in overrides)
+                hi = max(item[1] for item in overrides)
+            else:
+                ranges = [self._series_range(key) for key in indexes]
+                lo = min(value[0] for value in ranges)
+                hi = max(value[1] for value in ranges)
             if hi <= lo:
                 hi = lo + 1.0
             axes.append({"unit": unit, "vmin": lo, "vmax": hi,
@@ -1234,7 +1474,7 @@ class PlotCanvas(QWidget):
 
     def _y_range(self, key: str) -> tuple[float, float]:
         if self._mode == "lanes":
-            return self._series_range(key)
+            return self._override_range(key) or self._series_range(key)
         if self._mode == "multi_axis":
             axes, mapping = self._multi_axes()
             index = mapping.get(key, 0)
@@ -1243,9 +1483,10 @@ class PlotCanvas(QWidget):
                 if axis.get("normalized"):
                     return self._series_range(key)
                 return float(axis["vmin"]), float(axis["vmax"])
-            return self._series_range(key)
+            return self._override_range(key) or self._series_range(key)
         keys = self.visible_keys() or [key]
-        ranges = [self._series_range(item) for item in keys]
+        ranges = [self._override_range(item) or self._series_range(item)
+                  for item in keys]
         return min(value[0] for value in ranges), max(value[1] for value in ranges)
 
     def _update_min_height(self) -> None:
@@ -1320,11 +1561,7 @@ class PlotCanvas(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         painter.fillRect(self.rect(), QColor("#1E1E24"))
-        if not self._keys:
-            self._draw_center_message(painter, "无可见信号")
-            painter.end()
-            return
-        if not self.any_visible():
+        if not self._keys or not self.any_visible():
             self._draw_center_message(painter, "无可见信号")
             painter.end()
             return
@@ -1334,6 +1571,8 @@ class PlotCanvas(QWidget):
             self._paint_overlay(painter)
         if self._hover_t is not None and self._hover_pos is not None:
             self._draw_crosshair(painter, self._time_rect())
+        if self._select_anchor is not None and self._select_pos is not None:
+            self._draw_selection(painter)
         painter.end()
 
     def _paint_overlay(self, painter: QPainter) -> None:
@@ -1420,13 +1659,20 @@ class PlotCanvas(QWidget):
             painter.setPen(pen)
             painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
             lo, hi = float(axis["vmin"]), float(axis["vmax"])
-            for tick in range(TICK_COUNT):
-                fraction = tick / (TICK_COUNT - 1)
-                y = rect.bottom() - fraction * rect.height()
+            if hi <= lo:
+                hi = lo + 1.0
+            if axis.get("normalized"):
+                ticks = [lo + (hi - lo) * tick / (TICK_COUNT - 1)
+                         for tick in range(TICK_COUNT)]
+                decimals = 0
+            else:
+                # A：刻度按量程自适应精度，span 很小时不再出现 3 个相同标签。
+                ticks, decimals = _nice_ticks(lo, hi, TICK_COUNT)
+            for value in ticks:
+                y = rect.bottom() - (value - lo) / (hi - lo) * rect.height()
                 painter.drawLine(QPointF(x - 4, y), QPointF(x + 4, y))
-                value = lo + fraction * (hi - lo)
                 label = (f"{value:.0f}%" if axis.get("normalized")
-                         else _fmt_num(value, 3))
+                         else _fmt_num(value, decimals))
                 painter.drawText(QRectF(x - AXIS_WIDTH + 2, y - 8, AXIS_WIDTH - 10, 16),
                                  int(Qt.AlignmentFlag.AlignRight
                                      | Qt.AlignmentFlag.AlignVCenter), label)
@@ -1436,7 +1682,10 @@ class PlotCanvas(QWidget):
     def _draw_lane_axis(self, painter: QPainter, key: str, rect: QRectF) -> None:
         meta = self._signal_meta.get(key, {})
         style = self._styles.get(key) or SeriesStyle(series_color(0))
-        lo, hi = self._series_range(key)
+        # A / D：车道 Y 轴必须认 Y 覆盖（与 _ensure_geometry 用同一口径）。
+        lo, hi = self._y_range(key)
+        if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
+            hi = lo + 1.0
         font = QFont(self.font())
         font.setPointSizeF(max(6.5, font.pointSizeF() - 1.5))
         painter.setFont(font)
@@ -1449,13 +1698,12 @@ class PlotCanvas(QWidget):
                          int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
                          title)
         painter.setPen(QColor("#9A9AB0"))
-        for tick in range(3):
-            fraction = tick / 2.0
-            y = rect.bottom() - fraction * rect.height()
-            value = lo + fraction * (hi - lo)
+        ticks, decimals = _nice_ticks(lo, hi, 3)
+        for value in ticks:
+            y = rect.bottom() - (value - lo) / (hi - lo) * rect.height()
             painter.drawText(QRectF(8, y - 8, LANE_LEFT - 18, 16),
                              int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
-                             _fmt_num(value, 3))
+                             _fmt_num(value, decimals))
 
     def _draw_time_axis(self, painter: QPainter, rect: QRectF, *, at_top: bool) -> None:
         font = QFont(self.font())
@@ -1516,68 +1764,110 @@ class PlotCanvas(QWidget):
         if self._hover_pos is not None:
             y = max(rect.top(), min(rect.bottom(), self._hover_pos.y()))
             painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
-        lines = [f"时间：{format_axis_time(hover_t, self._time_format, self._t_min_str)}"]
+
+    def _selection_rect(self) -> QRectF:
+        if self._select_anchor is None or self._select_pos is None:
+            return QRectF()
+        box = QRectF(self._select_anchor, self._select_pos).normalized()
+        plot = self._time_rect()
+        if plot.width() <= 1 or plot.height() <= 1:
+            return QRectF()
+        return box.intersected(plot)
+
+    def _draw_selection(self, painter: QPainter) -> None:
+        """B：虚线框 + 半透明填充（裁到绘图区，不溢出到轴带）。"""
+        box = self._selection_rect()
+        if box.width() < 1 or box.height() < 1:
+            return
+        painter.save()
+        painter.setClipRect(self._time_rect())
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(79, 195, 247, 40)))
+        painter.drawRect(box)
+        pen = QPen(QColor("#4FC3F7"))
+        pen.setStyle(Qt.PenStyle.DashLine)
+        pen.setWidthF(1.0)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(box)
+        painter.restore()
+
+    # ------------------------------------------------- 固定读数条 ----
+    def _signal_label(self, key: str) -> str:
+        meta = self._signal_meta.get(key, {})
+        return str(meta.get("signal") or key)
+
+    def _readout_groups(self) -> list[tuple[str, str]]:
+        """(标签, 代表 key)：lanes 每车道 / multi_axis 每 unit / single_axis 单值。"""
+        if self._mode == "lanes":
+            return [(self._signal_label(key), key) for key in self.visible_keys()]
+        if self._mode == "multi_axis":
+            axes, mapping = self._multi_axes()
+            groups: list[tuple[str, str]] = []
+            seen: set[int] = set()
+            for key in self.visible_keys():
+                index = mapping.get(key, -1)
+                if index < 0 or index in seen:
+                    continue
+                seen.add(index)
+                unit = str(axes[index].get("unit") or "") if index < len(axes) else ""
+                groups.append((unit or self._signal_label(key), key))
+            return groups
+        keys = self.visible_keys()
+        return [(self._signal_label(keys[0]), keys[0])] if keys else []
+
+    @staticmethod
+    def _bucket_sample(cache: SeriesCache, index: int) -> float | None:
+        """桶读数：mean 优先，缺失时退回 min/max 中点；空桶向两侧再看 4 个。"""
+        if index < 0:
+            return None
+        for offset in (0, -1, 1, -2, 2, -3, 3, -4, 4):
+            position = index + offset
+            if position < 0 or position >= len(cache.times):
+                continue
+            value = cache.means[position] if position < len(cache.means) else None
+            if _finite(value):
+                return float(value)
+            low = cache.mins[position] if position < len(cache.mins) else None
+            high = cache.maxs[position] if position < len(cache.maxs) else None
+            if _finite(low) and _finite(high):
+                return (float(low) + float(high)) / 2.0
+            if _finite(low):
+                return float(low)
+            if _finite(high):
+                return float(high)
+        return None
+
+    def _readout_text(self) -> str:
+        """E：``t = …`` + 各轴数值。数据源只有 ``_cache`` + ``_nearest_index``。"""
+        hover_t = self._readout_t
+        if hover_t is None or not self._keys:
+            return ""
+        parts = [f"t = {format_tick_time(hover_t, self._time_format, self._t_min_str)}"]
         shown = 0
-        for key in self.visible_keys():
+        for label, key in self._readout_groups():
             cache = self._cache.get(key)
             if cache is None or not cache.times:
                 continue
             index = self._nearest_index(cache.times, hover_t)
             if index < 0:
                 continue
-            unit = (self._signal_meta.get(key, {}).get("unit") or "").strip()
-            name = str(self._signal_meta.get(key, {}).get("signal") or key)
-            value = cache.means[index] if index < len(cache.means) else None
-            lo = cache.mins[index] if index < len(cache.mins) else None
-            hi = cache.maxs[index] if index < len(cache.maxs) else None
-            suffix = f" {unit}" if unit else ""
-            lines.append(f"● {name}: {_fmt_num(value, 4)} "
-                         f"({_fmt_num(lo, 4)} ~ {_fmt_num(hi, 4)}){suffix}")
+            value = self._bucket_sample(cache, index)
+            lo, hi = self._y_range(key)
+            parts.append(f"{label} = {_fmt_readout(value, lo, hi)}")
             shown += 1
-            if shown >= 10:
-                lines.append(f"… 还有 {max(0, self.visible_count() - shown)} 条可见信号")
+            if shown >= 8:
+                remaining = len(self._readout_groups()) - shown
+                if remaining > 0:
+                    parts.append(f"… +{remaining}")
                 break
-        self._draw_readout(painter, rect, lines)
+        return "   ".join(parts)
 
-    def _draw_readout(self, painter: QPainter, rect: QRectF, lines: list[str]) -> None:
-        font = QFont(self.font())
-        font.setPointSizeF(max(7.0, font.pointSizeF() - 1.0))
-        painter.setFont(font)
-        metrics = QFontMetrics(font)
-        line_height = metrics.height() + 2
-        width = max(metrics.horizontalAdvance(line) for line in lines) + 18
-        width = min(width, max(160.0, rect.width() - 20))
-        height = line_height * len(lines) + 12
-        anchor = self._hover_pos or QPointF(rect.left(), rect.top())
-        bx = anchor.x() + 14
-        by = anchor.y() + 12
-        if bx + width > rect.right():
-            bx = anchor.x() - width - 14
-        if by + height > rect.bottom():
-            by = anchor.y() - height - 12
-        bx = max(rect.left() + 4, bx)
-        by = max(rect.top() + 4, by)
-        box = QRectF(bx, by, width, height)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(QColor(37, 37, 46, 235)))
-        painter.drawRoundedRect(box, 5, 5)
-        painter.setPen(QPen(QColor("#3A3A46")))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(box, 5, 5)
-        for offset, line in enumerate(lines):
-            color = QColor("#E8E8F0") if offset == 0 else QColor("#C8C8D8")
-            if offset > 0 and line.startswith("●"):
-                visible = self.visible_keys()
-                position = offset - 1
-                if 0 <= position < len(visible):
-                    style = self._styles.get(visible[position])
-                    if style is not None:
-                        color = QColor(style.color)
-            painter.setPen(color)
-            painter.drawText(QRectF(box.left() + 9, box.top() + 6 + offset * line_height,
-                                    box.width() - 18, line_height),
-                             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-                             line)
+    def _publish_readout(self) -> None:
+        try:
+            self.readout_changed.emit(self._readout_text())
+        except RuntimeError:  # 窗口正在销毁
+            return
 
     @staticmethod
     def _nearest_index(times: list, t: float) -> int:
@@ -1593,22 +1883,56 @@ class PlotCanvas(QWidget):
 
     # ----------------------------------------------------------- 交互 ----
     def wheelEvent(self, event) -> None:  # noqa: N802 - Qt 命名
-        delta = event.angleDelta().y()
-        if delta == 0:
-            return
-        factor = 0.8 if delta > 0 else 1.25
-        self.zoom_at(factor, event.position().x(), fetch=True, coarse=True)
+        self.wheel_at(event.position(), event.angleDelta().y())
         event.accept()
 
+    def wheel_at(self, position: QPointF, delta: int) -> None:
+        """A：X 轴带只缩 X；Y 轴带只缩该轴的 Y；其他区域保持整体缩放。"""
+        if not delta:
+            return
+        factor = 0.8 if delta > 0 else 1.25
+        if self._time_axis_band().contains(position):
+            self.zoom_at(factor, position.x(), fetch=True, coarse=True)
+            return
+        for _axis_id, keys, band in self._y_axis_bands():
+            if not keys or band.width() <= 1 or band.height() <= 1:
+                continue
+            if not band.contains(position):
+                continue
+            # fraction：底边 = 0（lo），顶边 = 1（hi），与锚点公式一致。
+            fraction = (band.bottom() - position.y()) / band.height()
+            self._zoom_y_axis(keys, factor, fraction)
+            return
+        self.zoom_at(factor, position.x(), fetch=True, coarse=True)
+
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        position = event.position()
+        shift_left = (event.button() == Qt.MouseButton.LeftButton
+                      and bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier))
+        if shift_left or event.button() == Qt.MouseButton.RightButton:
+            # B：先判选框状态，再判平移 anchor；两个状态机互斥。
+            self._drag_anchor = None
+            self._select_anchor = position
+            self._select_pos = position
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            self.update()
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_anchor = event.position()
+            self._select_anchor = None
+            self._select_pos = None
+            self._drag_anchor = position
             self._drag_view = [self._view[0], self._view[1]]
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         position = event.position()
+        if self._select_anchor is not None:
+            # 框选期间只画框，绝不动 _view（否则每次 move 都重建全部 QPainterPath）。
+            self._select_pos = position
+            self.update()
+            return
         if self._drag_anchor is not None:
             rect = self._time_rect()
             if rect.width() > 1:
@@ -1625,13 +1949,27 @@ class PlotCanvas(QWidget):
             self._hover_t = self._view[0] + max(0.0, min(1.0, fraction)) * (
                 self._view[1] - self._view[0])
             self._hover_pos = position
+            self._readout_t = self._hover_t
+            self._publish_readout()
         else:
             self._hover_t = None
             self._hover_pos = None
         self.update()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt 命名
-        if event.button() == Qt.MouseButton.LeftButton:
+        release = event.button()
+        if self._select_anchor is not None and release in (
+                Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
+            anchor = self._select_anchor
+            position = self._select_pos if self._select_pos is not None else anchor
+            self._select_anchor = None
+            self._select_pos = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self._commit_selection(anchor, position)
+            self.update()
+            event.accept()
+            return
+        if release == Qt.MouseButton.LeftButton:
             was_dragging = self._drag_anchor is not None
             self._drag_anchor = None
             self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -1640,15 +1978,69 @@ class PlotCanvas(QWidget):
                 self._refine_timer.stop()
                 self._coarse = False
                 self._request_view(self._actual_width(), force=True)
+                self._publish_readout()
         super().mouseReleaseEvent(event)
+
+    def _commit_selection(self, anchor: QPointF, position: QPointF) -> None:
+        """B：像素 → 数据域；X 排序；纵向 > 4px 时同时写 Y 覆盖。"""
+        rect = self._time_rect()
+        if rect.width() <= 2 or rect.height() <= 2:
+            return
+        left = max(rect.left(), min(anchor.x(), position.x()))
+        right = min(rect.right(), max(anchor.x(), position.x()))
+        top = max(rect.top(), min(anchor.y(), position.y()))
+        bottom = min(rect.bottom(), max(anchor.y(), position.y()))
+        width = right - left
+        height = bottom - top
+        if width < 4 or width * height < 2:
+            return                     # 误触
+        span = self._view[1] - self._view[0]
+        t0 = self._view[0] + (left - rect.left()) / rect.width() * span
+        t1 = self._view[0] + (right - rect.left()) / rect.width() * span
+        if t1 <= t0:
+            return
+        self._view = [t0, t1]
+        self._prune_view()
+        if height > 4:
+            self._apply_y_selection(top, bottom)
+        # X 变了：必须重新取数。
+        self._refine_timer.stop()
+        self._coarse = False
+        self._request_view(self._actual_width(), force=True)
+        self._publish_readout()
+
+    def _apply_y_selection(self, top: float, bottom: float) -> None:
+        """把选框纵向范围换算成 Y 覆盖；按模式写满该轴的可见 key。"""
+        changed = False
+        for _axis_id, keys, band in self._y_axis_bands():
+            if not keys or band.height() <= 1:
+                continue
+            band_top = max(band.top(), top)
+            band_bottom = min(band.bottom(), bottom)
+            if band_bottom - band_top < 4:
+                continue
+            lo, hi = self._y_range(keys[0])
+            if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
+                continue
+            y_lo = lo + (band.bottom() - band_bottom) / band.height() * (hi - lo)
+            y_hi = lo + (band.bottom() - band_top) / band.height() * (hi - lo)
+            if not (math.isfinite(y_lo) and math.isfinite(y_hi)) or y_hi <= y_lo:
+                continue
+            for key in keys:
+                self._y_override[key] = (y_lo, y_hi)
+            changed = True
+        if changed:
+            self._invalidate_layout()
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         if event.button() == Qt.MouseButton.LeftButton:
             self._refine_timer.stop()
-            self.reset_view(fetch=True)
+            self._coarse = False
+            self.fit_all()
         super().mouseDoubleClickEvent(event)
 
     def leaveEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        # E：十字线隐藏，但读数条保留最后一次数值。
         self._hover_t = None
         self._hover_pos = None
         self.update()
@@ -1726,7 +2118,7 @@ class PreviewWindow(QWidget):
                  parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("plotWindow")
-        self.setWindowTitle("📈 数据预览 · PlotSession · min/max 包络")
+        self.setWindowTitle("📈 数据预览")
         self.resize(1280, 760)
 
         self._session = session
@@ -1774,8 +2166,7 @@ class PreviewWindow(QWidget):
         elif static_data is not None:
             self.set_static_data(static_data, time_format=self._time_format,
                                  settings=self._view_settings)
-            self.show_notice("未建缓存（较慢）：本次为一次性抽稀数据，"
-                             "缩放 / 平移仍可用，但切换时间口径需要重新取数。")
+            self.show_notice("未建缓存：切换时间口径需重新取数")
         elif session is not None:
             self.set_session(session, self._info, self._stats, self._config,
                              self._initial_keys, format_meta=self._format_meta,
@@ -1800,7 +2191,7 @@ class PreviewWindow(QWidget):
         self.combo_time = QComboBox(self)
         for label, value in self._choices:
             self.combo_time.addItem(label, value)
-        self.combo_time.setToolTip("纯显示层切换：只调 session.set_time_format()，不重新取数")
+        self.combo_time.setToolTip("切换时间显示方式")
         self.combo_time.currentIndexChanged.connect(self._on_time_format_changed)
         row.addWidget(self.combo_time)
         row.addSpacing(8)
@@ -1808,7 +2199,6 @@ class PreviewWindow(QWidget):
         self.combo_mode = QComboBox(self)
         for label, value in DISPLAY_MODES:
             self.combo_mode.addItem(label, value)
-        self.combo_mode.setToolTip("车道 / 多 Y 轴叠加 / 单 Y 轴；切换只重算布局，不取数")
         self.combo_mode.currentIndexChanged.connect(self._on_mode_changed)
         row.addWidget(self.combo_mode)
         row.addStretch(1)
@@ -1851,15 +2241,12 @@ class PreviewWindow(QWidget):
         actions.setSpacing(8)
         self.btn_raise = QPushButton("提高上限并重试", self)
         self.btn_raise.setObjectName("plotBannerButton")
-        self.btn_raise.setToolTip("打开缓存上限设置，用更大的 cache_budget_mb 重试")
         self.btn_raise.clicked.connect(self._on_raise_budget)
         self.btn_reduce = QPushButton("只预览更少报文", self)
         self.btn_reduce.setObjectName("plotBannerButton")
-        self.btn_reduce.setToolTip("回到主窗口减少勾选的报文 / 信号后重新预览")
         self.btn_reduce.clicked.connect(self.reduce_selection_requested.emit)
         self.btn_nocache = QPushButton("不建缓存继续（较慢）", self)
         self.btn_nocache.setObjectName("plotBannerButton")
-        self.btn_nocache.setToolTip("不建帧缓存，一次性抽稀后继续预览（较慢）")
         self.btn_nocache.clicked.connect(self.no_cache_requested.emit)
         actions.addWidget(self.btn_raise)
         actions.addWidget(self.btn_reduce)
@@ -1879,7 +2266,21 @@ class PreviewWindow(QWidget):
         self.canvas.setObjectName("plotCanvas")
         self.canvas.view_refreshed.connect(self._update_top_info)
         self.scroll.setWidget(self.canvas)
-        body.addWidget(self.scroll, 1)
+        # E：画布下方的固定读数条（不随画布滚动）。
+        area = QWidget(self)
+        area.setObjectName("plotArea")
+        area_layout = QVBoxLayout(area)
+        area_layout.setContentsMargins(0, 0, 0, 0)
+        area_layout.setSpacing(2)
+        area_layout.addWidget(self.scroll, 1)
+        self.readout = QLabel("", area)
+        self.readout.setObjectName("plotReadout")
+        self.readout.setFixedHeight(26)
+        self.readout.setTextFormat(Qt.TextFormat.PlainText)
+        self.readout.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        area_layout.addWidget(self.readout, 0)
+        self.canvas.readout_changed.connect(self.readout.setText)
+        body.addWidget(area, 1)
         self.panel = SignalPanel(self)
         self.panel.all_toggled.connect(self._on_all_toggled)
         self.panel.visibility_toggled.connect(self._on_visibility_toggled)
@@ -1894,8 +2295,20 @@ class PreviewWindow(QWidget):
         self.chk_mean.setChecked(True)
         self.chk_mean.toggled.connect(self._on_show_mean)
         controls.addWidget(self.chk_mean)
+        # D：FIT X / FIT Y / FIT ALL（Y 只改覆盖，不取数）。
+        self.btn_fit_x = QPushButton("FIT X", self)
+        self.btn_fit_x.setObjectName("plotFitButton")
+        self.btn_fit_x.clicked.connect(self.canvas.fit_x)
+        self.btn_fit_y = QPushButton("FIT Y", self)
+        self.btn_fit_y.setObjectName("plotFitButton")
+        self.btn_fit_y.clicked.connect(self.canvas.fit_y)
+        self.btn_fit_all = QPushButton("FIT ALL", self)
+        self.btn_fit_all.setObjectName("plotFitButton")
+        self.btn_fit_all.clicked.connect(self.canvas.fit_all)
+        for button in (self.btn_fit_x, self.btn_fit_y, self.btn_fit_all):
+            controls.addWidget(button)
         controls.addStretch(1)
-        hint = QLabel("滚轮缩放 · 左键拖动平移 · 双击复位 · 十字线读数不取数", self)
+        hint = QLabel("滚轮缩放(轴内单轴) · 左键平移 · 右键框选 · 双击复位", self)
         hint.setObjectName("hintLabel")
         controls.addWidget(hint)
         outer.addLayout(controls)
@@ -1992,9 +2405,6 @@ class PreviewWindow(QWidget):
                                  f"{_fmt_points(points)} 点")
         hit = " · 命中" if self._cache_hit else ""
         self.lbl_cache.setText(f"缓存 {_fmt_mib(self._cache_bytes)}/{self._cache_budget_mb} MiB{hit}")
-        self.lbl_cache.setToolTip(
-            f"cache_bytes={self._cache_bytes} B\ncache_hit={self._cache_hit}\n"
-            f"预算={self._cache_budget_mb} MiB")
         self._update_loading_text()
 
     def _update_loading_text(self) -> None:
@@ -2015,10 +2425,10 @@ class PreviewWindow(QWidget):
 
     def _update_warning(self) -> None:
         if self.canvas.mode == "single_axis" and self.canvas.mixed_units():
-            self.lbl_warn.setText("⚠ 量纲混杂，仅建议同量纲信号（单 Y 轴会把 km/h 与 degC 画到同一刻度）")
+            self.lbl_warn.setText("⚠ 量纲混杂")
             self.lbl_warn.setVisible(True)
         elif self.canvas.normalized_keys():
-            self.lbl_warn.setText("超出 4 个量纲，其余信号已归一化到 0–100%（见图例标注）")
+            self.lbl_warn.setText("⚠ 超出 4 个量纲，已归一化到 0–100%")
             self.lbl_warn.setVisible(True)
         else:
             self.lbl_warn.setVisible(False)
@@ -2223,6 +2633,8 @@ class PreviewWindow(QWidget):
         self.panel.setEnabled(False)
         self.combo_mode.setEnabled(False)
         self.combo_time.setEnabled(False)
+        for button in (self.btn_fit_x, self.btn_fit_y, self.btn_fit_all):
+            button.setEnabled(False)
         self.lbl_window.setText("窗口 —")
         self.lbl_full.setText("全量 —")
         self.lbl_visible.setText("可见 0 条 · 0 点")
@@ -2354,7 +2766,9 @@ class PlotScrollArea(QScrollArea):
     def wheelEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         canvas = self.widget()
         if isinstance(canvas, PlotCanvas):
-            canvas.wheelEvent(event)
+            # 竖向滚动条可能把画布推上去：滚轮坐标是 viewport 坐标，必须换算。
+            position = canvas.mapFrom(self.viewport(), event.position().toPoint())
+            canvas.wheel_at(QPointF(position), event.angleDelta().y())
             event.accept()
             return
         super().wheelEvent(event)
