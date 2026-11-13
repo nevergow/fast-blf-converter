@@ -869,6 +869,27 @@ QPushButton#plotBannerButton:hover {
     border-color: #E5534B;
 }
 
+/* D：画布下方 FIT X / FIT Y / FIT ALL */
+QPushButton#plotFitButton {
+    background-color: #2D2D38;
+    border: 1px solid #3A3A46;
+    border-radius: 5px;
+    color: #C8C8D8;
+    padding: 3px 10px;
+    font-weight: 600;
+}
+
+QPushButton#plotFitButton:hover {
+    background-color: #35353F;
+    border-color: #4FC3F7;
+    color: #E8E8F0;
+}
+
+QPushButton#plotFitButton:disabled {
+    color: #6B6B7C;
+    border-color: #33333D;
+}
+
 /* 右侧信号面板：一个三态全选框 + 过滤框 + 每行色块。 */
 QWidget#signalPanel {
     background-color: #25252E;
