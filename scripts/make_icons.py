@@ -184,44 +184,87 @@ def write_icns(master, compact, dest: Path) -> Path | None:
     return dest
 
 
-def write_logo(master, dest: Path) -> Path:
-    """裁一张 README 用的横版 logo：紧贴图案四边留白 → 圆角浅灰卡片。
+def write_banner(master, light_dest: Path, dark_dest: Path) -> tuple[Path, Path]:
+    """README 顶部横幅（Notion 封面式）：全幅 4:1，浅色/深色两版。
 
-    为什么要裁：源图是 512 方形，图案只占中间 471×313 的一条，直接把整张方图塞进 README
-    会显得又小又空。这里按"图案包围盒"重新构图，输出 2 倍图（README 里按一半宽度显示）。
+    构图：底色 + 由图案自己放大模糊得到的氛围底 → 图案居中（正片叠底/滤色融入背景，
+    所以没有"一块白板"）。浅色版在 GitHub 浅色主题用，深色版给深色主题切。
+
+    两个必须处理干净的点：
+    * 正片叠底要求图案底色是**纯白**，源图是 #F9F9F9，直接乘会留一个暗 2% 的矩形；
+      所以先从四角泛洪把与边缘连通的近白压成纯白（FBC 字母那种被包住的内部白不动）。
+    * 深色版不能反过来简单 invert：黑字变白字的同时砖红会变成青色。这里按饱和度分离，
+      只把**中性色**（低饱和）反相，红色原样保留。
     """
-    Image, ImageChops, _ImageFilter, _ImageOps = _pil()
+    Image, ImageChops, ImageFilter, _ImageOps = _pil()
     from PIL import ImageDraw
 
+    W, H = 1760, 528   # 3.33:1；GitHub 按内容宽约 880 显示 → 正好 2 倍图
     rgb = master.convert("RGB")
     bg = rgb.getpixel((0, 0))
     diff = ImageChops.difference(rgb, Image.new("RGB", rgb.size, bg)).convert("L")
-    art = diff.point(lambda v: 255 if v > 12 else 0).getbbox()
-    if not art:
-        raise SystemExit("[LOGO] 源图里找不到图案")
-    pad = int(round((art[3] - art[1]) * 0.05))  # 按图案高度留 5% 呼吸位，不再用长边算（会显得上下太空）
-    canvas = Image.new("RGBA", (art[2] - art[0] + pad * 2, art[3] - art[1] + pad * 2),
-                       (bg[0], bg[1], bg[2], 255))
-    canvas.paste(master.crop(art), (pad, pad), master.crop(art))
+    art = rgb.crop(diff.point(lambda v: 255 if v > 12 else 0).getbbox())
+    for xy in ((0, 0), (art.width - 1, 0), (0, art.height - 1), (art.width - 1, art.height - 1)):
+        ImageDraw.floodfill(art, xy, (255, 255, 255), thresh=14)
 
-    # 2 倍图：README 里 width=500，实际 1000px，Retina 上不糊。
-    scale = 1000 / canvas.width
-    canvas = canvas.resize((1000, int(round(canvas.height * scale))), Image.LANCZOS)
+    def cover(img, w, h):
+        scale = max(w / img.width, h / img.height)
+        big = img.resize((int(img.width * scale) + 1, int(img.height * scale) + 1), Image.LANCZOS)
+        left, top = (big.width - w) // 2, (big.height - h) // 2
+        return big.crop((left, top, left + w, top + h))
 
-    # 圆角 + 1px 描边：白底/暗底主题下都能看出"这是一张卡"，而不是一块贴上去的白斑。
-    radius = int(round(canvas.height * 0.10))
-    mask = Image.new("L", canvas.size, 0)
-    ImageDraw.Draw(mask).rounded_rectangle([0, 0, canvas.width - 1, canvas.height - 1],
-                                           radius=radius, fill=255)
-    card = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-    card.paste(canvas, (0, 0), mask)
-    ImageDraw.Draw(card).rounded_rectangle([0, 0, canvas.width - 1, canvas.height - 1],
-                                           radius=radius, outline=(0, 0, 0, 26), width=2)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    card.save(dest, format="PNG", optimize=True)
-    print(f"[LOGO] README 横版 logo → {dest.relative_to(ROOT)} "
-          f"({card.width}x{card.height}, {dest.stat().st_size} B)")
-    return dest
+    def vignette():
+        """上下两端渐隐回页面底色的蒙版：只作用于**氛围底**，不作用于图案。
+
+        这样横幅上下看不出矩形边，而图案本身不会被淡掉——两者互不影响，图案高度也就不受
+        渐隐带宽度限制。
+        """
+        grad = Image.new("L", (1, H))
+        for y in range(H):
+            t = abs((y / (H - 1)) * 2 - 1)          # 0 = 中间, 1 = 上下边缘
+            f = max(0.0, (t - 0.50) / 0.50)         # 中间 50% 不动，外侧才开始过渡
+            grad.putpixel((0, y), int(255 * f ** 1.4))
+        return grad.resize((W, H))
+
+    def compose(base_color, art_layer, blend, mode):
+        # 氛围底：图案放大模糊后，两端淡成页面底色，再按 blend 混进纯色底
+        wash = cover(art_layer, W, H).filter(ImageFilter.GaussianBlur(60))
+        wash = Image.composite(Image.new("RGB", (W, H), base_color), wash, vignette())
+        base = Image.blend(Image.new("RGB", (W, H), base_color), wash, blend)
+        edge = (255, 255, 255) if mode == "multiply" else (0, 0, 0)
+        logo = art_layer.resize((int(art_layer.width * (H * 0.70) / art_layer.height),
+                                 int(H * 0.70)), Image.LANCZOS)
+        layer = Image.new("RGB", (W, H), edge)
+        x0, y0 = (W - logo.width) // 2, (H - logo.height) // 2
+        layer.paste(logo, (x0, y0))
+        merged = ImageChops.multiply(base, layer) if mode == "multiply" else ImageChops.screen(base, layer)
+        # 图案左右两端做 6% 宽度的羽化：源图的速度线/粒子本来就在画布边缘被切断，
+        # 放到宽横幅里会显得"一刀切"；淡出到背景后看起来是刻意消散。
+        feather = int(logo.width * 0.06)
+        mask = Image.new("L", (W, H), 255)
+        ramp = Image.new("L", (feather, 1))
+        for i in range(feather):
+            ramp.putpixel((i, 0), int(255 * i / feather))
+        mask.paste(ramp.resize((feather, logo.height)), (x0, y0))
+        mask.paste(ramp.resize((feather, logo.height)).transpose(Image.FLIP_LEFT_RIGHT),
+                   (x0 + logo.width - feather, y0))
+        return Image.composite(merged, base, mask)
+
+    # 深色版：中性色反相（黑↔白），彩色（红）保持
+    hsv = art.convert("HSV")
+    neutral = hsv.split()[1].point(lambda v: 255 if v < 40 else 0)
+    dark_art = Image.composite(ImageChops.invert(art), art, neutral)
+
+    # 底色 = 页面底色（GitHub 浅色 #FFFFFF / 深色 #0D1117），横幅才能和页面融为一体
+    light = compose((255, 255, 255), art, 0.26, "multiply")
+    dark = compose((13, 17, 23), dark_art, 0.30, "screen")
+
+    for img, dest, tag in ((light, light_dest, "浅色"), (dark, dark_dest, "深色")):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        img.save(dest, format="PNG", optimize=True)
+        print(f"[BANNER] {tag}横幅 → {dest.relative_to(ROOT)} "
+              f"({img.width}x{img.height}, {dest.stat().st_size} B)")
+    return light_dest, dark_dest
 
 
 def write_preview(master, compact, dest: Path) -> Path:
@@ -260,7 +303,8 @@ def main(argv: list[str] | None = None) -> int:
     write_runtime(origin, DEFAULT_SOURCE)
     write_ico(master, compact, ROOT / "packaging" / "icon.ico")
     write_icns(master, compact, ROOT / "packaging" / "icon.icns")
-    write_logo(master, ROOT / "docs" / "assets" / "logo.png")
+    write_banner(master, ROOT / "docs" / "assets" / "banner.png",
+                 ROOT / "docs" / "assets" / "banner-dark.png")
     if args.preview:
         write_preview(master, compact, Path(args.preview).expanduser())
     return 0

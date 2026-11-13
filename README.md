@@ -1,4 +1,7 @@
-<p align="center"><img src="docs/assets/logo.png" alt="Fast BLF Converter" width="300"></p>
+<p align="center">
+  <img src="docs/assets/banner.png#gh-light-mode-only" alt="Fast BLF Converter">
+  <img src="docs/assets/banner-dark.png#gh-dark-mode-only" alt="Fast BLF Converter">
+</p>
 
 # Fast BLF Converter
 
@@ -112,14 +115,18 @@ gui/main.py (PySide6, 暗色 Fluent)  ──QThread──►  fast_blf_core (Rus
 .venv/bin/python scripts/make_icons.py --preview     # 生成 + 出一张尺寸检查图
 ```
 
-它会派生并提交四份产物：
+它会派生并提交五份产物：
 
 | 产物 | 用途 |
 |---|---|
 | `gui/assets/icon.png` | 运行期 Qt 图标（窗口 / 任务栏 / macOS Dock，均由 `gui/main.py::apply_app_icon` 加载） |
 | `packaging/icon.ico` | Windows exe 资源图标（spec 里 `EXE(icon=...)`，仅 Windows 生效） |
 | `packaging/icon.icns` | macOS 应用图标（将来做 .app 时用） |
-| `docs/assets/logo.png` | README 顶部横幅：按图案包围盒重新裁剪 + 圆角卡片，README 里按 300px 显示（图本身是 2 倍图） |
+| `docs/assets/banner.png` | README 顶部横幅（浅色主题），1760×528 全幅 |
+| `docs/assets/banner-dark.png` | README 顶部横幅（深色主题）；README 用 `#gh-light-mode-only` / `#gh-dark-mode-only` 按主题切换 |
+
+横幅的构图是「页面底色 + 图案自己放大模糊后的氛围底 + 居中图案」，图案用正片叠底（浅色）/滤色
+（深色）融进背景，所以不会出现一块贴上去的白板；上下渐隐回页面底色、左右羽化，看不出矩形的边。
 
 ≤32px 的槽位用的是**以红色 FBC 块为中心的紧凑裁切**、48px 起才是完整构图 —— 完整构图的
 左侧像素/右侧速度线在 16–32px 下只剩噪点，这一点在 `scripts/make_icons.py` 里有注释说明。
