@@ -22,6 +22,7 @@ from __future__ import annotations
 import bisect
 import csv
 import json
+import logging
 import os
 import re
 import shutil
@@ -32,10 +33,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QModelIndex, QObject, QSortFilterProxyModel, QThread, QTimer, Qt, Signal,
+    QModelIndex, QObject, QSortFilterProxyModel, QThread, QTimer, Qt, QUrl, Signal,
 )
 from PySide6.QtGui import (
-    QAction, QColor, QFont, QFontDatabase, QPixmap, QStandardItem, QStandardItemModel,
+    QAction, QColor, QDesktopServices, QFont, QFontDatabase, QPixmap, QStandardItem,
+    QStandardItemModel,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
@@ -50,11 +52,16 @@ try:  # 以脚本方式运行（python gui/main.py）时 gui/ 已在 sys.path �
     import presets as preset_store
     from plot_view import PreviewWindow, TriStateCheckBox
     import report_html as report_builder
+    from log_setup import LOGGER_NAME, log_dir, log_path, setup_logging, shutdown_logging
 except ImportError:  # 作为包导入（gui.main）时
     from gui.check_delegate import CheckStateDelegate
     from gui import presets as preset_store
     from gui.plot_view import PreviewWindow, TriStateCheckBox
     from gui import report_html as report_builder
+    from gui.log_setup import LOGGER_NAME, log_dir, log_path, setup_logging, shutdown_logging
+
+#: Step 22：全应用唯一 logger。窗口化 exe 下 stderr 不可用，一切诊断信息走日志文件。
+logger = logging.getLogger(LOGGER_NAME)
 
 # --------------------------------------------------------------- 内核延迟导入 --
 try:  # pragma: no cover - 取决于是否已 maturin develop
@@ -343,6 +350,37 @@ class SignalFilterProxy(QSortFilterProxyModel):
         return any(self.filterAcceptsRow(row, index) for row in range(model.rowCount(index)))
 
 
+class SignalTreeView(QTreeView):
+    """信号树视图：视图挂的是过滤代理模型，但全应用按**源模型索引**定位节点。
+
+    Qt 6 起 ``QTreeView.isExpanded(index)`` 只认视图自己的模型（这里是
+    :class:`SignalFilterProxy`），传入 ``signal_model`` 的索引一律返回 False；
+    ``expand()`` / ``scrollTo()`` 同理。而“通道 / DBC 节点是否展开在 DBC 名称
+    层级”这件事在代码与自检里都是拿源索引说话的，所以这层把外部传入的源索引
+    先映射到代理侧再交给 Qt，避免调用方每处都手写 ``mapFromSource``。
+    """
+
+    def _view_index(self, index: QModelIndex) -> QModelIndex:
+        """把源模型索引映射到代理侧；不可见（被搜索框过滤）时返回无效索引。"""
+        proxy = self.model()
+        if not index.isValid():
+            return index
+        if index.model() is proxy or not isinstance(proxy, QSortFilterProxyModel):
+            return index
+        return proxy.mapFromSource(index)
+
+    def isExpanded(self, index: QModelIndex) -> bool:  # noqa: N802 - 对齐 Qt 命名
+        return super().isExpanded(self._view_index(index))
+
+    def expand(self, index: QModelIndex) -> None:  # noqa: N802 - 对齐 Qt 命名
+        super().expand(self._view_index(index))
+
+    def scrollTo(self, index: QModelIndex,  # noqa: N802 - 对齐 Qt 命名
+                 hint: QAbstractItemView.ScrollHint =
+                 QAbstractItemView.ScrollHint.EnsureVisible) -> None:
+        super().scrollTo(self._view_index(index), hint)
+
+
 # --------------------------- 工作线程：内核调用全部在此，UI 只通过信号接收 ---
 class Worker(QThread):
     """``mode="scan"`` 调 ``core.scan``；``mode="convert"`` 调 ``core.convert``。"""
@@ -390,11 +428,14 @@ class Worker(QThread):
                 report = self._open_plot_session()
             else:
                 report = core.convert(self.config, self._progress_bridge)
-        except Exception as exc:  # noqa: BLE001 - 任何内核异常都要变成提示
+        except BaseException as exc:  # noqa: BLE001 - pyo3 PanicException 是 BaseException 子类
+            # Step 22：``pyo3_runtime.PanicException`` 不走 ``Exception``，必须抓 BaseException，
+            # 否则 QThread 里 panic 会静默吞掉（窗口化下连 stderr 都没有）。先落盘再按原路径上报。
             text = str(exc)
             self.error_code = next((code for code in (
                 "CACHE_BUDGET_EXCEEDED", "BAD_CONFIG", "EMPTY_RESULT", "DISK_FULL",
                 "BLF_OPEN", "BLF_PARSE", "DBC_PARSE") if code in text), None)
+            logger.exception("worker failed mode=%s code=%s", self.mode, self.error_code)
             self.failed.emit(f"{type(exc).__name__}: {text}")
             return
         if isinstance(report, dict):
@@ -684,6 +725,10 @@ class MainWindow(QMainWindow):
         tune(self.act_settings, statusTip="帧缓存上限与缓存目录（默认 200 MiB / 系统临时目录）")
         self._refresh_settings_tooltip()
         bar.addAction(self.act_settings)
+        # Step 22：窗口化 exe 不弹黑框，出问题时靠日志文件排查 —— 给它一个入口。
+        self.act_open_logs = QAction("📂 打开日志目录", self)
+        tune(self.act_open_logs, statusTip="在文件管理器中打开日志目录（gui.log / crash.log）")
+        bar.addAction(self.act_open_logs)
         bar.addSeparator()
         self.dbc_label = QLabel("DBC 绑定：无")
         tune(self.dbc_label, objectName="hintLabel")
@@ -756,7 +801,7 @@ class MainWindow(QMainWindow):
         self.signal_model.setHeaderData(0, Qt.Orientation.Horizontal, "通道 / DBC / 报文 / 信号")
         self.signal_proxy = SignalFilterProxy(self)
         self.signal_proxy.setSourceModel(self.signal_model)
-        self.signal_view = QTreeView(panel)
+        self.signal_view = SignalTreeView(panel)
         self.signal_view.setModel(self.signal_proxy)
         # Step 6b：三态复选框改为自绘（空框 / 蓝框+横条 / 实心蓝+白勾），
         # 避免 QSS 里实心蓝 indicator 在蓝色选中行上“隐身”、且无法区分部分选中。
@@ -884,6 +929,7 @@ class MainWindow(QMainWindow):
         self.act_load_config.triggered.connect(self.load_config_dialog)
         self.act_delete_config.triggered.connect(self.delete_config_dialog)
         self.act_settings.triggered.connect(self.open_settings_dialog)
+        self.act_open_logs.triggered.connect(self.open_log_dir)
         self.file_tree.files_dropped.connect(self.add_blf_paths)
         self.btn_remove_selected.clicked.connect(self.remove_selected_files)
         self.btn_clear_files.clicked.connect(self.clear_files)
@@ -1080,11 +1126,29 @@ class MainWindow(QMainWindow):
         resolved = str(Path(path).resolve())
         self.dbc_by_channel[channel] = resolved
         self._upsert_dbc_node(channel, resolved, DBC_STATUS_PENDING)
+        self._reveal_dbc_node(channel)
         self._refresh_dbc_label()
         self._refresh_action_state()
         self.statusBar().showMessage(
             f"已为 Ch{channel} 添加 DBC：{os.path.basename(resolved)}"
             "（点「🔍 解析信号」后生效）")
+
+    def _reveal_dbc_node(self, channel: int) -> None:
+        """展开到 DBC 名称层级：展开通道节点并把它滚到视野中央。
+
+        DBC 节点是通道节点的**子节点**，所以"展开到 DBC 名称那一层"就是展开通道
+        节点本身；绝不再往下展开报文 / 信号（报文可能成百上千，展开后完全看不清）。
+        视图挂的是过滤代理模型，``SignalTreeView`` 会把源索引自动映射到代理侧。
+        """
+        channel_item = self._channel_item(channel)
+        index = self.signal_model.indexFromItem(channel_item)
+        if not index.isValid():
+            return
+        if not self.signal_proxy.mapFromSource(index).isValid():
+            # 搜索框过滤掉了该通道（当前不可见）：展开状态留给用户清空关键字后再看。
+            return
+        self.signal_view.expand(index)
+        self.signal_view.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtCenter)
 
     def _upsert_dbc_node(self, channel: int, path: str, status: str) -> QStandardItem:
         """在通道下插入/更新唯一的 DBC 节点（不提供移除单个 DBC 的入口）。"""
@@ -1218,6 +1282,9 @@ class MainWindow(QMainWindow):
                 self.missing_dbc_channels.add(channel)
                 node.setForeground(DBC_ERROR_COLOR)
                 node.setToolTip(f"{path}\nDBC 文件不存在（配置里的路径已失效）")
+        # Step 22：批量降入 DBC（加载预设 / 应用映射）后同样展开到 DBC 名称层级。
+        for channel in sorted(self.dbc_by_channel):
+            self._reveal_dbc_node(channel)
         self._refresh_dbc_label()
         self._refresh_action_state()
         return self.missing_dbc_channels
@@ -1261,6 +1328,21 @@ class MainWindow(QMainWindow):
         if not self._apply_cache_settings(budget, cache_dir):
             return
         self.lbl_status.setText(f"缓存上限已设为 {self.preview_cache_budget_mb} MiB")
+
+    def open_log_dir(self) -> None:
+        """「📂 打开日志目录」：用系统文件管理器定位到日志目录（gui.log / crash.log）。"""
+        target = log_dir()
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("[GUI] 无法创建日志目录 %s：%s", target, exc)
+            self.statusBar().showMessage(f"日志目录不可用：{target}")
+            return
+        opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+        if not opened:
+            logger.warning("[GUI] 打开日志目录失败：%s", target)
+        self.lbl_status.setText(f"日志目录：{target}")
+        self.statusBar().showMessage(f"日志目录：{target}")
 
     def _apply_cache_settings(self, budget: int, cache_dir: str | None,
                               *, persist: bool = True) -> bool:
@@ -1761,6 +1843,9 @@ class MainWindow(QMainWindow):
         finally:
             self._checks_guard = previous
         self.signal_view.expandToDepth(0)
+        # Step 22：重建树后把绑定了 DBC 的通道自动展开到 DBC 名称层级（不展开到报文）。
+        for channel in sorted(self._collect_dbc_by_channel()):
+            self._reveal_dbc_node(channel)
         # Step 19 D2：树重建后重算标题行的三态复选框（全选 / 部分 / 全不选）。
         self._sync_select_all_checkbox()
 
@@ -2124,7 +2209,15 @@ class MainWindow(QMainWindow):
             # Step 14：填充方式与最大保持时长（0 → None）；不再写兼容字段 `ffill`。
             "fill_policy": self._fill_policy(),
             "ffill_max_gap_ms": self._fill_gap_ms(),
+            # Step 22：日志路径交给 Rust 侧写 phase 2 预检与 panic（窗口化 exe 必看）。
+            "log_path": str(log_path()),
         }
+        logger.info("convert start files=%d split=%s resample_hz=%s format=%s "
+                    "time_format=%s fill=%s budget_mb=%s",
+                    len(config["blf_paths"]), config["split_by_message"],
+                    config["resample_hz"], config["export_format"],
+                    config["time_format"], config["fill_policy"],
+                    config["memory_budget_mb"])
         self.last_report = None
         self.last_error = None
         self._mark_all(STATUS_PARSING)
@@ -2522,6 +2615,8 @@ class MainWindow(QMainWindow):
         errors, warnings = report.get("errors") or [], report.get("warnings") or []
         self._finish_progress_ok(report)
         self.lbl_status.setText(f"完成：{len(tables)} 个子表 / {rows:,} 行 / {elapsed:.1f}s")
+        logger.info("convert done ok=True rows=%d tables=%d warnings=%d elapsed_s=%.2f",
+                    rows, len(tables), len(warnings), elapsed)
         if report.get("downgraded") and not self.quiet_dialogs:
             paths = [str(t.get("path", "")) for t in tables if t.get("path")]
             out_display = paths[0] if paths and len(set(paths)) == 1 else (
@@ -2534,7 +2629,7 @@ class MainWindow(QMainWindow):
                 f"子表数量：{len(tables)}\n总行数：{rows:,}\n耗时：{elapsed:.1f} 秒\n"
                 f"输出位置：{out_display}")
         for line in warnings:
-            print(f"[fast_blf_core] 警告：{line}", file=sys.stderr)
+            logger.warning("[fast_blf_core] 警告：%s", line)
         if errors:
             first = errors[0]
             self.statusBar().showMessage(
@@ -2549,7 +2644,8 @@ class MainWindow(QMainWindow):
                 entry.apply_status(STATUS_FAILED, message)
         self._finish_progress_failed(message)
         self.lbl_status.setText(f"转换失败：{message}")
-        print(f"[fast_blf_core] 转换失败：{message}", file=sys.stderr)
+        logger.error("[fast_blf_core] 转换失败：%s（code=%s）", message,
+                     getattr(self.convert_worker, "error_code", None))
 
     def _on_convert_thread_done(self) -> None:
         self.convert_worker = None
@@ -2578,6 +2674,7 @@ class MainWindow(QMainWindow):
             "selected": selection,
             "time_format": time_format,
             "buckets": int(buckets),
+            "log_path": str(log_path()),
         }
 
     def _plot_guard(self) -> tuple[bool, dict]:
@@ -2654,6 +2751,8 @@ class MainWindow(QMainWindow):
             "temp_dir": tempfile.gettempdir(),
             "cache_dir": str(cache_dir),
             "cache_budget_mb": int(self.preview_cache_budget_mb),
+            # Step 22：与 convert config 一致，Rust 侧需要知道日志落哪里。
+            "log_path": str(log_path()),
         }
 
     def _launch_preview_session_worker(self) -> None:
@@ -2788,7 +2887,7 @@ class MainWindow(QMainWindow):
         self.lbl_progress_meta.setText("失败")
         self._set_progress_state("error")
         self.lbl_status.setText(f"画图 / 报告失败：{message}")
-        print(f"[fast_blf_core] 画图 / 报告失败：{message}", file=sys.stderr)
+        logger.error("[fast_blf_core] 画图 / 报告失败：%s", message)
 
     def _collect_plot_meta(self, time_format: str) -> dict:
         """HTML 报告需要的界面上下文（文件清单 / DBC 绑定 / 版本 / 生成时间）。"""
@@ -3144,7 +3243,7 @@ def load_theme(app: QApplication) -> None:
     try:
         stylesheet = THEME_PATH.read_text(encoding="utf-8")
     except OSError as exc:
-        print(f"[GUI] 未能加载主题 {THEME_PATH}：{exc}", file=sys.stderr)
+        logger.warning("[GUI] 未能加载主题 %s：%s", THEME_PATH, exc)
         return
     stylesheet = stylesheet.replace(THEME_FONT_DECL,
                                     _runtime_font_decl() or THEME_FONT_DECL, 1)
@@ -4514,6 +4613,12 @@ def _dump_target(args: list[str]) -> str | None:
 
 
 def _main_impl(argv: list[str] | None = None) -> int:
+    # Step 22：第一步就把日志落盘（早于 QApplication）：窗口化 exe 下 stderr 为 None，
+    # 之后的任何异常 / 警告只有写进文件才可能被事后排查。
+    try:
+        setup_logging()
+    except OSError as exc:
+        logging.getLogger(LOGGER_NAME).warning("[GUI] 日志初始化失败：%s", exc)
     args = list(sys.argv if argv is None else argv)
     selftest = "--selftest" in args[1:]
     deep = "--selftest-deep" in args[1:]
@@ -4551,8 +4656,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
     if dump_target is not None:
         return run_dump_check_states(dump_target)
     window = build_main_window()
-    print(f"[GUI] 内核就绪：{'是' if KERNEL_READY else '否'}；版本："
-          f"{core.version() if KERNEL_READY else '—'}", file=sys.stderr)
+    logger.info("[GUI] 内核就绪：%s；版本：%s", '是' if KERNEL_READY else '否',
+                core.version() if KERNEL_READY else '—')
     if not KERNEL_READY:
         print(f"[GUI] {KERNEL_MISSING_TEXT}")
     if selftest:
@@ -4579,6 +4684,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.flush()
     except Exception:  # noqa: BLE001 - 关闭阶段不允许再抛
         pass
+    shutdown_logging()
     os._exit(int(code))
 
 
