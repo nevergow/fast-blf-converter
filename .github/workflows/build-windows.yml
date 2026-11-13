@@ -162,9 +162,29 @@ jobs:
           path: dist/FastBLFConverter-portable.zip
           retention-days: 30
 
+      - name: 组装发布说明（手写说明 + 产物大小/sha256）
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $zip = Get-Item "dist\FastBLFConverter-portable.zip"
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          $size = [math]::Round($zip.Length / 1MB, 1)
+          $meta = "`n---`n`n**FastBLFConverter-portable.zip** · $size MB · sha256 ``$hash```n"
+          $src = "docs\releases\$tag.md"
+          if (Test-Path $src) {
+            $body = (Get-Content $src -Raw) + $meta
+            Write-Host "使用手写发布说明：$src"
+          } else {
+            $body = "# $tag`n`nCI 构建的 Windows 绿色包（PyInstaller onedir，解压即用）。" + $meta
+            Write-Host "未找到 docs/releases/$tag.md，使用通用说明"
+          }
+          Set-Content -Path "release_body.md" -Value $body -Encoding utf8
+          Write-Host "发布说明 $($body.Length) 字符；zip $size MB；sha256 $hash"
+
       - name: 打 tag 时发布 Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/FastBLFConverter-portable.zip
-          generate_release_notes: true
+          body_path: release_body.md

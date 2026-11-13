@@ -275,17 +275,15 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python gui/main.py --selftest
 
 ### 方式 A（推荐）：直接下载已发布的绿色包
 
-**https://github.com/nevergow/fast-blf-converter/releases/tag/v0.4.0** → 下载 `FastBLFConverter-portable.zip`（**73.8 MB**）
+**https://github.com/nevergow/fast-blf-converter/releases/latest** → 下载 `FastBLFConverter-portable.zip`
 
 ```bash
 # 或用 gh CLI（私有仓库需先登录）
-gh release download v0.4.0 -R nevergow/fast-blf-converter -D ./ci-out
+gh release download -R nevergow/fast-blf-converter -D ./ci-out
 ```
 
-sha256：`3775b77d128c82e7c22d632c1279b586faef9508d4fd7f1e6237deb69396fde3`
-
-> 该包由 CI（`windows-latest`）构建，**215 个条目**、解压即用（onedir）。
-> 校验四方一致：本地构建产物 / GitHub `digest` / `gh release download` / API 直链（HTTP 200）。
+> 该包由 CI（`windows-latest`）构建，解压即用（onedir，不写注册表、不自我释放）。
+> 每个 Release 的说明里都写了**该版本 zip 的大小与 sha256**，下载后请核对。
 
 ### 方式 A2：自己触发一次构建（改动后出包用这条）
 
@@ -310,6 +308,23 @@ gh run download <run-id> -n FastBLFConverter-portable-windows -D ./ci-out
 > 已知小瑕疵：PowerShell `Compress-Archive` 写中文条目名（`使用说明.txt`）时不设 UTF-8 标志，
 > 非 Windows 解压工具（macOS `unzip` 等）会显示乱码并可能中断。Windows 资源管理器 / 7-Zip 正常。
 > 若要在非 Windows 环境解压，可用 Python：`python -c "import zipfile;zipfile.ZipFile('...zip').extractall()"`。
+
+### 方式 A3：发一个正式版本（全自动，只需一个 tag）
+
+```bash
+# 1) 改版本号（Cargo.toml 的 [workspace.package].version —— pyproject 从它取）
+# 2) 写发布说明 docs/releases/v<ver>.md（会原样成为 Release 正文）
+# 3) 提交并推 main
+git add -A && git commit -m "chore(release): v<ver>" && git push origin main
+# 4) 打 tag 并推送 —— 这一步就是发版
+git tag v<ver> && git push origin v<ver>
+```
+
+推 tag 会触发 `build-windows.yml`：编译 Rust 扩展 → PyInstaller onedir → **跑打包后的真 exe 做三个冻结态自检**
+→ 压缩 zip → 上传 artifact → **自动创建 Release 并把 zip 挂上去**。
+Release 正文 = `docs/releases/v<ver>.md` + 自动附加的 `zip 大小 / sha256`（由构建机现算，不用手填）。
+
+> 想先验证能不能打包而不发版：`gh workflow run build-windows.yml --ref main`（只出 artifact，不创建 Release）。
 
 ### 方式 B：在 Windows 本机构建
 
