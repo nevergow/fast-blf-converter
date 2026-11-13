@@ -168,17 +168,18 @@ jobs:
         run: |
           $tag = $env:GITHUB_REF_NAME
           $zip = Get-Item "dist\FastBLFConverter-portable.zip"
-          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          $hash = (Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLower()
           $size = [math]::Round($zip.Length / 1MB, 1)
           $meta = "`n---`n`n**FastBLFConverter-portable.zip** · $size MB · sha256 ``$hash```n"
           $src = "docs\releases\$tag.md"
           if (Test-Path $src) {
-            $body = (Get-Content $src -Raw) + $meta
+            $body = [string](Get-Content $src -Raw) + $meta
             Write-Host "使用手写发布说明：$src"
           } else {
             $body = "# $tag`n`nCI 构建的 Windows 绿色包（PyInstaller onedir，解压即用）。" + $meta
             Write-Host "未找到 docs/releases/$tag.md，使用通用说明"
           }
+          if ([string]::IsNullOrWhiteSpace($body)) { throw "发布说明为空，拒绝发版" }
           Set-Content -Path "release_body.md" -Value $body -Encoding utf8
           Write-Host "发布说明 $($body.Length) 字符；zip $size MB；sha256 $hash"
 
